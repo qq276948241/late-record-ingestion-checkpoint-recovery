@@ -1,0 +1,228 @@
+import os
+from typing import Iterator, Tuple, Union, cast
+from packaging.version import Version
+import pytest
+
+import dlt
+from dlt.common.libs.pyarrow import pyarrow as pa
+from dlt.common.libs.deltalake import (
+    DeltaTable,
+    write_delta_table,
+    deltalake_storage_options,
+)
+from dlt.common.configuration.specs import AwsCredentials
+from dlt.destinations.impl.filesystem.filesystem import (
+    FilesystemClient,
+    FilesystemDestinationClientConfiguration,
+)
+
+from tests.cases import arrow_table_all_data_types
+from tests.utils import get_test_storage_root
+
+
+if Version(pa.__version__) < Version("17.0.0"):
+    pytest.skip("Tests disabled for pyarrow < 17.0.0", allow_module_level=True)
+
+
+DELTA_ROUNDTRIP_NON_COMPARABLE_COLUMNS = ("null", "time", "decimal_arrow_max_precision")
+
+
+def _canonicalize_delta_roundtrip_table(table: pa.Table) -> pa.Table:
+    table = table.drop_columns(DELTA_ROUNDTRIP_NON_COMPARABLE_COLUMNS)
+
+    # Delta's logical string type does not preserve Arrow string offset width.
+    # e.g. arrows `large_string` is converted to `string` in Delta table.
+    fields = [
+        (
+            field.with_type(pa.string())
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+            else field
+        )
+        for field in table.schema
+    ]
+    return table.cast(pa.schema(fields, metadata=table.schema.metadata))
+
+
+@pytest.fixture()
+def filesystem_client() -> Iterator[Tuple[FilesystemClient, str]]:
+    """Returns tuple of local `FilesystemClient` instance and remote directory string.
+
+    Remote directory is removed on teardown.
+    """
+    # setup
+    os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = get_test_storage_root()
+    client = cast(FilesystemClient, dlt.pipeline(destination="filesystem").destination_client())
+    remote_dir = os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] + "/tmp_dir"
+
+    yield (client, remote_dir)
+
+    # teardown
+    if client.fs_client.exists(remote_dir):
+        client.fs_client.rm(remote_dir, recursive=True)
+
+
+def test_deltalake_storage_options() -> None:
+    # no credentials, no storage options
+    assert deltalake_storage_options() == dict()
+
+    # no credentials, yes storage options
+    assert deltalake_storage_options(storage_options={"foo": "bar"}) == {"foo": "bar"}
+
+    # yes credentials, yes storage options: no shared keys
+    creds = AwsCredentials(
+        aws_access_key_id="dummy_key_id",
+        aws_secret_access_key="dummy_acces_key",
+        aws_session_token="dummy_session_token",
+        region_name="dummy_region_name",
+    )
+    assert deltalake_storage_options(creds, {"foo": "bar"}).keys() == {
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "region",
+        "foo",
+    }
+
+    # yes credentials, yes storage options: yes shared keys
+    opts = deltalake_storage_options(creds, {"aws_access_key_id": "i_will_overwrite"})
+    assert opts.keys() == {
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "region",
+    }
+    assert opts["aws_access_key_id"] == "i_will_overwrite"
+
+
+@pytest.mark.parametrize("arrow_data_type", (pa.Table, pa.RecordBatchReader))
+def test_write_delta_table(
+    filesystem_client,
+    arrow_data_type: Union[pa.Table, pa.RecordBatchReader],
+) -> None:
+    def arrow_data(  # type: ignore[return]
+        arrow_table: pa.Table,
+        return_type: Union[pa.Table, pa.RecordBatchReader],
+    ) -> Union[pa.Table, pa.RecordBatchReader]:
+        if return_type == pa.Table:
+            return arrow_table
+        elif return_type == pa.RecordBatchReader:
+            return arrow_table.to_reader()
+
+    client, remote_dir = filesystem_client
+    client = cast(FilesystemClient, client)
+    storage_options = deltalake_storage_options(
+        client.config.credentials, client.config.deltalake_storage_options
+    )
+
+    arrow_table = arrow_table_all_data_types(
+        "arrow-table",
+        include_decimal_default_precision=True,
+        include_decimal_arrow_max_precision=True,
+        num_rows=2,
+    )[0]
+
+    # first write should create Delta table with same shape as input Arrow table
+    write_delta_table(
+        remote_dir,
+        arrow_data(arrow_table, arrow_data_type),
+        write_disposition="append",
+        storage_options=storage_options,
+        configuration={"delta.logRetentionDuration": "interval 1 day"},  # default is 30 days
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+
+    assert dt.version() == 0
+
+    # Check that the configuration is passed to the Delta table correctly
+    assert dt.metadata().configuration == {"delta.logRetentionDuration": "interval 1 day"}
+
+    dt_arrow_table = dt.to_pyarrow_table()
+    assert dt_arrow_table.shape == (arrow_table.num_rows, arrow_table.num_columns)
+
+    # table contents should be different because "time" column has type `string`
+    # in Delta table, but type `time` in Arrow source table
+    assert not dt_arrow_table.equals(arrow_table)
+    assert _canonicalize_delta_roundtrip_table(dt_arrow_table).equals(
+        _canonicalize_delta_roundtrip_table(arrow_table)
+    )
+
+    # another `append` should create a new table version with twice the number of rows
+    write_delta_table(
+        remote_dir,
+        arrow_data(arrow_table, arrow_data_type),
+        write_disposition="append",
+        storage_options=storage_options,
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+    assert dt.version() == 1
+    assert dt.to_pyarrow_table().shape == (arrow_table.num_rows * 2, arrow_table.num_columns)
+
+    # the `replace` write disposition should trigger a "logical delete"
+    write_delta_table(
+        remote_dir,
+        arrow_data(arrow_table, arrow_data_type),
+        write_disposition="replace",
+        storage_options=storage_options,
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+    assert dt.version() == 2
+    assert dt.to_pyarrow_table().shape == (arrow_table.num_rows, arrow_table.num_columns)
+
+    # the previous table version should still exist
+    dt.load_as_version(1)
+    assert dt.to_pyarrow_table().shape == (arrow_table.num_rows * 2, arrow_table.num_columns)
+
+    # `merge` should resolve to `append` bevavior
+    write_delta_table(
+        remote_dir,
+        arrow_data(arrow_table, arrow_data_type),
+        write_disposition="merge",
+        storage_options=storage_options,
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+    assert dt.version() == 3
+    assert dt.to_pyarrow_table().shape == (arrow_table.num_rows * 2, arrow_table.num_columns)
+
+    # add column in source table
+    evolved_arrow_table = arrow_table.append_column(
+        "new", pa.array([1 for _ in range(arrow_table.num_rows)])
+    )
+    assert (
+        evolved_arrow_table.num_columns == arrow_table.num_columns + 1
+    )  # ensure column was appendend
+
+    # new column should be propagated to Delta table (schema evolution is supported)
+    write_delta_table(
+        remote_dir,
+        arrow_data(evolved_arrow_table, arrow_data_type),
+        write_disposition="append",
+        storage_options=storage_options,
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+    assert dt.version() == 4
+    dt_arrow_table = dt.to_pyarrow_table()
+    assert dt_arrow_table.shape == (arrow_table.num_rows * 3, evolved_arrow_table.num_columns)
+    assert "new" in dt_arrow_table.schema.names
+    assert dt_arrow_table.column("new").to_pylist() == [1, 1, None, None, None, None]
+
+    # providing a subset of columns should lead to missing columns being null-filled
+    write_delta_table(
+        remote_dir,
+        arrow_data(arrow_table, arrow_data_type),
+        write_disposition="append",
+        storage_options=storage_options,
+    )
+    dt = DeltaTable(remote_dir, storage_options=storage_options)
+    assert dt.version() == 5
+    dt_arrow_table = dt.to_pyarrow_table()
+    assert dt_arrow_table.shape == (arrow_table.num_rows * 4, evolved_arrow_table.num_columns)
+    assert dt_arrow_table.column("new").to_pylist() == [None, None, 1, 1, None, None, None, None]
+
+    with pytest.raises(ValueError):
+        # unsupported value for `write_disposition` should raise ValueError
+        write_delta_table(
+            remote_dir,
+            arrow_data(arrow_table, arrow_data_type),
+            write_disposition="foo",  # type:ignore[arg-type]
+            storage_options=storage_options,
+        )

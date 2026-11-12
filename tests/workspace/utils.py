@@ -1,0 +1,160 @@
+from contextlib import contextmanager, nullcontext
+import os
+import shutil
+import sys
+from typing import Any, Generator, Iterator, List, Tuple
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from dlt.common import known_env
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs.pluggable_run_context import RunContextBase, PluggableRunContext
+from dlt.common.runtime.run_context import switch_context
+from dlt.common.storages.file_storage import FileStorage
+from dlt.common.utils import set_working_dir
+from dlt.pipeline import platform
+
+from dlt._workspace._workspace_context import WorkspaceRunContext
+
+from tests.utils import get_test_storage_root
+
+WORKSPACE_CASES_DIR = os.path.abspath(os.path.join("tests", "workspace", "cases", "workspaces"))
+TEST_SETTINGS_DIR = os.path.abspath(os.path.join("tests", ".dlt"))
+"""The `.dlt` the test session reads secrets and config from, as `tests/conftest.py` wires it."""
+
+
+def test_storage_root_abs() -> str:
+    """Absolute path to this worker's test storage root. Resolved on every call so xdist
+    workers see their own env-set PYTEST_XDIST_WORKER, not whatever the controller cached.
+    """
+    return os.path.abspath(get_test_storage_root())
+
+
+def empty_workspace_dir() -> str:
+    """Path to the per-worker `empty` workspace under the test storage root."""
+    return os.path.join(test_storage_root_abs(), "empty")
+
+
+@contextmanager
+def isolated_workspace(
+    name: str,
+    profile: str = None,
+    required: str = "WorkspaceRunContext",
+    global_dir: str = None,
+) -> Iterator[WorkspaceRunContext]:
+    """Copies `name` workspace from WORKSPACE_CASES_DIR to `_storage` top level folder
+    changes cwd to a workspace copy and activates it to create a fully isolated workspace.
+    `global_dir` stands in for the user's `~/.dlt`: an empty folder in the copy unless given.
+    """
+    new_run_dir = restore_clean_workspace(name)
+    with set_working_dir(new_run_dir):
+        ctx = switch_context(new_run_dir, profile=profile, required=required)
+        assert ctx.run_dir == new_run_dir
+        # also mock global dir so it does not point to default user ~
+        if hasattr(ctx, "_global_dir"):
+            ctx._global_dir = global_dir or os.path.abspath(".global_dir")
+            os.makedirs(ctx._global_dir, exist_ok=True)
+            # reload toml providers after patching
+            Container()[PluggableRunContext].reload_providers()
+        yield ctx  # type: ignore
+
+
+@contextmanager
+def importable_workspace(
+    name: str, *modules: str, global_dir: str = None
+) -> Iterator[WorkspaceRunContext]:
+    """`isolated_workspace` with its root on `sys.path`, as `python -m` gives a launcher."""
+    with isolated_workspace(name, global_dir=global_dir) as ctx:
+        sys.path.insert(0, ctx.run_dir)
+        try:
+            yield ctx
+        finally:
+            sys.path.remove(ctx.run_dir)
+            # so the next copy of the workspace is imported afresh
+            for module in modules:
+                sys.modules.pop(module, None)
+
+
+def restore_clean_workspace(name: str) -> str:
+    """Create a fresh copy of a workspace for a test run.
+
+    If the current working directory is inside the target workspace directory, temporarily
+    change the working directory outside of it before deletion to avoid Windows errors.
+
+    Args:
+        name: Name of the workspace case to restore.
+
+    Returns:
+        Absolute path to the restored workspace directory.
+    """
+    storage_root = test_storage_root_abs()
+    source_workspace_dir = os.path.join(WORKSPACE_CASES_DIR, name)
+    new_run_dir = os.path.join(storage_root, name)
+
+    # ensure parent exists before copying
+    os.makedirs(storage_root, exist_ok=True)
+
+    # if cwd is within the target directory, move out temporarily to allow deletion
+    cwd = os.path.abspath(os.getcwd())
+    target = os.path.abspath(new_run_dir)
+    try:
+        is_within_target = os.path.commonpath([cwd, target]) == target
+    except ValueError:
+        # paths on different drives on windows
+        is_within_target = False
+
+    # use a single code path, switching cwd only when needed
+    cm = set_working_dir(storage_root) if is_within_target else nullcontext()
+    with cm:
+        if os.path.isdir(new_run_dir):
+            shutil.rmtree(new_run_dir, onerror=FileStorage.rmtree_del_ro)
+        shutil.copytree(source_workspace_dir, new_run_dir, dirs_exist_ok=True)
+
+    return new_run_dir
+
+
+def drain_beacon() -> None:
+    """Waits for the fire-and-forget beacon pool, so a test sees everything a run sent."""
+    assert platform._THREAD_POOL is not None
+    platform._THREAD_POOL.thread_pool.shutdown(wait=True)
+
+
+@pytest.fixture
+def beacon() -> Iterator[List[Tuple[str, str]]]:
+    """Beacon PUTs the test's runs send, as `(url, body)`, on a tracker reset around the test."""
+    sent: List[Tuple[str, str]] = []
+
+    def _put(url: str, data: str) -> Any:
+        sent.append((url, data))
+        return MagicMock(status_code=200)
+
+    platform._THREAD_POOL = None
+    platform.init_platform_tracker()
+    patcher = patch.object(platform, "requests")
+    patcher.start().put.side_effect = _put
+    try:
+        yield sent
+    finally:
+        # drained while still patched, so a late PUT lands here and not on the network
+        drain_beacon()
+        patcher.stop()
+        platform._THREAD_POOL = None
+
+
+@pytest.fixture
+def pokemon_pipeline_context() -> Generator[RunContextBase, None, None]:
+    from dlt._workspace._templates._core_source_templates.rest_api_pipeline import load_pokemon
+
+    with isolated_workspace(name="pipelines") as ctx:
+        load_pokemon(base_url="https://pokeapi.apps.dlthub.com/api/v2/")
+        yield ctx
+
+
+@pytest.fixture
+def fruitshop_pipeline_context() -> Generator[RunContextBase, None, None]:
+    from dlt._workspace._templates._single_file_templates.fruitshop_pipeline import load_shop
+
+    with isolated_workspace(name="pipelines") as ctx:
+        load_shop()
+        yield ctx

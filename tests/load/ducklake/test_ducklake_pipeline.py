@@ -1,0 +1,231 @@
+from typing import List
+
+import pytest
+import pathlib
+
+import dlt
+from dlt.common.destination.reference import TDestinationReferenceArg
+
+from dlt.common.utils import uniq_id
+from dlt.destinations.impl.ducklake.configuration import (
+    DuckLakeCredentials,
+    DUCKLAKE_STORAGE_PATTERN,
+)
+from dlt.destinations import ducklake
+
+from dlt.pipeline.exceptions import PipelineStepFailed
+from tests.load.utils import (
+    ABFS_BUCKET,
+    ACTIVE_DESTINATIONS,
+    AWS_BUCKET,
+    GCS_BUCKET,
+    DestinationTestConfiguration,
+    destinations_configs,
+)
+from tests.pipeline.utils import assert_load_info
+from tests.utils import get_test_storage_root
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    (
+        None,
+        "sqlite:///catalog.sqlite",
+        "duckdb:///catalog.duckdb",
+        "postgres://loader:loader@localhost:5432/dlt_data",
+    ),
+)
+def test_all_catalogs(catalog: str) -> None:
+    """Check that catalog and storage are materialized at the right
+    location and properly derive their name from the pipeline name.
+    """
+    if catalog is None:
+        # use destination alias
+        ducklake_name = "ducklake"
+        destination: TDestinationReferenceArg = "ducklake"
+    else:
+        # pick random catalog name so we isolate via postgres schema
+        ducklake_name = "ducklake_" + uniq_id(4)
+        destination = ducklake(
+            credentials=DuckLakeCredentials(ducklake_name=ducklake_name, catalog=catalog)
+        )
+    pipeline = dlt.pipeline(
+        "destination_defaults", destination=destination, dataset_name="lake_schema", dev_mode=True
+    )
+
+    try:
+        load_info = pipeline.run(
+            [{"foo": 1}, {"foo": 2}], table_name="table_foo", loader_file_format="parquet"
+        )
+    except PipelineStepFailed as conn_ex:
+        # skip test gracefully if local postgres is not running. allows to run on ci when only
+        # remote postgres is available. TODO: allow to use configured catalog if present
+        if "postgres" not in catalog or "localhost" not in str(conn_ex):
+            raise
+        pytest.skip(f"Requires localhost postgres running: {catalog}")
+
+    assert_load_info(load_info)
+
+    # test basic data access
+    ds = pipeline.dataset()
+    assert ds.table_foo["foo"].fetchall() == [(1,), (2,)]
+
+    # test lake location
+    expected_location = pathlib.Path(
+        get_test_storage_root(), DUCKLAKE_STORAGE_PATTERN % ducklake_name
+    )
+    assert expected_location.exists()
+    # test dataset in lake
+    assert (expected_location / pipeline.dataset_name).exists()
+
+    # test catalog location if applicable
+    catalog_location = pipeline.destination_client().config.credentials.catalog.database  # type: ignore
+    if "." in catalog_location:
+        catalog_file = pathlib.Path(get_test_storage_root(), catalog_location)
+        assert catalog_file.exists()
+        # verify the catalog file has the expected on-disk backend format. regression for #3870
+        # where a `duckdb:///` URI silently produced a SQLite-format file at `catalog.duckdb`.
+        header = catalog_file.read_bytes()[:16]
+        if catalog_location.endswith(".duckdb"):
+            assert b"DUCK" in header, f"expected DuckDB-format catalog, got: {header!r}"
+        elif catalog_location.endswith(".sqlite"):
+            assert header.startswith(
+                b"SQLite format"
+            ), f"expected SQLite-format catalog, got: {header!r}"
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    (
+        None,
+        "duckdb:///catalog.duckdb",
+        "postgres://loader:loader@localhost:5432/dlt_data",
+    ),
+    ids=["default-sqlite", "duckdb", "postgres"],
+)
+def test_truncate_staging_dataset(catalog: str) -> None:
+    """Staging dataset is truncated after load when truncate_staging_dataset is set."""
+    ducklake_name = "trunc_" + uniq_id(4)
+    if catalog is None:
+        credentials = DuckLakeCredentials(ducklake_name=ducklake_name)
+    else:
+        credentials = DuckLakeCredentials(ducklake_name=ducklake_name, catalog=catalog)
+    pipeline = dlt.pipeline(
+        "ducklake_truncate_staging",
+        destination=ducklake(credentials=credentials),
+        dataset_name="lake_schema",
+        dev_mode=True,
+    )
+    dlt.config["truncate_staging_dataset"] = True
+
+    @dlt.resource(write_disposition="merge", merge_key="id")
+    def items():
+        yield [{"id": 1, "value": "A"}, {"id": 2, "value": "B"}]
+
+    try:
+        load_info = pipeline.run(items)
+    except PipelineStepFailed as conn_ex:
+        # skip gracefully if local postgres catalog is not running
+        if catalog is None or "postgres" not in catalog or "localhost" not in str(conn_ex):
+            raise
+        pytest.skip(f"Requires localhost postgres running: {catalog}")
+    assert_load_info(load_info)
+
+    # data lands in the final dataset
+    assert len(pipeline.dataset().items.fetchall()) == 2
+
+    # staging dataset is emptied
+    with pipeline.sql_client() as client:
+        with client.with_staging_dataset():
+            staging_items = client.make_qualified_table_name("items")
+        assert len(client.execute_sql(f"SELECT * FROM {staging_items}")) == 0
+
+
+def _all_bucket_configs() -> List[DestinationTestConfiguration]:
+    # enable filesystem to be able to collect bucket cases, won't be enabled on
+    # ci for ducklake tests
+    restore_filesystem = "filesystem" not in ACTIVE_DESTINATIONS
+    ACTIVE_DESTINATIONS.add("filesystem")
+    try:
+        configs = list(
+            destinations_configs(
+                all_buckets_filesystem_configs=True,
+                bucket_subset=(GCS_BUCKET, ABFS_BUCKET, AWS_BUCKET),
+            )
+        )
+    finally:
+        if restore_filesystem:
+            ACTIVE_DESTINATIONS.discard("filesystem")
+    # also access the gs:// bucket through the s3 compatibility layer (s3:// + interop keys)
+    if configs and GCS_BUCKET:
+        configs.append(
+            DestinationTestConfiguration(
+                destination_type="filesystem",
+                bucket_url=GCS_BUCKET.replace("gs://", "s3://"),
+                destination_name="filesystem_s3_gcs_comp",
+                extra_info="gcs-via-s3",
+                file_format="jsonl",
+                supports_merge=False,
+            )
+        )
+    return configs
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    _all_bucket_configs(),
+    ids=lambda x: x.name,
+)
+def test_all_buckets(destination_config: DestinationTestConfiguration) -> None:
+    filesystem = destination_config.setup_pipeline("filesystem_config")
+    destination = ducklake(
+        credentials=DuckLakeCredentials(
+            "bucket_cat",
+            # each test has separate DATA PATH so we isolate catalogs
+            metadata_schema="bucket_cat_" + uniq_id(4),
+            storage=filesystem.destination_client().config,  # type: ignore
+        )
+    )
+
+    pipeline = dlt.pipeline(
+        "destination_defaults",
+        destination=destination,
+        dataset_name="lake_schema",
+        dev_mode=True,
+    )
+
+    import duckdb
+
+    # set per thread catalog option
+    with pipeline.sql_client() as client:
+        con: duckdb.DuckDBPyConnection = client.native_connection
+        con.sql("CALL bucket_cat.set_option('target_file_size', '1GB')")
+
+    load_info = pipeline.run(
+        [{"foo": 1}, {"foo": 2}], table_name="table_foo", loader_file_format="parquet"
+    )
+    assert_load_info(load_info)
+    # get data
+    assert pipeline.dataset().table_foo["foo"].fetchall() == [(1,), (2,)]
+
+    # make sure that data is really in the bucket
+    all_metrics = load_info.metrics[load_info.loads_ids[0]][0]
+    for job_id, metrics in all_metrics["job_metrics"].items():
+        remote_url = metrics.remote_url
+        print(remote_url)
+        assert remote_url.startswith(destination_config.bucket_url)
+        table_name = job_id.split(".")[0]
+        with pipeline.sql_client() as sql:
+            with sql.execute_query(
+                f"FROM ducklake_list_files('bucket_cat', '{table_name}');"
+            ) as cur:
+                for row in cur.fetchall():
+                    assert row[0].startswith(remote_url)
+
+    # verify options
+    with pipeline.sql_client() as client:
+        opt_val = client.execute_sql(
+            "SELECT value FROM bucket_cat.options() WHERE option_name = 'target_file_size'"
+        )
+        assert opt_val[0][0] == "1000000000"
+        print(client.execute_sql("CALL bucket_cat.merge_adjacent_files()"))

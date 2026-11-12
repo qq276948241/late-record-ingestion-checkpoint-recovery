@@ -1,0 +1,1405 @@
+from datetime import date, datetime  # noqa: I251
+from typing import (
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+    Set,
+    Any,
+    Iterable,
+    Literal,
+    TYPE_CHECKING,
+)
+import sqlglot
+import sqlglot.expressions as sge
+from sqlglot.expressions import DataType, DATA_TYPE
+from sqlglot.optimizer.scope import build_scope
+
+from dlt.common.time import (
+    DEFAULT_TIMESTAMP_PRECISION,
+    ensure_date,
+    ensure_datetime_in_tz,
+)
+from dlt.common.utils import without_none
+from dlt.common.exceptions import TerminalValueError
+from dlt.common.schema.typing import TColumnType, TDataType, TColumnSchema, TTableSchemaColumns
+from dlt.common.schema.exceptions import CannotCoerceNullException
+
+if TYPE_CHECKING:
+    from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+
+
+TSqlGlotDialect = Literal[
+    "athena",
+    "bigquery",
+    "clickhouse",
+    "databricks",
+    "doris",
+    "drill",
+    "dremio",
+    "druid",
+    "duckdb",
+    "dune",
+    "fabric",
+    "hive",
+    "materialize",
+    "mysql",
+    "oracle",
+    "postgres",
+    "presto",
+    "prql",
+    "redshift",
+    "risingwave",
+    "snowflake",
+    "spark",
+    "spark2",
+    "sqlite",
+    "starrocks",
+    "tableau",
+    "teradata",
+    "trino",
+    "tsql",
+]
+
+SQLGLOT_TO_DLT_TYPE_MAP: dict[DataType.Type, TDataType] = {
+    # NESTED_TYPES
+    DataType.Type.OBJECT: "json",
+    DataType.Type.STRUCT: "json",
+    DataType.Type.NESTED: "json",
+    DataType.Type.ARRAY: "json",
+    DataType.Type.JSON: "json",
+    # TEXT
+    DataType.Type.CHAR: "text",
+    DataType.Type.NCHAR: "text",
+    DataType.Type.NVARCHAR: "text",
+    DataType.Type.TEXT: "text",
+    DataType.Type.VARCHAR: "text",
+    DataType.Type.NAME: "text",
+    # SIGNED_INTEGER
+    DataType.Type.BIGINT: "bigint",
+    DataType.Type.INT: "bigint",
+    DataType.Type.INT128: "bigint",
+    DataType.Type.INT256: "bigint",
+    DataType.Type.MEDIUMINT: "bigint",
+    DataType.Type.SMALLINT: "bigint",
+    DataType.Type.TINYINT: "bigint",
+    # UNSIGNED_INTEGER
+    DataType.Type.UBIGINT: "bigint",
+    DataType.Type.UINT: "bigint",
+    DataType.Type.UINT128: "bigint",
+    DataType.Type.UINT256: "bigint",
+    DataType.Type.UMEDIUMINT: "bigint",
+    DataType.Type.USMALLINT: "bigint",
+    DataType.Type.UTINYINT: "bigint",
+    # other INTEGER
+    DataType.Type.BIT: "bigint",
+    # FLOAT
+    DataType.Type.DOUBLE: "double",
+    DataType.Type.FLOAT: "double",
+    # DECIMAL
+    DataType.Type.BIGDECIMAL: "decimal",
+    DataType.Type.DECIMAL: "decimal",
+    DataType.Type.MONEY: "decimal",
+    DataType.Type.SMALLMONEY: "decimal",
+    DataType.Type.UDECIMAL: "decimal",
+    # TEMPORAL
+    DataType.Type.DATE: "date",
+    DataType.Type.DATE32: "date",
+    DataType.Type.DATETIME: "date",
+    DataType.Type.DATETIME64: "date",
+    DataType.Type.TIMESTAMP: "timestamp",
+    DataType.Type.TIMESTAMPLTZ: "timestamp",
+    DataType.Type.TIMESTAMPTZ: "timestamp",
+    DataType.Type.TIMESTAMP_MS: "timestamp",
+    DataType.Type.TIMESTAMP_NS: "timestamp",
+    DataType.Type.TIMESTAMP_S: "timestamp",
+    DataType.Type.TIME: "time",
+    DataType.Type.TIMETZ: "time",
+    # binary
+    DataType.Type.VARBINARY: "binary",
+    # BOOLEAN
+    DataType.Type.BOOLEAN: "bool",
+    # UNKNOWN
+    DataType.Type.UNKNOWN: None,
+    # older sqlglot types a `NULL` literal as `NULL`, newer as `UNKNOWN`
+    DataType.Type.NULL: None,
+}
+
+# these types were introduced after our sqlglot minimum version of 23.6.3
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.UDOUBLE] = "decimal"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.DATETIME2] = "date"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.SMALLDATETIME] = "date"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.UNION] = "json"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.LIST] = "json"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.VECTOR] = "json"
+except AttributeError:
+    pass
+
+try:
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.DECIMAL32] = "decimal"
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.DECIMAL64] = "decimal"
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.DECIMAL128] = "decimal"
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.DECIMAL256] = "decimal"
+except AttributeError:
+    pass
+
+
+# NOTE in Snowflake, TIMESTAMPNTZ == DATETIME; is this true for dlt?
+SQLGLOT_HAS_TIMEZONE = {
+    DataType.Type.TIMESTAMP: None,  # default value; False
+    DataType.Type.TIMESTAMPLTZ: True,
+    DataType.Type.TIMESTAMPTZ: True,
+    DataType.Type.TIMESTAMP_MS: False,
+    DataType.Type.TIMESTAMP_NS: False,
+    DataType.Type.TIMESTAMP_S: False,
+    DataType.Type.TIME: False,  # default value; False
+    DataType.Type.TIMETZ: True,
+}
+
+has_timestampntz = hasattr(DataType.Type, "TIMESTAMPNTZ")
+if has_timestampntz:
+    SQLGLOT_HAS_TIMEZONE[DataType.Type.TIMESTAMPNTZ] = False
+    SQLGLOT_TO_DLT_TYPE_MAP[DataType.Type.TIMESTAMPNTZ] = "timestamp"
+
+DLT_TO_SQLGLOT = {
+    "json": DataType.Type.JSON,
+    "text": DataType.Type.TEXT,
+    "double": DataType.Type.DOUBLE,
+    "bool": DataType.Type.BOOLEAN,
+    "date": DataType.Type.DATE,
+    "timestamp": DataType.Type.TIMESTAMP,
+    "bigint": DataType.Type.BIGINT,
+    "binary": DataType.Type.VARBINARY,
+    "time": DataType.Type.TIME,
+    "decimal": DataType.Type.DECIMAL,
+}
+
+
+# TODO should we raise errors on type conversion or silently convert to correct values?
+def from_sqlglot_type(sqlglot_type: DATA_TYPE) -> TColumnType:
+    """Convert a SQLGlot DataType to dlt column hints.
+
+    reference: https://dlthub.com/docs/general-usage/schema/#tables-and-columns
+    """
+    if isinstance(sqlglot_type, str):
+        sqlglot_type = sge.DataType.build(sqlglot_type)
+    elif isinstance(sqlglot_type, sge.DataType.Type):
+        sqlglot_type = sge.DataType.build(sqlglot_type)
+    assert isinstance(sqlglot_type, sge.DataType)
+
+    # only `DataType.UNKNOWN` and `DataType.NULL` produce `dlt_type=None`
+    dlt_type = SQLGLOT_TO_DLT_TYPE_MAP.get(sqlglot_type.this, "text")
+
+    if dlt_type == "bigint":
+        hints = _from_integer_type(sqlglot_type)
+    elif dlt_type == "decimal":
+        hints = _from_decimal_type(sqlglot_type)
+    elif dlt_type == "timestamp":
+        hints = _from_timezone_type(sqlglot_type)
+    elif dlt_type == "time":
+        hints = _from_time_type(sqlglot_type)
+    elif dlt_type in ("text", "binary"):
+        hints = _from_string_type(sqlglot_type)
+    else:
+        hints = {}
+
+    # `nullable` is not a required arg on exp.DataType
+    nullable = sqlglot_type.args.get("nullable")
+
+    return without_none({"data_type": dlt_type, "nullable": nullable, **hints})  # type: ignore[return-value]
+
+
+def _from_integer_type(sqlglot_type: sge.DataType) -> TColumnSchema:
+    if sqlglot_type.expressions:  # from parameterized type
+        assert len(sqlglot_type.expressions) == 1
+        assert isinstance(sqlglot_type.expressions[0], sge.DataTypeParam)
+        return {"precision": sqlglot_type.expressions[0].this.to_py()}
+
+    return {}
+
+
+def _from_decimal_type(sqlglot_type: sge.DataType) -> TColumnSchema:
+    hints = {}
+    if sqlglot_type.expressions:
+        assert all(isinstance(e, sge.DataTypeParam) for e in sqlglot_type.expressions)
+        assert len(sqlglot_type.expressions) in (1, 2)
+        if len(sqlglot_type.expressions) == 1:
+            precision = sqlglot_type.expressions[0].this.to_py()
+            hints = {"precision": precision}
+        elif len(sqlglot_type.expressions) == 2:
+            precision = sqlglot_type.expressions[0].this.to_py()
+            scale = sqlglot_type.expressions[1].this.to_py()
+            hints = {"precision": precision, "scale": scale}
+        else:
+            raise RuntimeError(
+                "Expected 1 or 2 `DataTypeParam` attached to expression. "
+                f"Found {len(sqlglot_type.expressions)}: {sqlglot_type.expressions}"
+            )
+
+    return hints  # type: ignore[return-value]
+
+
+def _from_timezone_type(sqlglot_type: sge.DataType) -> TColumnSchema:
+    timezone = SQLGLOT_HAS_TIMEZONE.get(sqlglot_type.this)
+    precision = None
+
+    if sqlglot_type.expressions:  # from parameterized type
+        assert len(sqlglot_type.expressions) == 1
+        assert isinstance(sqlglot_type.expressions[0], sge.DataTypeParam)
+        precision = sqlglot_type.expressions[0].this.to_py()
+
+    return {"precision": precision, "timezone": timezone}
+
+
+def _from_time_type(sqlglot_type: sge.DataType) -> TColumnSchema:
+    timezone = SQLGLOT_HAS_TIMEZONE.get(sqlglot_type.this)
+
+    if sqlglot_type.expressions:  # from parameterized type
+        assert len(sqlglot_type.expressions) == 1
+        assert isinstance(sqlglot_type.expressions[0], sge.DataTypeParam)
+        precision = sqlglot_type.expressions[0].this.to_py()
+        hints = {"precision": precision, "timezone": timezone}
+    else:  # from named type
+        hints = {"timezone": timezone}
+
+    return hints  # type: ignore[return-value]
+
+
+def _from_string_type(sqlglot_type: sge.DataType) -> TColumnSchema:
+    if sqlglot_type.expressions:  # from parameterized type
+        assert len(sqlglot_type.expressions) == 1
+        assert isinstance(sqlglot_type.expressions[0], sge.DataTypeParam)
+        precision = sqlglot_type.expressions[0].this.to_py()
+        hints: TColumnSchema = {"precision": precision}
+    else:
+        hints = {}
+    return hints
+
+
+def to_sqlglot_type(
+    dlt_type: TDataType,
+    precision: Optional[int] = None,
+    scale: Optional[int] = None,
+    timezone: Optional[bool] = None,
+    nullable: Optional[bool] = None,
+    use_named_types: bool = False,
+) -> DataType:
+    """Convert the dlt `data_type` and column hints to a SQLGlot DataType expression.
+
+    `if use_named_type is True:` use "named" types with fallback on "parameterized" types.
+    `else:` use "parameterized" types everywhere.
+
+    Named types:
+    - have some set attributes, e.g., `DataType.Type.DECIMAL64` has `precision=16` and `scale=4`.
+    - can be referenced directly in SQL (table definition, CAST(), which could make SQLGlot transpiling more reliable.
+    - may not exist in all dialects and will be casted automatically during transpiling
+    - can have limited expressivity, e.g., named types for timestamps only included precision 0, 3, 9
+
+    Parameterized types:
+    - instead of DECIMAL64, a generic `DataType.Type.DECIMAL` is used with `DataTypeParam` expressions attached
+      to represent `precision` and `scale`. SQLGlot is responsible for properly compiling and transpiling them.
+    - parameters might be handled differently across dialects and would require greater testing on the dlt side.
+
+    reference: https://dlthub.com/docs/general-usage/schema/#tables-and-columns
+    """
+    if use_named_types is True:
+        try:
+            sqlglot_type = _build_named_sqlglot_type(
+                dlt_type=dlt_type,
+                nullable=nullable,
+                precision=precision,
+                scale=scale,
+                timezone=timezone,
+            )
+        except TerminalValueError:
+            sqlglot_type = _build_parameterized_sqlglot_type(
+                dlt_type=dlt_type,
+                nullable=nullable,
+                precision=precision,
+                scale=scale,
+                timezone=timezone,
+            )
+    else:
+        sqlglot_type = _build_parameterized_sqlglot_type(
+            dlt_type=dlt_type,
+            nullable=nullable,
+            precision=precision,
+            scale=scale,
+            timezone=timezone,
+        )
+
+    return sqlglot_type
+
+
+# NOTE Let's ignore named types for now
+def _build_named_sqlglot_type(
+    dlt_type: TDataType,
+    precision: Optional[int] = None,
+    scale: Optional[int] = None,
+    timezone: Optional[bool] = None,
+    nullable: Optional[bool] = None,
+) -> DataType:
+    hints = {}
+    if nullable is not None:
+        hints["nullable"] = nullable
+
+    if dlt_type == "bigint" and precision is not None:
+        sqlglot_type = _to_named_integer_type(precision=precision)
+    elif dlt_type == "decimal" and precision is not None:
+        sqlglot_type = _to_named_decimal_type(precision=precision, scale=scale)
+    elif dlt_type == "timestamp" and (precision is not None or timezone is not None):
+        sqlglot_type = _to_named_timestamp_type(precision=precision, timezone=timezone)
+    elif dlt_type == "time" and timezone is not None:
+        sqlglot_type = _to_named_time_type(timezone=timezone)
+    else:
+        raise TerminalValueError()
+
+    return DataType.build(dtype=sqlglot_type, **hints)  # type: ignore[arg-type]
+
+
+def _build_parameterized_sqlglot_type(
+    dlt_type: TDataType,
+    nullable: Optional[bool] = None,
+    precision: Optional[int] = None,
+    scale: Optional[int] = None,
+    timezone: Optional[bool] = None,
+) -> DataType:
+    hints: TColumnType = {}
+    # `nullable` should always be added to DataType
+    if nullable is not None:
+        hints["nullable"] = nullable
+
+    if dlt_type == "bigint" and precision is not None:
+        # NOTE INT precision is not supported by many backend.
+        # For instance, INT(5) in MySQL should be DECIMAL(5,0) in DuckDB
+        # Currently, SQLGLot can't transpile from INT(5) to DECIMAL(5,0).
+        # Using non-parameterized type would be more reliable in these cases.
+        sqlglot_type = sge.DataType.build(f"INT({precision})", **hints)
+
+    elif dlt_type == "decimal" and precision is not None:
+        # this code is inspired from sqlglot.dialects.dialect.build_default_decimal_type
+        params = f"({precision}{f', {scale}' if scale is not None else ''})"
+        sqlglot_type = sge.DataType.build(f"DECIMAL{params}", **hints)
+
+    elif dlt_type == "timestamp" and (precision is not None or timezone is not None):
+        base_sqlglot_type = _to_named_timestamp_type(precision=None, timezone=timezone)
+        params = f"({precision})" if precision is not None else ""
+        sqlglot_type = sge.DataType.build(f"{base_sqlglot_type.value}{params}", **hints)
+
+    elif dlt_type == "time" and (precision is not None or timezone is not None):
+        base_sqlglot_type = _to_named_time_type(timezone=timezone)
+        params = f"({precision})" if precision is not None else ""
+        sqlglot_type = sge.DataType.build(f"{base_sqlglot_type.value}{params}", **hints)
+
+    elif dlt_type == "text" and precision is not None:
+        sqlglot_type = sge.DataType.build(f"TEXT({precision})", **hints)
+
+    elif dlt_type == "binary" and precision is not None:
+        sqlglot_type = sge.DataType.build(f"VARBINARY({precision})", **hints)
+    elif dlt_type == "wei":
+        sqlglot_type = sge.DataType.build("DECIMAL(38, 0)", **hints)
+    else:
+        sqlglot_type = sge.DataType.build(DLT_TO_SQLGLOT[dlt_type], **hints)
+
+    return sqlglot_type
+
+
+def _to_named_integer_type(precision: Optional[int]) -> DataType.Type:
+    """Return the SQLGlot INTEGER DataType with precision `>= precision`."""
+    if precision is None:
+        return DataType.Type.BIGINT
+    elif precision <= 0:
+        # raise TerminalValueError(f"Precision must be positive, got {precision}")
+        sqlglot_type = DataType.Type.BIGINT  # default value
+    elif precision <= 3:
+        sqlglot_type = DataType.Type.TINYINT
+    elif precision <= 5:
+        sqlglot_type = DataType.Type.SMALLINT
+    elif precision <= 8:
+        sqlglot_type = DataType.Type.MEDIUMINT
+    elif precision <= 10:
+        sqlglot_type = DataType.Type.INT
+    elif precision <= 19:
+        sqlglot_type = DataType.Type.BIGINT
+    elif precision <= 39:
+        sqlglot_type = DataType.Type.INT128
+    elif precision <= 78:
+        sqlglot_type = DataType.Type.INT256
+    else:
+        raise TerminalValueError(
+            f"Precision must be less than maximum precision of 78, got {precision}"
+        )
+
+    return sqlglot_type
+
+
+# TODO
+def _to_named_decimal_type(precision: Optional[int], scale: Optional[int]) -> DataType.Type:
+    sqlglot_type = DataType.Type.DECIMAL
+    # if precision is None:
+    #     sqlglot_type = DataType.Type.DECIMAL
+    # elif precision <= 0:
+    #     raise TerminalValueError(f"Precision must be positive, got {precision}")
+    # else
+
+    return sqlglot_type
+
+
+def _to_named_timestamp_type(precision: Optional[int], timezone: Optional[bool]) -> DataType.Type:
+    if precision is None:
+        if timezone is True:
+            sqlglot_type = DataType.Type.TIMESTAMPTZ
+        elif timezone is False and has_timestampntz:
+            sqlglot_type = DataType.Type.TIMESTAMPNTZ
+        elif timezone is None:
+            sqlglot_type = DataType.Type.TIMESTAMP
+        else:
+            raise TerminalValueError(
+                f"Received `timezone` value not in (True, False, None), got {timezone}"
+            )
+
+    else:
+        if timezone is None and precision == 0:
+            sqlglot_type = sge.DataType.Type.TIMESTAMP_S
+        elif timezone is None and precision <= 3:
+            sqlglot_type = sge.DataType.Type.TIMESTAMP_MS
+        elif timezone is None and precision <= 9:
+            sqlglot_type = sge.DataType.Type.TIMESTAMP_NS
+        else:
+            raise TerminalValueError(
+                f"Precision must be less than maximum precision of 9, got {precision}"
+            )
+
+    return sqlglot_type
+
+
+def _to_named_time_type(timezone: Optional[bool]) -> DataType.Type:
+    if timezone is None:
+        sqlglot_type = DataType.Type.TIME
+    elif timezone is True:
+        sqlglot_type = DataType.Type.TIMETZ
+    elif timezone is False:
+        sqlglot_type = DataType.Type.TIME
+    else:
+        raise TerminalValueError(
+            f"Received `timezone` value not in (True, False, None), got {timezone}"
+        )
+
+    return sqlglot_type
+
+
+# TODO implement an SQLGlot annotator for setting dlt hints instead of relying on types.
+# ref: https://github.com/tobymao/sqlglot/blob/17f7eaff564790b1fe7faa414143accf362f550e/sqlglot/optimizer/annotate_types.py#L135
+def set_metadata(sqlglot_type: sge.DataType, metadata: TColumnSchema) -> sge.DataType:
+    """Set a metadata dictionary on the SQGLot DataType object.
+
+    By attaching dlt hints to a DataType object, they will be propagated
+    until the DataType is modified.
+    """
+    sqlglot_type._meta = _filter_dlt_hints(metadata)  # type: ignore[assignment]
+    return sqlglot_type
+
+
+def get_metadata(sqlglot_type: sge.DataType) -> TColumnSchema:
+    """Get a metadata dictionary from the SQLGlot DataType object."""
+    metadata = sqlglot_type.meta
+    return _filter_dlt_hints(metadata)  # type: ignore[arg-type]
+
+
+def _filter_dlt_hints(hints: TColumnSchema) -> TColumnSchema:
+    """Filter the metadata dictionary to only include dlt hints."""
+    DATA_TYPE_HINTS = ("data_type", "nullable", "precision", "scale", "timezone")
+    # allow original name to be propagated, so we can track it if aliases were used
+    ALLOWED_HINTS = ("name", "hard_delete", "incremental")
+    # only propagate specially designated hints
+    # TODO review all x- hints we use and decide which to propagate
+    CUSTOM_HINT_PREFIX = "x-annotation"
+
+    final_hints = {}
+    for k, v in hints.items():
+        # those are directly expressed via the DataType and Column
+        if k in DATA_TYPE_HINTS:
+            continue
+
+        if k in ALLOWED_HINTS:
+            final_hints[k] = v
+        elif k.startswith(CUSTOM_HINT_PREFIX):
+            final_hints[k] = v
+
+    return final_hints  # type: ignore[return-value]
+
+
+def query_is_complex(
+    parsed_select: Union[sge.Select, sge.Union],
+    columns: Set[str],
+) -> bool:
+    """
+    Return **True** unless the query is provably “simple”.
+    A *simple* query
+    1. references **exactly one** physical table,
+    2. contains no complex constructs (CTEs, sub-queries, derived tables,
+       unions, window functions, GROUP BY, DISTINCT, etc.),
+    3. projects either
+         • a plain/qualified star with only constant literals after it, or
+         • the full, explicit list of *all* columns with only constant
+           literals after it.
+    Anything we cannot *prove* to be simple is conservatively flagged
+    as complex.
+    """
+    root_scope = build_scope(parsed_select)
+    tables: list[sge.Table] = []
+    non_literal_cols: dict[str, int] = {}
+    star_present = False
+    for node in root_scope.walk():
+        if isinstance(node, sge.Table):
+            tables.append(node)
+        if isinstance(node, sge.Window):
+            return True
+        if isinstance(node, sge.SetOperation):
+            return True
+        if isinstance(node, sge.With):
+            return True
+        if isinstance(node, sge.Distinct):
+            return True
+        if isinstance(node, sge.Group):
+            return True
+        if isinstance(node, sge.DPipe):
+            return True
+        # Detect a star in the outermost projection list.
+        # A star can be either “*” or a qualified “t.*”.
+        # In the AST:
+        #   • bare  “*”    Star -> SELECT
+        #   • qual. “t.*”  Star -> Column -> SELECT
+        if isinstance(node, sge.Star) and (
+            node.parent == parsed_select or (node.parent and node.parent.parent == parsed_select)
+        ):
+            star_present = True
+        # Detect plain (aliased) column references that belong to the outermost projection list.
+        if isinstance(node, sge.Column) and not isinstance(node.this, sge.Star):
+            # it's an (aliased) column in our outer select
+            if node.parent == parsed_select or (
+                isinstance(node.parent, sge.Alias) and node.parent_select == parsed_select
+            ):
+                non_literal_cols[node.name] = non_literal_cols.get(node.name, 0) + 1
+        # An aliased expression that is *not* just a column or a
+        # literal disqualifies the query from being “simple
+        if isinstance(node, sge.Alias):
+            if not (isinstance(node.this, sge.Column) or isinstance(node.this, sge.Literal)):
+                return True
+    if len(tables) > 1:
+        return True
+    if star_present and not non_literal_cols:
+        return False
+    non_literal_cols_names = set(non_literal_cols.keys())
+    # if any column is selected twice, it is complex
+    if any(count > 1 for count in non_literal_cols.values()):
+        return True
+    # if selected columns are exactly the same as the table columns, it is simple
+    if non_literal_cols_names == columns:
+        return False
+    # if newly added columns are all exclusively dlt columns, it is simple
+    if (
+        all(col_name.startswith("_dlt_") for col_name in non_literal_cols_names - columns)
+        and non_literal_cols_names - columns != set()
+    ):
+        return False
+    # if missing columns are all exclusively dlt columns, it is simple
+    if (
+        all(col_name.startswith("_dlt_") for col_name in columns - non_literal_cols_names)
+        and columns - non_literal_cols_names != set()
+    ):
+        return False
+    return True
+
+
+def build_typed_literal(
+    value: Any, sqlglot_type: sge.DataType = None
+) -> Union[sge.Expression, sge.Tuple]:
+    """Create a literal and CAST it to the requested sqlglot DataType."""
+
+    def _literal(v: Any) -> sge.Expression:
+        lit: sge.Expression
+        if v is None:
+            lit = sge.Null()
+        elif isinstance(v, str):
+            lit = sge.Literal.string(v)
+        elif isinstance(v, bool):
+            lit = sge.Boolean(this=v)
+        elif isinstance(v, (int, float)):
+            lit = sge.Literal.number(v)
+        elif isinstance(v, (bytes, bytearray)):
+            lit = sge.Literal.string(v.hex())
+        else:
+            lit = sge.Literal.string(str(v))
+        return sge.Cast(this=lit, to=sqlglot_type.copy()) if sqlglot_type is not None else lit
+
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return sge.Tuple(expressions=[_literal(v) for v in value])
+    else:
+        return _literal(value)
+
+
+def resolve_timestamp_cast(
+    lower: Any,
+    upper: Any,
+    caps: Optional["DestinationCapabilitiesContext"],
+) -> Tuple[Optional[sge.DataType], Any, Any]:
+    """Resolve the cast type and ISO-string bounds for a timestamp pair.
+
+    Tunes the SQLGlot DataType and the bound literals to the destination's
+    quirks: precision, tz-aware-in-CAST support, dialect-specific dropouts
+    (sqlite). Non-datetime bounds pass through unchanged.
+
+    Args:
+        lower (Any): Lower bound; a `datetime` is reformatted, anything else
+            is returned as-is (including `None`).
+        upper (Any): Upper bound; same handling as `lower`.
+        caps (Optional[DestinationCapabilitiesContext]): Destination caps used
+            to pick precision and decide tz / cast behavior. When `None`, a
+            generic tz-aware cast is emitted.
+
+    Returns:
+        Tuple[Optional[sge.DataType], Any, Any]: `(sqlglot_type, lower, upper)`,
+            where `sqlglot_type` is `None` when no cast should be emitted
+            (sqlite's numeric-affinity TIMESTAMP).
+    """
+    # lazy import — `dlt.common.data_writers` reaches back into
+    # `dlt.common.destination`, which imports this module at load time
+    from dlt.common.data_writers.escape import format_datetime_value
+
+    # coerce date / ISO-string bounds in the context timezone; real datetimes carry their own
+    if lower is not None and not isinstance(lower, datetime):
+        lower = ensure_datetime_in_tz(lower)
+    if upper is not None and not isinstance(upper, datetime):
+        upper = ensure_datetime_in_tz(upper)
+
+    dialect = caps.sqlglot_dialect if caps is not None else None
+    precision = caps.timestamp_precision if caps is not None else DEFAULT_TIMESTAMP_PRECISION
+
+    # tz-awareness comes from the actual bound value — needed so dialects that
+    # split timestamp/timestamptz (bigquery DATETIME vs TIMESTAMP) emit the
+    # right cast and don't reject the comparison
+    tz_sample = (
+        lower if isinstance(lower, datetime) else (upper if isinstance(upper, datetime) else None)
+    )
+    timezone: Optional[bool] = None
+    if tz_sample is not None:
+        timezone = tz_sample.tzinfo is not None
+
+    # naive cast when destination can't store tz-aware (dremio, athena) or its
+    # tz-aware CAST rejects offset literals (clickhouse via the `_in_cast`
+    # override); sqlite emits no cast, but its literal still needs the naive
+    # context wall clock to match TEXT-affinity column storage
+    if timezone and caps is not None:
+        cast_tz_ok = (
+            caps.supports_tz_aware_datetime_in_cast
+            if caps.supports_tz_aware_datetime_in_cast is not None
+            else caps.supports_tz_aware_datetime
+        )
+        if not cast_tz_ok or dialect == "sqlite":
+            timezone = False
+
+    # cast precision on athena depends on table format: iceberg supports TIMESTAMP(6)
+    # while regular tables are TIMESTAMP(3). `_dlt_loads` (and other dlt internal
+    # tables) are always iceberg, so a JOIN against them needs microsecond
+    # precision. Below we use (6) for hive tables as well which is proven to work
+    # with them.
+    cast_precision: Optional[int] = precision
+    if dialect == "athena":
+        cast_precision = DEFAULT_TIMESTAMP_PRECISION
+        precision = DEFAULT_TIMESTAMP_PRECISION
+
+    sqlglot_type = to_sqlglot_type(
+        dlt_type="timestamp", timezone=timezone, precision=cast_precision
+    )
+
+    naive = timezone is False
+    if isinstance(lower, datetime):
+        lower = format_datetime_value(lower, precision, no_tz=naive)
+    if isinstance(upper, datetime):
+        upper = format_datetime_value(upper, precision, no_tz=naive)
+
+    # sqlite's CAST AS TIMESTAMP/TIMESTAMPTZ goes through NUMERIC affinity and
+    # parses only leading digits — drop the cast so text comparison works
+    if dialect == "sqlite":
+        sqlglot_type = None
+
+    return sqlglot_type, lower, upper
+
+
+def resolve_date_cast(lower: Any, upper: Any) -> Tuple[Any, Any]:
+    """Coerce date bounds to stdlib dates so DATE literals render without a time component.
+
+    Args:
+        lower (Any): Lower bound; a datetime / date / ISO-string is reduced to its calendar date,
+            `None` passes through.
+        upper (Any): Upper bound; same handling as `lower`.
+
+    Returns:
+        Tuple[Any, Any]: `(lower, upper)` as stdlib `datetime.date` (or `None`).
+    """
+    if lower is not None:
+        lower = ensure_date(lower)
+    if upper is not None:
+        upper = ensure_date(upper)
+    return lower, upper
+
+
+DLT_SUBQUERY_NAME = "_dlt_subquery"
+
+
+def uuid_expr_for_dialect(dialect: TSqlGlotDialect, load_id: str) -> sge.Expression:
+    """Generates a UUID expression based on the specified dialect.
+
+    Args:
+        dialect: The SQL dialect for which the UUID expression needs to be generated.
+        load_id: The load ID used for deterministic UUID generation (redshift).
+
+    Returns:
+        A SQL expression that generates a UUID for the specified dialect.
+    """
+    # NOTE: redshift and sqlite don't have an in-built uuid function
+    if dialect == "redshift":
+        row_num = sge.Window(
+            this=sge.Anonymous(this="row_number"),
+            partition_by=None,
+            order=None,
+        )
+        concat_expr = sge.func(
+            "CONCAT",
+            sge.Literal.string(load_id),
+            sge.Literal.string("-"),
+            row_num,
+        )
+        return sge.func("MD5", concat_expr)
+    elif dialect == "sqlite":
+        return sge.func(
+            "lower",
+            sge.func("hex", sge.func("randomblob", sge.Literal.number(16))),
+        )
+    elif dialect == "clickhouse":
+        return sge.func("generateUUIDv4")
+    # NOTE: UUID in Athena creates a native UUID data type
+    # which needs to be typecasted
+    elif dialect == "athena":
+        return sge.Cast(this=sge.func("UUID"), to=sge.DataType.build("VARCHAR"))
+    else:
+        return sge.func("UUID")
+
+
+def get_select_column_names(
+    selects: List[sge.Expression],
+    dialect: Optional[TSqlGlotDialect] = None,
+) -> List[str]:
+    """Extract output column names from a SELECT clause's expression list.
+
+    Handles Alias (returns alias), Column and Dot (returns output_name with
+    fallback to name — needed for BigQuery quoted identifiers that parse as Dot).
+    Raises ValueError for star expressions or unsupported expression types.
+
+    Args:
+        selects: The ``.selects`` list from a parsed SELECT statement.
+        dialect: SQL dialect used only for error message formatting.
+
+    Returns:
+        Column output names in SELECT order.
+    """
+    names: List[str] = []
+    for select in selects:
+        if isinstance(select, sge.Star):
+            raise ValueError(
+                "Star expressions are not supported."
+                " Please rewrite the query to explicitly specify columns."
+            )
+        if isinstance(select, sge.Alias):
+            names.append(select.alias)
+        elif isinstance(select, sge.Column) or isinstance(select, sge.Dot):
+            if isinstance(select.this, sge.Star):
+                raise ValueError(
+                    "Star expressions are not supported."
+                    " Please rewrite the query to explicitly specify columns."
+                )
+            name = select.output_name or select.name
+            names.append(name)
+        else:
+            sql_text = select.sql(dialect) if dialect else str(select)
+            raise ValueError(
+                "\n\nUnsupported SELECT expression in the model query:\n\n"
+                f"  {sql_text}\n\nOnly simple column selections like `column`"
+                " or `column AS alias` are currently supported.\n"
+            )
+    return names
+
+
+def filter_select_column_names(
+    selects: List[sge.Expression],
+    discard_columns: Set[str],
+    normalize_fn: Callable[[str], str],
+    dialect: Optional[TSqlGlotDialect] = None,
+) -> List[str]:
+    """Return SELECT column names excluding those whose normalized form is in discard_columns.
+
+    Preserves original SELECT order.
+
+    Args:
+        selects: The ``.selects`` list from a parsed SELECT statement.
+        discard_columns: Set of normalized column names to exclude.
+        normalize_fn: Callable that normalizes a column name (e.g. casefold).
+        dialect: SQL dialect used only for error message formatting.
+
+    Returns:
+        Remaining column names in their original SELECT order.
+    """
+    all_names = get_select_column_names(selects, dialect)
+    return [name for name in all_names if normalize_fn(name) not in discard_columns]
+
+
+def validate_no_star_select(parsed_select: sge.Select, dialect: TSqlGlotDialect) -> None:
+    """Raises ValueError if the SELECT statement contains a star expression.
+
+    Args:
+        parsed_select: The parsed SELECT statement.
+        dialect: The SQL dialect (used for error message formatting).
+    """
+    if any(
+        isinstance(expr, sge.Star)
+        or (isinstance(expr, sge.Column) and isinstance(expr.this, sge.Star))
+        for expr in parsed_select.selects
+    ):
+        raise ValueError(
+            "\n\nA `SELECT *` was detected in the model query:\n\n"
+            f"{parsed_select.sql(dialect)}\n\n"
+            "Model queries using a star (`*`) expression cannot be normalized. "
+            "Please rewrite the query to explicitly specify the columns to be selected.\n"
+        )
+
+
+def build_outer_select_statement(
+    select_dialect: TSqlGlotDialect,
+    parsed_select: sge.Select,
+    columns: TTableSchemaColumns,
+    normalize_casefold_fn: Callable[[str], str],
+) -> Tuple[sge.Select, bool]:
+    """Wraps the parsed SELECT in a subquery and builds an outer SELECT statement.
+
+    Args:
+        select_dialect: The SQL dialect to use for parsing and formatting.
+        parsed_select: The parsed SELECT statement.
+        columns: The schema columns to match.
+        normalize_casefold_fn: A callable that normalizes and casefolds an identifier.
+
+    Returns:
+        Tuple of the outer SELECT statement and a flag indicating if reordering is needed.
+    """
+    subquery = parsed_select.subquery(alias=DLT_SUBQUERY_NAME)
+
+    column_names = get_select_column_names(parsed_select.selects, select_dialect)
+
+    selected_columns: List[str] = []
+    outer_selects: List[sge.Expression] = []
+    for name in column_names:
+        norm_casefolded = normalize_casefold_fn(name)
+        selected_columns.append(norm_casefolded)
+
+        column_ref = sge.Dot(
+            this=sqlglot.to_identifier(DLT_SUBQUERY_NAME),
+            expression=sqlglot.to_identifier(name, quoted=True),
+        )
+
+        outer_selects.append(column_ref.as_(norm_casefolded, quoted=True))
+
+    needs_reordering = selected_columns != list(columns.keys())
+
+    outer_select = sqlglot.select(*outer_selects).from_(subquery)
+
+    return outer_select, needs_reordering
+
+
+def reorder_or_adjust_outer_select(
+    outer_parsed_select: sge.Select,
+    columns: TTableSchemaColumns,
+    normalize_casefold_fn: Callable[[str], str],
+    schema_name: str,
+    table_name: str,
+) -> None:
+    """Reorders or adjusts the SELECT statement to match the schema.
+
+    Adds missing columns as NULL and removes extra columns not in the schema.
+
+    Args:
+        outer_parsed_select: The parsed outer SELECT statement.
+        columns: The schema columns to match.
+        normalize_casefold_fn: A callable that normalizes and casefolds an identifier.
+        schema_name: The schema name (used for error messages).
+        table_name: The table name (used for error messages).
+    """
+    alias_map = {expr.alias.lower(): expr for expr in outer_parsed_select.selects}
+
+    new_selects: List[sge.Expression] = []
+    for col in columns:
+        lower_col = col.lower()
+        expr = alias_map.get(lower_col)
+        if expr:
+            new_selects.append(expr)
+        else:
+            if columns[col]["nullable"]:
+                new_selects.append(
+                    sge.Alias(
+                        this=sge.Null(),
+                        alias=sqlglot.to_identifier(normalize_casefold_fn(col), quoted=True),
+                    )
+                )
+            else:
+                exc = CannotCoerceNullException(schema_name, table_name, col)
+                exc.args = (
+                    exc.args[0]
+                    + " — column is missing from the SELECT clause but is non-nullable and must"
+                    " be explicitly selected",
+                )
+                raise exc
+
+    outer_parsed_select.set("expressions", new_selects)
+
+
+def normalize_query_identifiers(
+    query: sge.Query,
+    naming_convention: Any,
+) -> sge.Query:
+    """Normalize all logical identifiers in a query to match the naming convention.
+
+    Normalizes table names, column names, and aliases. Does not modify database
+    or catalog names. Call before bind_query to ensure identifiers match the
+    dlt schema naming.
+
+    Args:
+        query: Query with logical (possibly unnormalized) identifiers
+        naming_convention: Naming convention to apply
+
+    Returns:
+        Query with all identifiers normalized
+    """
+    query = query.copy()
+
+    for node in query.walk():
+        # normalize table names
+        if isinstance(node, sge.Table):
+            normalized = naming_convention.normalize_tables_path(node.name)
+            if node.name != normalized:
+                node.this.set("this", normalized)
+
+        # normalize column and other identifiers (but not table/db/catalog)
+        elif isinstance(node, sge.Identifier):
+            # skip identifiers that are part of Table nodes (table/db/catalog names)
+            if isinstance(node.parent, sge.Table):
+                continue
+
+            # table qualifiers in column references must use normalize_tables_path
+            # to stay consistent with table names in FROM/JOIN
+            if isinstance(node.parent, sge.Column) and node.arg_key == "table":
+                normalized = naming_convention.normalize_tables_path(node.this)
+            else:
+                normalized = naming_convention.normalize_path(node.this)
+            if node.this != normalized:
+                node.set("this", normalized)
+
+        # normalize aliases
+        elif isinstance(node, sge.Alias) and node.alias:
+            normalized = naming_convention.normalize_path(node.alias)
+            if node.alias != normalized:
+                node.set("alias", sqlglot.to_identifier(normalized, quoted=False))
+
+    return query
+
+
+TPhysicalDatasetRef = Tuple[Optional[str], str]
+"""The physical `(catalog alias, schema)` of a dataset. The alias overrides the catalog
+name of a foreign dataset"""
+
+
+class IdentifiersBinding(NamedTuple):
+    """Maps identifiers from the logical (schema) namespace to the destination (physical)
+    namespace"""
+
+    physical_ref: TPhysicalDatasetRef
+    make_qualified_table_name_path: Callable[..., List[str]]
+    casefold_identifier: Callable[[str], str]
+
+
+def bind_query(
+    qualified_query: sge.Query,
+    sqlglot_schema: Any,  # SQLGlotSchema
+    *,
+    bindings: Dict[str, IdentifiersBinding],
+    default_binding: IdentifiersBinding,
+) -> sge.Query:
+    """Binds a logical query (compliant with dlt schema) to physical tables in the destination dataset.
+
+    This function performs name resolution/binding - a standard query processing step that maps
+    logical identifiers to actual database objects. It takes a query using dlt's logical naming
+    convention and adapts it for execution on the destination database.
+    Note that outer select list after binding preserve select list in `qualified_query`.
+
+    Binding steps performed:
+    1. **Table name expansion**: Resolves table references to fully qualified physical paths
+       (e.g., for ClickHouse: `dataset.table` -> `dataset___table`)
+    2. **Identifier case-folding**: Applies destination-specific case transformation
+       (`str.upper` for Snowflake, `str.lower` for most databases, `str` for case-sensitive)
+    3. **Identifier quoting**: Quotes all identifiers for safe execution and to preserve
+       exact casing (e.g., `column_name` -> `"column_name"`)
+    4. **Alias preservation**: For case-folding destinations, adds aliases to SELECT columns
+       to maintain compatibility with dlt schema naming (e.g., `SELECT "VALUE" AS "value"`)
+
+    Each dataset in the query has its own binding. The dataset qualifier of the table
+    (`node.db`) selects that binding. A table and its columns expand and case-fold with the
+    rules of their own dataset. Everything else uses `default_binding`.
+
+    Args:
+        qualified_query: SQLGlot query expression with qualified table/column references
+        sqlglot_schema: Schema mapping for name validation and column resolution
+        bindings: Rules that resolve each dataset, with the logical dataset qualifier as the key
+        default_binding: Rules of the primary (output) dataset. The function applies them to
+            unqualified identifiers, aliases and output select names
+
+    Returns:
+        Bound query expression ready for execution on the destination database
+    """
+    qualified_query = qualified_query.copy()
+
+    def _binding_for(db: Optional[str]) -> IdentifiersBinding:
+        return bindings.get(db, default_binding) if db else default_binding
+
+    # bind ORDER BY references to output aliases back to their source expressions. dialects
+    # like tsql cannot resolve a select alias inside an ORDER BY expression (NULLS emulation).
+    # under DISTINCT/GROUP BY the sort key must stay an output column (source is out of scope)
+    order = qualified_query.args.get("order")
+    if (
+        order is not None
+        and isinstance(qualified_query, sge.Select)
+        and not qualified_query.args.get("distinct")
+        and not qualified_query.args.get("group")
+    ):
+        alias_sources = {
+            proj.output_name: proj.this
+            for proj in qualified_query.selects
+            if isinstance(proj, sge.Alias)
+        }
+        for col in list(order.find_all(sge.Column)):
+            if col.args.get("table") is not None or col.parent_select is not qualified_query:
+                continue
+            source = alias_sources.get(col.name)
+            if source is not None and not isinstance(source, sge.Star):
+                col.replace(source.copy())
+
+    # alias -> logical dataset for schema-known tables, taken before expansion rewrites node.db.
+    # unknown tables (for example CTE refs) are absent, so they and their columns use the default
+    alias_to_db: Dict[str, Optional[str]] = {
+        t.alias_or_name: t.db or None
+        for t in qualified_query.find_all(sge.Table)
+        if sqlglot_schema.column_names(t)
+    }
+
+    default_casefold = default_binding.casefold_identifier
+    # any case-folding binding can rewrite output column names, so the function keeps the originals
+    is_casefolding = any(
+        b.casefold_identifier is not str for b in (default_binding, *bindings.values())
+    )
+
+    # preserve "column" names in original selects which are done in dlt schema namespace
+    orig_selects: Dict[int, str] = None
+    if is_casefolding:
+        orig_selects = {}
+        for i, proj in enumerate(qualified_query.selects):
+            orig_selects[i] = proj.output_name
+
+    # case-fold overrides for identifiers that belong to a dataset, recorded at the parent
+    # table or column (the walk visits a parent first and its mutated children after)
+    folds: Dict[int, Callable[[str], str]] = {}
+    for node in qualified_query.walk():
+        if isinstance(node, sge.Table):
+            # a known table expands to a fully-qualified physical path with the rules of its dataset
+            if sqlglot_schema.column_names(node):
+                logical_db = node.db or None
+                binding = _binding_for(logical_db)
+                catalog_alias: Optional[str] = None
+                if logical_db is None:
+                    # no kwargs here, so clients that override the path builder with the
+                    # legacy signature (no dataset_name/catalog) still work
+                    path = binding.make_qualified_table_name_path(
+                        node.name, quote=False, casefold=False
+                    )
+                else:
+                    catalog_alias, ds_name = binding.physical_ref
+                    path = binding.make_qualified_table_name_path(
+                        node.name,
+                        quote=False,
+                        casefold=False,
+                        dataset_name=ds_name,
+                        catalog=catalog_alias,
+                    )
+                cf = binding.casefold_identifier
+                # set the table name
+                if node.name != path[-1]:
+                    node.this.set("this", path[-1])
+                # the next pass case-folds this node with the function recorded here
+                folds[id(node.this)] = cf
+                # set the dataset/schema name
+                if node.db != path[-2]:
+                    node.set("db", sqlglot.to_identifier(path[-2], quoted=False))
+                folds[id(node.args["db"])] = cf
+                # set the catalog name
+                if len(path) == 3:
+                    node.set("catalog", sqlglot.to_identifier(path[0], quoted=False))
+                    if (cat_ident := node.args.get("catalog")) is not None:
+                        # an attach alias uses the case-fold of the primary dataset
+                        folds[id(cat_ident)] = default_casefold if catalog_alias is not None else cf
+        elif isinstance(node, sge.Column) and isinstance(node.this, sge.Identifier):
+            # a column name case-folds with the rules of the dataset that its table belongs to
+            folds[id(node.this)] = _binding_for(alias_to_db.get(node.table)).casefold_identifier
+        # quote and case-fold identifiers, TODO: maybe we could be more intelligent, but then we need to unquote ibis
+        if isinstance(node, sge.Identifier):
+            cf = folds.get(id(node), default_casefold)
+            if cf is not str:
+                node.set("this", cf(node.this))
+            node.set("quoted", True)
+
+    # add aliases to output selects to stay compatible with dlt schema after the query
+    if orig_selects:
+        for i, orig in orig_selects.items():
+            # a foreign binding can fold a column even when the default case-fold is the identity
+            if qualified_query.selects[i].output_name != orig:
+                # somehow we need to alias just top select in UNION (tested on Snowflake)
+                sel_expr = qualified_query.selects[i]
+                qualified_query.selects[i] = sge.alias_(sel_expr, orig, quoted=True)
+
+    return qualified_query
+
+
+def has_pure_column_projection(query: sge.Query) -> bool:
+    """True when every projection is a plain column or star, so it defines no output names."""
+    if not isinstance(query, sge.Select):
+        return False
+    # with multiple sources an unqualified replacement column turns ambiguous
+    if query.args.get("joins"):
+        return False
+    if any(query.args.get(key) for key in ("group", "having", "qualify", "distinct")):
+        return False
+    return all(
+        isinstance(sel, sge.Star)
+        or (isinstance(sel, sge.Column) and isinstance(sel.this, (sge.Identifier, sge.Star)))
+        for sel in query.selects
+    )
+
+
+def migrate_order_and_limit(inner: sge.Query, outer: sge.Select, qualifier: str) -> None:
+    """Move ORDER BY / LIMIT / OFFSET from a wrapped query onto the wrapping select."""
+    order = inner.args.get("order")
+    if order is not None:
+        exposed_names = {proj.output_name for proj in inner.selects}
+        has_star = any(
+            isinstance(proj, sge.Star)
+            or (isinstance(proj, sge.Column) and isinstance(proj.this, sge.Star))
+            for proj in inner.selects
+        )
+        hoisted: List[sge.Expression] = []
+        for ordered in order.expressions:
+            sort_key = ordered.this
+            if isinstance(sort_key, sge.Column) and sort_key.args.get("table") is None:
+                if not has_star and sort_key.name not in exposed_names:
+                    # a sort key dropped by the projection cannot survive the wrap, keep the unit inside
+                    return
+                hoisted.append(ordered.copy())
+                continue
+            # a qualified or computed sort key is only visible outside the wrap by its output name
+            output_name = next(
+                (
+                    proj.output_name
+                    for proj in inner.selects
+                    if (proj.this if isinstance(proj, sge.Alias) else proj) == sort_key
+                ),
+                None,
+            )
+            if output_name is None:
+                return
+            rewritten = ordered.copy()
+            rewritten.set(
+                "this",
+                sge.Column(
+                    table=sge.to_identifier(qualifier),
+                    this=sge.to_identifier(output_name, quoted=True),
+                ),
+            )
+            hoisted.append(rewritten)
+        outer.set("order", sge.Order(expressions=hoisted))
+        inner.set("order", None)
+    for clause in ("limit", "offset"):
+        if (value := inner.args.get(clause)) is not None:
+            outer.set(clause, value)
+            inner.set(clause, None)
+
+
+def _identifier_name(node: Any) -> Optional[str]:
+    """Return the string name of an sqlglot identifier-or-string node."""
+    if isinstance(node, sge.Identifier):
+        return node.name
+    if isinstance(node, str):
+        return node
+    return None
+
+
+def extract_table_qualifier(table_expr: sge.Expression) -> Optional[Tuple[str, str]]:
+    """Return the table name and the qualifier (alias or table name) of a table expression."""
+    if not isinstance(table_expr, sge.Table):
+        return None
+
+    table_name = _identifier_name(table_expr.args.get("this"))
+    if table_name is None:
+        return None
+
+    alias_expr = table_expr.args.get("alias")
+    if isinstance(alias_expr, sge.TableAlias):
+        alias_name = _identifier_name(alias_expr.this)
+        if alias_name is not None:
+            return table_name, alias_name
+
+    return table_name, table_name
+
+
+def get_from_source(query: sge.Query) -> Optional[sge.Expression]:
+    """Return the FROM source expression (table or subquery), or `None`."""
+    # sqlglot >= 28 renamed `from` to `from_` internally
+    from_expr = query.args.get("from_") or query.args.get("from")
+    if not isinstance(from_expr, sge.From):
+        return None
+    source: Optional[sge.Expression] = from_expr.this
+    return source
+
+
+def get_source_qualifier(source: Optional[sge.Expression]) -> Optional[str]:
+    """Return the SQL qualifier (alias or table name) of a FROM/JOIN source."""
+    if source is None:
+        return None
+    if table_qualifier := extract_table_qualifier(source):
+        return table_qualifier[1]
+    # derived tables, table functions, VALUES and stages are referenced by their alias only
+    return source.alias or None
+
+
+def get_left_source_qualifier(query: sge.Query) -> Optional[str]:
+    """Return the qualifier used to reference the FROM source (alias or table name)."""
+    return get_source_qualifier(get_from_source(query))
+
+
+def aliased_subquery(query: sge.Query, qualifier: str) -> sge.Subquery:
+    """Wrap `query` as a derived table exposed under `qualifier`."""
+    return sge.Subquery(
+        this=query,
+        alias=sge.TableAlias(this=sge.to_identifier(qualifier, quoted=False)),
+    )
+
+
+def wrap_as_derived_table(query: sge.Select, qualifier: str) -> sge.Select:
+    """Re-select all of `query`'s columns from it embedded as a derived table."""
+    return (
+        sge.Select()
+        .select(sge.Column(table=sge.to_identifier(qualifier), this=sge.Star()))
+        .from_(aliased_subquery(query, qualifier))
+    )
+
+
+def defines_rows(query: sge.Select) -> bool:
+    """True when grouping, DISTINCT, aggregates or windows produce the output rows."""
+    if any(query.args.get(key) for key in ("group", "having", "qualify", "distinct")):
+        return True
+    return any(sel.find(sge.AggFunc, sge.Window) for sel in query.selects)
+
+
+def _where_on_derived_table(query: sge.Select, predicate: sge.Expression) -> sge.Query:
+    """Filter the output of `query` embedded as a derived table."""
+    inner = query.copy()
+    qualifier = get_left_source_qualifier(inner) or DLT_SUBQUERY_NAME
+    outer = wrap_as_derived_table(inner, qualifier)
+    migrate_order_and_limit(inner, outer, qualifier)
+    if any(inner.args.get(key) for key in ("order", "limit", "offset")):
+        # ORDER BY on a column dropped by the projection can't move out of the derived table
+        return query.where(predicate)
+    return outer.where(predicate)
+
+
+def where_on_output(query: sge.Query, predicate: sge.Expression) -> sge.Query:
+    """Filter `query` by `predicate` whose unqualified columns refer to the output of `query`.
+
+    Columns that `query` does not output bind to its sources, as in a plain WHERE.
+    """
+    if not isinstance(query, sge.Select):
+        return query.where(predicate)
+    output_refs = [
+        col for col in predicate.find_all(sge.Column) if not col.table and col.parent_select is None
+    ]
+    if defines_rows(query):
+        # WHERE runs before grouping, aggregates and windows so it can't see their output
+        output_names = {sel.output_name for sel in query.selects}
+        has_star = any(sel.is_star for sel in query.selects)
+        if any(has_star or col.name in output_names for col in output_refs):
+            return _where_on_derived_table(query, predicate)
+        return query.where(predicate)
+
+    # WHERE reads the sources of the projection, so an alias is replaced by its expression
+    aliased = {
+        sel.output_name: sel.this
+        for sel in query.selects
+        if isinstance(sel, sge.Alias)
+        and not (isinstance(sel.this, sge.Column) and sel.this.name == sel.output_name)
+    }
+    for col in output_refs:
+        if col.name not in aliased:
+            continue
+        expression = aliased[col.name]
+        # an unknown function may be an aggregate
+        if expression.find(sge.Anonymous):
+            return _where_on_derived_table(query, predicate)
+        # dialects that resolve WHERE names to aliases first (ie. clickhouse) would capture
+        # a source column shadowed by an alias and expand it again
+        if any(
+            not source_col.table and source_col.name in aliased
+            for source_col in expression.find_all(sge.Column)
+        ):
+            return _where_on_derived_table(query, predicate)
+
+    def _expand_alias(node: sge.Expression) -> sge.Expression:
+        if (
+            isinstance(node, sge.Column)
+            and not node.table
+            and node.parent_select is None
+            and node.name in aliased
+        ):
+            expanded = aliased[node.name].copy()
+            if isinstance(expanded, (sge.Column, sge.Literal, sge.Func, sge.Paren)):
+                return expanded
+            return sge.paren(expanded, copy=False)
+        return node
+
+    return query.where(predicate.transform(_expand_alias))

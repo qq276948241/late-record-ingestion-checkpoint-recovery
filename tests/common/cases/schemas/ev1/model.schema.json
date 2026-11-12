@@ -1,0 +1,63 @@
+{
+  "tables": {
+    "_dlt_version": {
+      "version": {
+        "name": "version",
+        "data_type": "bigint",
+        "nullable": false
+      },
+      "engine_version": {
+        "name": "engine_version",
+        "data_type": "bigint",
+        "nullable": false
+      },
+      "inserted_at": {
+        "name": "inserted_at",
+        "data_type": "timestamp",
+        "nullable": false
+      }
+    },
+    "_dlt_loads": {
+      "load_id": {
+        "name": "load_id",
+        "data_type": "text",
+        "nullable": false
+      },
+      "status": {
+        "name": "status",
+        "data_type": "bigint",
+        "nullable": false
+      },
+      "inserted_at": {
+        "name": "inserted_at",
+        "data_type": "timestamp",
+        "nullable": false
+      }
+    }
+  },
+  "name": "model",
+  "version": 1,
+  "preferred_types": {
+    "^timestamp$": "timestamp",
+    "trained_at$": "timestamp",
+    "^inserted_at$": "timestamp",
+    "^_dlt_list_idx$": "bigint"
+  },
+  "hints": {
+    "not_null": [
+      "^timestamp$",
+      "^_dlt_id$",
+      "^_dlt_root_id$",
+      "^_dlt_load_id$",
+      "^_dlt_parent_id$",
+      "^_dlt_list_idx$"
+    ],
+    "primary_key": [
+      "^_dlt_id$"
+    ],
+    "foreign_key": [
+      "^_dlt_parent_id$"
+    ]
+  },
+  "engine_version": 1
+}

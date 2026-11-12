@@ -1,0 +1,104 @@
+[project]
+name = "dlt-docs-tools"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+
+# NOTE: working here is always dev enviroment, so we don't need a dev group
+dependencies = [
+    "dlt[duckdb,postgres,bigquery,mssql,databricks,qdrant,sql_database,weaviate,hub,lancedb]",
+    "flake8>=7.0.0,<8",
+    "modal>=1.2.1",
+    "mypy>=1.11.0,<1.13.0",
+    "nbqa>=1.9.1",
+    "prek>=0.4.14,<0.5",
+    "pytest>=8.4.2",
+    "python-dotenv>=1.2.1",
+    "requests>=2.30.5",
+    "ruff>=0.16.0,<0.17.0",
+    "types-pyyaml>=6.0.12.20250915",
+    "types-regex>=2025.10.23.20251023",
+    "types-requests>=2.32.4.20250913",
+    "SQLAlchemy>=1.4.0",
+    "pymysql>=1.1.0,<2",
+    "pypdf2>=3.0.1,<4",
+    "dbt-core>=1.5.0",
+    "dbt-duckdb>=1.5.0",
+    "pymongo>=4.3.3",
+    "pandas>=2.1.4",
+    "alive-progress==3.2.0",
+    "pyarrow>=16.0.0",
+    "psycopg2-binary>=2.9",
+    "lancedb>=0.8.2 ; python_version < '3.13'",
+    "connectorx>=0.4.2 ; python_version >= '3.10'",
+    "modal>=0.64.170",
+    "google-api-python-client>=1.7.11",
+    "google-auth-oauthlib>=1.0.0,<2",
+    "types-psycopg2>=2.9.21.20251012",
+    "weaviate-client>=4.0.0,<5.0.0",
+    "regex>=2025.10.23",
+    "pytest-forked>=1.6.0",
+    "marimo>=0.17.4",
+    "logfire>=4.32.1",
+    "pytest-examples>=0.0.11",
+    "pytest-xdist>=3.8.0",
+    "ty>=0.0.72",
+    "mdsmith>=0.55.1",
+    "griffe>=1.5",
+]
+
+[dependency-groups]
+hub = [
+    "dlt[hub]"
+]
+
+# this project is only an environment for the docs tooling, tests and snippets,
+# it is never built or installed. the tools in `tools/` are run with
+# `uv run [--script] tools/<tool>.py`
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# TODO ideally, this should match the ruff configuration from the root
+# `pyproject.toml`. There could be docs-specific checks in the extend-select
+# clause though.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["F811", "F821", "F401", "F841", "E402", "F704"]
+
+# ty is used for linting docs snippets because it's faster, lighter, and
+# incremental, which allows to run it in parallel over individual snippets.
+# This would hang forever with `mypy`.
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.ty.rules]
+redundant-cast = "warn"
+unused-type-ignore-comment = "ignore"
+unresolved-import = "ignore"
+empty-body = "ignore"
+invalid-parameter-default = "ignore"
+
+[tool.uv.sources]
+dlt = { path = "..", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = [".."]
+console_output_style = "count"
+addopts = [
+    "-p", "xdist",        # load the xdist parallel execution plugin
+    "-n", "auto",         # auto-detect worker count from available CPUs
+    "-rn",             # only show failed/errored test summary lines
+    "--tb=short",      # compact tracebacks on failure
+    "-p", "no:warnings",  # suppress Python warnings output
+]
+markers = [
+    "lint_snippets: parametrizes a test with all lintable docs snippets/examples (see pytest_generate_tests)",
+    "typecheck_snippets: parametrizes a test with all type-checkable docs snippets/examples (see pytest_generate_tests)",
+    "run_snippets: parametrizes a test with all runnable docs pages/examples (see pytest_generate_tests)",
+    "example: expensive snippet to run",
+]

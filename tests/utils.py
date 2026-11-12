@@ -1,0 +1,810 @@
+import contextlib
+import logging
+from http import HTTPStatus
+import http.server
+import multiprocessing
+import os
+import platform
+import threading
+import sys
+import time
+from functools import partial
+from os import environ
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, Literal, Optional, Type, Union, get_args, List
+from unittest.mock import patch
+
+import pytest
+import requests
+from requests import Response
+
+import dlt
+from dlt.common import known_env, pendulum
+from dlt.common.runtime import telemetry
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.providers import (
+    DictionaryProvider,
+    EnvironProvider,
+    SecretsTomlProvider,
+    ConfigTomlProvider,
+)
+from dlt.common.configuration.providers.provider import ConfigProvider
+from dlt.common.configuration.resolve import resolve_configuration
+from dlt.common.configuration.specs import RuntimeConfiguration, PluggableRunContext, configspec
+from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContainer
+from dlt.common.configuration.specs.pluggable_run_context import (
+    RunContextBase,
+)
+from dlt.common.pipeline import PipelineContext, SupportsPipeline
+from dlt.common.runtime.run_context import DOT_DLT, RunContext
+from dlt.common.runtime.telemetry import stop_telemetry
+from dlt.common.schema import Schema
+from dlt.common.schema.typing import TTableFormat
+from dlt.common.storages import FileStorage
+from dlt.common.storages.versioned_storage import VersionedStorage
+from dlt.common.metrics import DataWriterMetrics
+from dlt.common.time import ensure_datetime_in_tz
+from dlt.common.typing import StrAny, TDataItem, PathLike, TTimeInterval
+from dlt.common.utils import set_working_dir
+
+
+DLT_TEST_STORAGE_ROOT = "DLT_TEST_STORAGE_ROOT"
+PYTEST_XDIST_WORKER = "PYTEST_XDIST_WORKER"
+STORAGE_ROOT_PREFIX = os.path.abspath("_storage")
+
+LOCAL_TIMEZONES = [
+    None,  # do not change anything, must run on all oses and python versions
+    "UTC",
+    "Europe/Berlin",
+    "Asia/Kolkata",
+]
+"""Local timezones to parametrize over so that no result depends on the machine setting."""
+
+
+def make_interval(start: str, end: str) -> TTimeInterval:
+    """Builds a tz-aware `[start, end)` interval from two ISO strings."""
+    return TTimeInterval(ensure_datetime_in_tz(start), ensure_datetime_in_tz(end))
+
+
+@contextlib.contextmanager
+def local_timezone(tz_name: Optional[str]) -> Iterator[None]:
+    """Sets the OS and pendulum local timezone for the duration of the block."""
+    # do not change when not set
+    if not tz_name:
+        yield
+        return
+
+    if not hasattr(time, "tzset") or os.name == "nt":
+        pytest.skip("Timezone manipulation requires tzset (not available on Windows)")
+
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = tz_name
+    time.tzset()
+
+    try:
+        # pendulum has test utils in core library
+        with pendulum.test_local_timezone(pendulum._safe_timezone(tz_name)):  # type: ignore[arg-type]
+            yield
+    finally:
+        if old_tz is None:
+            if "TZ" in os.environ:
+                del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
+
+
+def get_test_worker_id() -> str:
+    wid = os.environ.get(PYTEST_XDIST_WORKER)
+    # under xdist `PYTEST_XDIST_TESTRUNUID` is set in every process (controller + workers);
+    # the per-worker `PYTEST_XDIST_WORKER` is only set in workers. if we fall through to
+    # the "gw0" default while xdist is active, workers will share `_storage_gw0` and rmtree
+    # each other's state — fail loudly instead.
+    if wid is None and "PYTEST_XDIST_TESTRUNUID" in os.environ:
+        raise RuntimeError(
+            "running under xdist but PYTEST_XDIST_WORKER is not set — test storage would"
+            " collide across workers"
+        )
+    return wid or "gw0"
+
+
+def get_test_worker_idx() -> int:
+    worker_id = get_test_worker_id()
+    assert worker_id.startswith("gw")
+    return int(worker_id.removeprefix("gw"))
+
+
+def compute_test_storage_root() -> str:
+    return f"{STORAGE_ROOT_PREFIX}_{get_test_worker_id()}"
+
+
+def set_environment_test_storage_root(test_storage_root: str) -> None:
+    os.environ[DLT_TEST_STORAGE_ROOT] = test_storage_root
+
+
+def get_test_storage_root() -> str:
+    return os.environ.get(DLT_TEST_STORAGE_ROOT, f"{STORAGE_ROOT_PREFIX}_{get_test_worker_id()}")
+
+
+ALL_DESTINATIONS = dlt.config.get("ALL_DESTINATIONS", list) or [
+    "duckdb",
+]
+
+LOCAL_POSTGRES_CREDENTIALS = "postgresql://loader:loader@localhost:5432/dlt_data"
+
+
+# destination constants
+IMPLEMENTED_DESTINATIONS = {
+    "athena",
+    "duckdb",
+    "bigquery",
+    "fabric",
+    "redshift",
+    "postgres",
+    "snowflake",
+    "filesystem",
+    "weaviate",
+    "dummy",
+    "motherduck",
+    "mssql",
+    "qdrant",
+    "lancedb",
+    "lance",
+    "destination",
+    "synapse",
+    "databricks",
+    "clickhouse",
+    "dremio",
+    "sqlalchemy",
+    "ducklake",
+}
+NON_SQL_DESTINATIONS = {
+    "filesystem",
+    "weaviate",
+    "dummy",
+    "qdrant",
+    "lancedb",
+    "lance",
+    "destination",
+}
+
+try:
+    # register additional destinations from _addons.py which must be placed in the same folder
+    # as tests
+    from _addons import register_destinations  # type: ignore[import-not-found]
+
+    register_destinations(IMPLEMENTED_DESTINATIONS, NON_SQL_DESTINATIONS)
+except ImportError:
+    pass
+
+SQL_DESTINATIONS = IMPLEMENTED_DESTINATIONS - NON_SQL_DESTINATIONS
+
+# exclude destination test configurations
+EXCLUDED_DESTINATION_CONFIGURATIONS = set(
+    dlt.config.get("EXCLUDED_DESTINATION_CONFIGURATIONS", list) or set()
+)
+EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS = set(
+    dlt.config.get("EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS", list) or set()
+)
+
+
+# filter out active destinations for current tests
+ACTIVE_DESTINATIONS = set(dlt.config.get("ACTIVE_DESTINATIONS", list) or IMPLEMENTED_DESTINATIONS)
+
+ACTIVE_SQL_DESTINATIONS = SQL_DESTINATIONS.intersection(ACTIVE_DESTINATIONS)
+ACTIVE_NON_SQL_DESTINATIONS = NON_SQL_DESTINATIONS.intersection(ACTIVE_DESTINATIONS)
+
+# filter out active table formats for current tests
+IMPLEMENTED_TABLE_FORMATS = set(get_args(TTableFormat))
+ACTIVE_TABLE_FORMATS = set(
+    dlt.config.get("ACTIVE_TABLE_FORMATS", list) or IMPLEMENTED_TABLE_FORMATS
+)
+
+# sanity checks
+assert len(ACTIVE_DESTINATIONS) >= 0, "No active destinations selected"
+
+for destination in NON_SQL_DESTINATIONS:
+    assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown non sql destination {destination}"
+
+for destination in SQL_DESTINATIONS:
+    assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown sql destination {destination}"
+
+for destination in ACTIVE_DESTINATIONS:
+    assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown active destination {destination}"
+
+TPythonTableFormat = Literal["pandas", "arrow-table", "arrow-batch"]
+"""Possible arrow item formats"""
+
+TestDataItemFormat = Literal["object", "pandas", "arrow-table", "arrow-batch"]
+ALL_TEST_DATA_ITEM_FORMATS = get_args(TestDataItemFormat)
+"""List with TDataItem formats: object, arrow table/batch / pandas"""
+
+
+def TEST_DICT_CONFIG_PROVIDER():
+    # add test dictionary provider
+    providers_context = Container()[PluggableRunContext].providers
+    try:
+        return providers_context[DictionaryProvider.NAME]
+    except KeyError:
+        provider = DictionaryProvider()
+        providers_context.add_provider(provider)
+        return provider
+
+
+class PublicCDNHandler(http.server.SimpleHTTPRequestHandler):
+    def list_directory(self, path: Union[str, PathLike]) -> None:
+        self.send_error(HTTPStatus.FORBIDDEN, "Directory listing is forbidden")
+        return None
+
+
+class MockHttpResponse(Response):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 300:
+            raise requests.HTTPError(response=self)
+
+
+class MockPipeline(SupportsPipeline):
+    def __init__(self, pipeline_name: str, first_run: bool) -> None:
+        self.pipeline_name = pipeline_name
+        self.first_run = first_run
+
+
+def write_version(storage: FileStorage, version: str) -> None:
+    storage.save(VersionedStorage.VERSION_FILE, str(version))
+
+
+def delete_test_storage() -> None:
+    storage = FileStorage(get_test_storage_root())
+    if storage.has_folder(""):
+        storage.delete_folder("", recursively=True, delete_ro=True)
+
+
+@pytest.fixture()
+def test_storage() -> FileStorage:
+    return clean_test_storage()
+
+
+@pytest.fixture(autouse=True)
+def autouse_test_storage(request) -> Optional[FileStorage]:
+    # skip storage cleanup if module level fixture is activated
+    if not request.keywords.get("skip_autouse_test_storage", False):
+        return clean_test_storage()
+    return None
+
+
+@pytest.fixture(scope="function", autouse=True)
+def preserve_environ() -> Iterator[None]:
+    yield from _preserve_environ()
+
+
+@pytest.fixture(autouse=True)
+def auto_test_run_context() -> Iterator[None]:
+    """Creates a run context that points to get_test_storage_root()"""
+    yield from create_test_run_context()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def auto_module_test_storage(request) -> FileStorage:
+    request.keywords["skip_autouse_test_storage"] = True
+    return clean_test_storage()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def preserve_module_environ() -> Iterator[None]:
+    yield from _preserve_environ()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def auto_module_test_run_context(auto_module_test_storage) -> Iterator[None]:
+    yield from create_test_run_context()
+
+
+def _serve_sample_files(
+    handler: Type[http.server.SimpleHTTPRequestHandler], port: int
+) -> Iterator[http.server.ThreadingHTTPServer]:
+    httpd = http.server.ThreadingHTTPServer(
+        ("localhost", port),
+        partial(handler, directory=Path.cwd().joinpath("tests/common/storages/samples")),
+    )
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        yield httpd
+    finally:
+        # always close
+        httpd.shutdown()
+        server_thread.join()
+        httpd.server_close()
+
+
+@pytest.fixture
+def public_http_server() -> Iterator[http.server.ThreadingHTTPServer]:
+    """
+    A simple HTTP server serving files from the current directory.
+    Used to simulate public CDN. It allows only file access, directory listing is forbidden.
+    """
+    yield from _serve_sample_files(PublicCDNHandler, 8189)
+
+
+@pytest.fixture
+def autoindex_http_server() -> Iterator[http.server.ThreadingHTTPServer]:
+    """
+    Serves the same files as `public_http_server` but renders an html directory index.
+    fsspec has no listing protocol over http, it scrapes that index to list files.
+    """
+    yield from _serve_sample_files(http.server.SimpleHTTPRequestHandler, 8190)
+
+
+def create_test_run_context() -> Iterator[None]:
+    # this plugs active context
+    ctx = PluggableRunContext()
+    mock = MockableRunContext.from_context(ctx.context)
+    mock._local_dir = os.path.abspath(get_test_storage_root())
+    mock._global_dir = mock._data_dir = os.path.join(mock._local_dir, DOT_DLT)
+    ctx_plug = Container()[PluggableRunContext]
+    cookie = ctx_plug.push_context()
+    try:
+        ctx_plug.reload(mock)
+        yield
+    finally:
+        assert ctx_plug is Container()[PluggableRunContext], "PluggableRunContext was replaced"
+        ctx_plug.pop_context(cookie)
+
+
+def _preserve_environ() -> Iterator[None]:
+    saved_environ = environ.copy()
+    # delta-rs sets those keys without updating environ and there's no
+    # method to refresh environ
+    known_environ = {
+        key_: saved_environ.get(key_)
+        for key_ in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "AWS_SESSION_TOKEN",
+        ]
+    }
+    try:
+        yield
+    finally:
+        environ.clear()  # clear Python-level env vars
+        environ.update(saved_environ)
+        for key_, value_ in known_environ.items():
+            if value_ is None:
+                os.unsetenv(key_)  # unset C-level env var
+            else:
+                environ[key_] = value_
+
+
+def _restore_thread_contexts(
+    container: Container,
+    saved: Dict[int, "Container._TContext"],
+) -> None:
+    """Puts back the contexts each thread held, running the add/remove callbacks."""
+    for thread_id, saved_context in saved.items():
+        context, lock = container.thread_contexts[thread_id]
+        with lock:
+            for spec in list(context):
+                if context[spec] is not saved_context.get(spec):
+                    container._thread_delitem(context, spec)
+            for spec, ctx in saved_context.items():
+                if context.get(spec) is not ctx:
+                    container._thread_setitem(context, spec, ctx)
+    for thread_id in list(container.thread_contexts):
+        if thread_id not in saved:
+            context, lock = container.thread_contexts.pop(thread_id)
+            with lock:
+                for spec in list(context):
+                    container._thread_delitem(context, spec)
+
+
+@contextlib.contextmanager
+def preserve_container() -> Iterator[None]:
+    """Saves and restores the whole Container singleton (instance, main thread id and contexts)."""
+    saved_instance = Container._INSTANCE
+    saved_main_thread_id = Container._MAIN_THREAD_ID
+    # the dicts are restored in place and the locks are kept, so anything still holding a
+    # reference to a thread context sees the restored content
+    saved_contexts = (
+        {
+            thread_id: dict(context)
+            for thread_id, (context, _) in saved_instance.thread_contexts.items()
+        }
+        if saved_instance
+        else None
+    )
+    try:
+        yield
+    finally:
+        Container._INSTANCE = saved_instance
+        Container._MAIN_THREAD_ID = saved_main_thread_id
+        if saved_instance is not None:
+            _restore_thread_contexts(saved_instance, saved_contexts)
+
+
+@pytest.fixture(autouse=True)
+def preserve_run_context() -> Iterator[None]:
+    """Restores run context and container singleton when a test completes."""
+    ctx_plug = Container()[PluggableRunContext]
+    cookie = ctx_plug.push_context()
+    try:
+        with preserve_container():
+            yield
+    finally:
+        # preserve_container has restored the singleton; the original run context must be back
+        assert ctx_plug is Container()[PluggableRunContext], "PluggableRunContext was replaced"
+        ctx_plug.pop_context(cookie)
+
+
+class MockableRunContext(RunContext):
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def global_dir(self) -> str:
+        return self._global_dir
+
+    @property
+    def run_dir(self) -> str:
+        return os.environ.get(known_env.DLT_PROJECT_DIR, self._run_dir)
+
+    @property
+    def local_dir(self) -> str:
+        return os.environ.get(known_env.DLT_LOCAL_DIR, self._local_dir)
+
+    # @property
+    # def settings_dir(self) -> str:
+    #     return self._settings_dir
+
+    @property
+    def data_dir(self) -> str:
+        return os.environ.get(known_env.DLT_DATA_DIR, self._data_dir)
+
+    _name: str
+    _global_dir: str
+    _run_dir: str
+    _settings_dir: str
+    _data_dir: str
+    _local_dir: str
+
+    @classmethod
+    def from_context(cls, ctx: RunContextBase) -> "MockableRunContext":
+        cls_ = cls(ctx.run_dir)
+        cls_._name = ctx.name
+        cls_._global_dir = ctx.global_dir
+        cls_._run_dir = ctx.run_dir
+        cls_._settings_dir = ctx.settings_dir
+        cls_._data_dir = ctx.data_dir
+        cls_._local_dir = ctx.local_dir
+        cls_._runtime_config = ctx.runtime_config
+        return cls_
+
+
+@pytest.fixture(autouse=True)
+def auto_unload_modules() -> Iterator[None]:
+    """Restore sys.modules to pre-test state: unload added modules, re-add removed ones."""
+    prev_modules = dict(sys.modules)
+    try:
+        yield
+    finally:
+        # remove modules added during the test
+        for mod in set(sys.modules.keys()) - set(prev_modules.keys()):
+            del sys.modules[mod]
+        # restore modules removed during the test
+        for mod, module in prev_modules.items():
+            if mod not in sys.modules:
+                sys.modules[mod] = module
+
+
+@pytest.fixture(autouse=True)
+def deactivate_pipeline(preserve_environ) -> Iterator[None]:
+    """Deactivates pipeline. Local state is not removed"""
+    container = Container()
+    if container[PipelineContext].is_active():
+        container[PipelineContext].deactivate()
+    try:
+        yield
+    finally:
+        if container[PipelineContext].is_active():
+            # take existing pipeline
+            # NOTE: no more needed. test storage is wiped fully when test starts
+            # p = dlt.pipeline()
+            # p._wipe_working_folder()
+            # deactivate context
+            container[PipelineContext].deactivate()
+
+
+@pytest.fixture(autouse=True)
+def setup_secret_providers_to_current_module(request):
+    """Creates set of config providers where secrets are loaded from cwd()/.dlt and
+    configs are loaded from the .dlt/ in the same folder as module being tested
+    """
+    secret_dir = os.path.abspath("./.dlt")
+    dname = os.path.dirname(request.module.__file__)
+    config_dir = dname + "/.dlt"
+
+    # inject provider context so the original providers are restored at the end
+    def _initial_providers(self):
+        return [
+            EnvironProvider(),
+            SecretsTomlProvider(settings_dir=secret_dir),
+            ConfigTomlProvider(settings_dir=config_dir),
+        ]
+
+    with (
+        set_working_dir(dname),
+        patch(
+            "dlt.common.runtime.run_context.RunContext.initial_providers",
+            _initial_providers,
+        ),
+    ):
+        Container()[PluggableRunContext].reload_providers()
+
+        try:
+            sys.path.insert(0, dname)
+            yield
+        finally:
+            sys.path.pop(0)
+
+
+def unload_modules_at_path(path: str) -> None:
+    abs_dir = os.path.realpath(path)
+    for name in list(sys.modules.keys()):
+        mod = sys.modules.get(name)
+        mod_file = getattr(mod, "__file__", None) if mod else None
+        if not mod_file:
+            continue
+        try:
+            mod_abs = os.path.realpath(mod_file)
+        except (OSError, ValueError):
+            continue
+        if mod_abs.startswith(abs_dir):
+            del sys.modules[name]
+
+
+def data_to_item_format(
+    item_format: TestDataItemFormat, data: Union[Iterator[TDataItem], Iterable[TDataItem]]
+) -> Any:
+    """Return the given data in the form of pandas, arrow table/batch or json items"""
+    if item_format == "object":
+        return data
+
+    import pandas as pd
+    from dlt.common.libs.pyarrow import pyarrow as pa
+
+    # Make dataframe from the data
+    df = pd.DataFrame(list(data))
+    if item_format == "pandas":
+        return [df]
+    elif item_format == "arrow-table":
+        return [pa.Table.from_pandas(df)]
+    elif item_format == "arrow-batch":
+        return [pa.RecordBatch.from_pandas(df)]
+    else:
+        raise ValueError(f"Unknown item format: {item_format}")
+
+
+def data_item_length(data: TDataItem) -> int:
+    import pandas as pd
+    from dlt.common.libs.pyarrow import pyarrow as pa
+
+    if isinstance(data, list):
+        # If data is a list, check if it's a list of supported data types
+        if all(isinstance(item, (list, pd.DataFrame, pa.Table, pa.RecordBatch)) for item in data):
+            return sum(data_item_length(item) for item in data)
+        # If it's a list but not a list of supported types, treat it as a single list object
+        else:
+            return len(data)
+    elif isinstance(data, pd.DataFrame):
+        return len(data.index)
+    elif isinstance(data, pa.Table) or isinstance(data, pa.RecordBatch):
+        return data.num_rows
+    else:
+        raise TypeError("Unsupported data type.")
+
+
+def arrow_item_from_pandas(
+    df: Any,
+    object_format: TPythonTableFormat,
+) -> Any:
+    from dlt.common.libs.pyarrow import pyarrow as pa
+
+    if object_format == "pandas":
+        return df
+    elif object_format == "arrow-table":
+        return pa.Table.from_pandas(df)
+    elif object_format == "arrow-batch":
+        return pa.RecordBatch.from_pandas(df)
+    raise ValueError("Unknown item type: " + object_format)
+
+
+def arrow_item_from_table(
+    table: Any,
+    object_format: TPythonTableFormat,
+) -> Any:
+    if object_format == "pandas":
+        return table.to_pandas()
+    elif object_format == "arrow-table":
+        return table
+    elif object_format == "arrow-batch":
+        return table.to_batches()[0]
+    raise ValueError("Unknown item type: " + object_format)
+
+
+def init_test_logging(c: RuntimeConfiguration = None) -> None:
+    ctx = Container()[PluggableRunContext].context
+    ctx.initialize_runtime(c)
+
+
+@configspec
+class SentryLoggerConfiguration(RuntimeConfiguration):
+    pipeline_name: str = "logger"
+    sentry_dsn: str = (
+        "https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752"
+    )
+
+
+def start_test_telemetry(c: RuntimeConfiguration = None):
+    stop_telemetry()
+    if not c:
+        c = resolve_configuration(RuntimeConfiguration())
+        c.dlthub_telemetry = True
+    ctx = Container()[PluggableRunContext].context
+    ctx.initialize_runtime(c)
+
+
+@pytest.fixture
+def temporary_telemetry() -> Iterator[RuntimeConfiguration]:
+    c = SentryLoggerConfiguration()
+    start_test_telemetry(c)
+    try:
+        yield c
+    finally:
+        stop_telemetry()
+
+
+@pytest.fixture
+def disable_temporary_telemetry() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        # force stop telemetry
+        telemetry._TELEMETRY_STARTED = True
+        stop_telemetry()
+        from dlt.common.runtime import anon_tracker
+
+        assert anon_tracker._ANON_TRACKER_ENDPOINT is None
+
+
+def clean_test_storage(
+    init_normalize: bool = False, init_loader: bool = False, mode: str = "t"
+) -> FileStorage:
+    storage = FileStorage(get_test_storage_root(), mode, makedirs=True)
+    storage.delete_folder("", recursively=True, delete_ro=True)
+    storage.create_folder(".")
+    if init_normalize:
+        from dlt.common.storages import NormalizeStorage
+
+        NormalizeStorage(True)
+    if init_loader:
+        from dlt.common.storages import LoadStorage
+
+        LoadStorage(True, LoadStorage.ALL_SUPPORTED_FILE_FORMATS)
+    return storage
+
+
+def create_schema_with_name(schema_name) -> Schema:
+    schema = Schema(schema_name)
+    return schema
+
+
+def assert_no_dict_key_starts_with(d: StrAny, key_prefix: str) -> None:
+    assert all(not key.startswith(key_prefix) for key in d.keys())
+
+
+def sum_job_metrics_by_table(job_metrics: Dict[str, DataWriterMetrics]) -> Dict[str, int]:
+    """Sum `items_count` per table from step info `job_metrics` (keyed by job id)."""
+    counts: Dict[str, int] = {}
+    for job_id, metric in job_metrics.items():
+        table_name = job_id.split(".", 1)[0]
+        counts[table_name] = counts.get(table_name, 0) + metric.items_count
+    return counts
+
+
+def skip_if_not_active(*destinations: str) -> None:
+    for destination in destinations:
+        assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown skipped destination {destination}"
+    if all(d not in ACTIVE_DESTINATIONS for d in destinations):
+        pytest.skip(
+            f"{', '.join(destinations)} not in ACTIVE_DESTINATIONS", allow_module_level=True
+        )
+
+
+def is_running_in_github_fork() -> bool:
+    """Check if executed by GitHub Actions, in a repo fork."""
+    is_github_actions = is_running_in_github_ci()
+    is_fork = os.environ.get("IS_FORK") == "true"  # custom var set by us in the workflow's YAML
+    return is_github_actions and is_fork
+
+
+def is_running_in_github_ci() -> bool:
+    """Check if executed by GitHub Actions"""
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+skipifspawn = pytest.mark.skipif(
+    multiprocessing.get_start_method() != "fork", reason="process fork not supported"
+)
+
+skipifpypy = pytest.mark.skipif(
+    platform.python_implementation() == "PyPy", reason="won't run in PyPy interpreter"
+)
+
+skipifnotwindows = pytest.mark.skipif(platform.system() != "Windows", reason="runs only on windows")
+
+skipifwindows = pytest.mark.skipif(
+    platform.system() == "Windows", reason="does not runs on windows"
+)
+
+skipifgithubfork = pytest.mark.skipif(
+    is_running_in_github_fork(), reason="Skipping test because it runs on a PR coming from fork"
+)
+
+skipifgithubci = pytest.mark.skipif(
+    is_running_in_github_ci(), reason="This test does not work on github CI"
+)
+
+skipifworktree = pytest.mark.skipif(
+    os.path.basename(os.path.abspath(".")) != "dlt",
+    reason="Test requires run dir to be 'dlt' (skipped in worktrees)",
+)
+
+
+@contextlib.contextmanager
+def reset_providers(settings_dir: str) -> Iterator[ConfigProvidersContainer]:
+    """Context manager injecting standard set of providers where toml providers are initialized from `settings_dir`"""
+    return _reset_providers(settings_dir)
+
+
+def _reset_providers(settings_dir: str) -> Iterator[ConfigProvidersContainer]:
+    yield from _inject_providers(
+        [
+            EnvironProvider(),
+            SecretsTomlProvider(settings_dir=settings_dir),
+            ConfigTomlProvider(settings_dir=settings_dir),
+        ]
+    )
+
+
+@contextlib.contextmanager
+def inject_providers(providers: List[ConfigProvider]) -> Iterator[ConfigProvidersContainer]:
+    return _inject_providers(providers)
+
+
+def _inject_providers(providers: List[ConfigProvider]) -> Iterator[ConfigProvidersContainer]:
+    container = Container()
+    ctx = ConfigProvidersContainer(initial_providers=providers)
+    try:
+        old_providers = container[PluggableRunContext].providers
+        container[PluggableRunContext].providers = ctx
+        yield ctx
+    finally:
+        container[PluggableRunContext].providers = old_providers
+
+
+@contextlib.contextmanager
+def capture_dlt_logger(
+    caplog: pytest.LogCaptureFixture, level: int = logging.WARNING
+) -> Iterator[pytest.LogCaptureFixture]:
+    """Temporarily enables propagation on `dlt` logger so `caplog` can capture logs."""
+    dlt_logger = logging.getLogger("dlt")
+    dlt_logger.propagate = True
+    try:
+        with caplog.at_level(level, logger="dlt"):
+            yield caplog
+    finally:
+        dlt_logger.propagate = False

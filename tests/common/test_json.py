@@ -1,0 +1,475 @@
+import io
+import os
+from datetime import date, datetime, time, timedelta, timezone  # noqa: I251
+from typing import Any, List, NamedTuple
+from dataclasses import dataclass
+from zoneinfo import ZoneInfo
+import pytest
+import pytz
+from copy import deepcopy
+
+from dlt.common import json, Decimal, pendulum
+from dlt.common.time import datetime_to_timestamp_us
+from dlt.common.arithmetics import numeric_default_context
+from dlt.common import known_env
+from dlt.common.json import (
+    _DECIMAL,
+    _WEI,
+    PUA_START,
+    PUA_CHARACTER_MAX,
+    custom_pua_decode,
+    may_have_pua,
+    _orjson,
+    _simplejson,
+    SupportsJson,
+    _DATETIME,
+    _custom_encoder,
+    JsonSerializable,
+)
+
+from tests.utils import autouse_test_storage, get_test_storage_root, preserve_environ
+from tests.cases import (
+    JSON_TYPED_DICT,
+    JSON_TYPED_DICT_DECODED,
+    JSON_TYPED_DICT_NESTED,
+    JSON_TYPED_DICT_NESTED_DECODED,
+)
+from tests.common.utils import json_case_path, load_json_case
+
+
+class NamedTupleTest(NamedTuple):
+    str_field: str
+    dec_field: Decimal
+
+
+@dataclass
+class DataClassTest:
+    str_field: str
+    int_field: int = 5
+    dec_field: Decimal = Decimal("0.5")
+
+
+_JSON_IMPL: List[SupportsJson] = [_orjson, _simplejson]  # type: ignore[list-item]
+
+
+def test_orjson_default_imported() -> None:
+    assert json._impl_name == "orjson"
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_load_save_binary(json_impl: SupportsJson) -> None:
+    with open(json_case_path("weird_rows"), "rb") as f:
+        doc = json_impl.load(f)
+    assert doc[1]["str"] == "イロハニホヘト チリヌルヲ 'ワカヨタレソ ツネナラム"
+    test_path = os.path.join(get_test_storage_root(), "weird_rows_b.json")
+    with open(test_path, "wb") as f:
+        json_impl.dump(doc, f)
+    saved_doc = load_json_case("weird_rows")
+    with open(test_path, "rb") as f:
+        dumped_doc = json_impl.load(f)
+    assert doc == saved_doc == dumped_doc
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_string_serialization(json_impl: SupportsJson) -> None:
+    with open(json_case_path("weird_rows"), "r", encoding="utf-8") as f:
+        content = f.read()
+    doc = json_impl.loads(content)
+    serialized = json_impl.dumps(doc)
+    assert "\n" not in serialized
+    doc2 = json_impl.loads(serialized)
+    assert doc == doc2
+    assert doc[1]["str"] == "イロハニホヘト チリヌルヲ 'ワカヨタレソ ツネナラム"
+    assert doc[3]["str"] == "hello\nworld\t\t\t\r\u0006"
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_bytes_serialization(json_impl: SupportsJson) -> None:
+    with open(json_case_path("weird_rows"), "rb") as f:
+        content = f.read()
+    doc = json_impl.loadb(content)
+    serialized = json_impl.dumpb(doc)
+    assert b"\n" not in serialized
+    doc2 = json_impl.loadb(serialized)
+    assert doc == doc2
+    assert doc[1]["str"] == "イロハニホヘト チリヌルヲ 'ワカヨタレソ ツネナラム"
+    assert doc[3]["str"] == "hello\nworld\t\t\t\r\u0006"
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_pretty_print(json_impl: SupportsJson) -> None:
+    # do pretty dump and read
+    with open(json_case_path("weird_rows"), "rb") as f:
+        doc = json_impl.load(f)
+    test_path = os.path.join(get_test_storage_root(), "weird_rows_b.json")
+    with open(test_path, "wb") as f:
+        json_impl.dump(doc, f, pretty=True)
+    with open(test_path, "r", encoding="utf-8") as f:
+        dumped_content = f.readlines()
+    # dumped doc should have idents
+    # print("".join(dumped_content))
+    assert len(dumped_content) == 22
+
+    # dumps
+    content = json_impl.dumps(doc, pretty=True)
+    assert len(content.splitlines()) == 22
+    content_b = json_impl.dumpb(doc, pretty=True)
+    assert len(content_b.splitlines()) == 22
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_order_keys(json_impl: SupportsJson) -> None:
+    with open(json_case_path("mod_bot_case"), "rb") as f:
+        doc = json_impl.load(f)
+    # get keys in current order
+    doc_keys = list(doc.keys())
+    doc__data_keys = list(doc["data"].keys())
+
+    test_path = os.path.join(get_test_storage_root(), "mod_bot_case_b.json")
+    with open(test_path, "wb") as f:
+        json_impl.dump(doc, f, pretty=True, sort_keys=True)
+    with open(test_path, "r", encoding="utf-8") as f:
+        dumped_doc = json_impl.load(f)
+    # keys are ordered
+    assert list(dumped_doc.keys()) == list(sorted(doc_keys))
+    assert list(dumped_doc["data"].keys()) == list(sorted(doc__data_keys))
+    # and not ordered
+    with open(test_path, "wb") as f:
+        json_impl.dump(doc, f, pretty=True)
+    with open(test_path, "r", encoding="utf-8") as f:
+        dumped_doc = json_impl.load(f)
+    assert list(dumped_doc.keys()) == doc_keys
+    assert list(dumped_doc["data"].keys()) == doc__data_keys
+
+    # also for strings
+    content = json_impl.dumps(doc, sort_keys=True)
+    dumped_doc = json_impl.loads(content)
+    assert list(dumped_doc.keys()) == list(sorted(doc_keys))
+    assert list(dumped_doc["data"].keys()) == list(sorted(doc__data_keys))
+    content = json_impl.dumps(doc)
+    dumped_doc = json_impl.loads(content)
+    assert list(dumped_doc.keys()) == doc_keys
+    assert list(dumped_doc["data"].keys()) == doc__data_keys
+
+    content_b = json_impl.dumpb(doc, sort_keys=True)
+    dumped_doc = json_impl.loadb(content_b)
+    assert list(dumped_doc.keys()) == list(sorted(doc_keys))
+    assert list(dumped_doc["data"].keys()) == list(sorted(doc__data_keys))
+    content_b = json_impl.dumpb(doc)
+    dumped_doc = json_impl.loadb(content_b)
+    assert list(dumped_doc.keys()) == doc_keys
+    assert list(dumped_doc["data"].keys()) == doc__data_keys
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_decimals(json_impl: SupportsJson) -> None:
+    # deserialize as float
+    d = json_impl.loads('{"v": 21.37}')
+    assert type(d["v"]) is float
+
+    # serialize as string
+    s = json_impl.dumps({"decimal": Decimal("21.37")})
+    assert s == '{"decimal":"21.37"}'
+
+    # serialize max precision which is 10**38
+    with numeric_default_context():
+        s = json_impl.dumps({"decimal": Decimal(10**29) - Decimal("0.001")})
+        assert s == '{"decimal":"99999999999999999999999999999.999"}'
+
+    # serialize untypical context
+    with numeric_default_context(precision=77):
+        doc = {"decimal": Decimal(10**74) - Decimal("0.001")}
+    # serialize out of local context
+    s = json_impl.dumps(doc)
+    # full precision. you need to quantize yourself if you need it
+    assert (
+        s
+        == '{"decimal":"99999999999999999999999999999999999999999999999999999999999999999999999999.999"}'
+    )
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_large_int(json_impl: SupportsJson):
+    # optimized json parsers like orjson do not support large integers
+    if json_impl._impl_name == "orjson":
+        with pytest.raises(TypeError):
+            doc = json_impl.dumps({"a": 2**256})
+    else:
+        doc = json_impl.dumps({"a": 2**256})
+        assert json_impl.loads(doc)["a"] == 2**256
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_pendulum(json_impl: SupportsJson) -> None:
+    dt_str = "2005-04-02T20:37:37.358236+00:00"
+    r = json_impl.loads('{"t": "%s"}' % dt_str)
+    # iso datetime string not deserialized to dates automatically
+    assert r["t"] == dt_str
+    # use zulu notation for UTC
+    now = pendulum.parse("2005-04-02T20:37:37.358236Z")
+    s = json_impl.dumps({"t": now})
+    # must serialize UTC timezone
+    assert s.endswith('+00:00"}')
+    s_r = json_impl.loads(s)
+    assert pendulum.parse(s_r["t"]) == now
+    # serialize date and time
+    s = json_impl.dumps(JSON_TYPED_DICT)
+    s_r = json_impl.loads(s)
+    assert s_r["date"] == "2022-02-02"
+    assert s_r["time"] == "20:37:37.358236"
+
+    # Decodes zulu notation as well
+    dt_str_z = "2005-04-02T20:37:37.358236Z"
+    s = f'"{_DATETIME + dt_str_z}"'
+    s_r = json_impl.typed_loads(s)
+    assert s_r == pendulum.parse(dt_str_z)
+
+    # decodes timezones and ensures that deepcopy retains timezones
+    # we had a bug where timezones got lost during deepcopy
+    dt_str_utc = "2005-04-02T20:37:37.358236Z"
+    dt_str_0200 = "2005-04-02T20:37:37.358236+02:00"
+    dt_naive = "2005-04-02T20:37:37.358236"
+
+    values = {
+        "utc": pendulum.parse(dt_str_utc),
+        "0200": pendulum.parse(dt_str_0200),
+        "naive": pendulum.parse(dt_naive, tz=None),
+    }
+
+    loaded_values = json_impl.typed_loads(json_impl.typed_dumps(values))
+    assert loaded_values == values
+
+    copied_values = deepcopy(loaded_values)
+    assert copied_values == values == loaded_values
+    # assert the offset, not the tzinfo name: decoders may return stdlib or pendulum zones
+    assert copied_values["utc"].utcoffset() == timedelta(0)
+    assert copied_values["0200"].utcoffset() == timedelta(hours=2)
+    assert copied_values["naive"].utcoffset() is None
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_dumps_utc_z(json_impl: SupportsJson) -> None:
+    """`utc_z` restores each backend's own pre-1.29 rendering of a UTC datetime."""
+    value = datetime(2024, 1, 15, 23, 30, tzinfo=timezone.utc)
+    assert json_impl.dumps(value) == '"2024-01-15T23:30:00+00:00"'
+    legacy = (
+        '"2024-01-15T23:30:00Z"'
+        if json_impl._impl_name == "orjson"
+        else '"2024-01-15T23:30:00+00:00"'
+    )
+    assert json_impl.dumps(value, utc_z=True) == legacy
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2024, 1, 15, 23, 30, tzinfo=timezone.utc),
+        datetime(2024, 1, 16, 0, 30, tzinfo=ZoneInfo("Europe/Berlin")),
+        datetime(2024, 1, 15, 23, 30),
+        pendulum.DateTime(2024, 1, 15, 23, 30, tzinfo=pendulum.UTC),
+        pytz.UTC.localize(datetime(2024, 1, 15, 23, 30)),
+    ],
+    ids=["utc", "berlin", "naive", "pendulum", "pytz"],
+)
+def test_json_dumps_datetime_encoder(json_impl: SupportsJson, value: datetime) -> None:
+    """`datetime_encoder` replaces `isoformat` for every datetime, nested ones included, and
+    leaves dates, times and other custom types as they render without it."""
+    doc = {
+        "dt": value,
+        "nested": [value, {"dt": value}],
+        "d": date(2024, 1, 15),
+        "t": time(23, 30, 15, 123456),
+        "dec": Decimal("1.25"),
+    }
+    encoded = json_impl.dumps(doc, sort_keys=True, datetime_encoder=datetime_to_timestamp_us)
+    assert (
+        encoded
+        == '{"d":"2024-01-15","dec":"1.25","dt":1705361400000000,"nested":[1705361400000000,{"dt":1705361400000000}],"t":"23:30:15.123456"}'
+    )
+    # the other values render exactly as they do without the encoder
+    plain = json_impl.loads(json_impl.dumps(doc, sort_keys=True))
+    del plain["dt"], plain["nested"]
+    assert plain == {"d": "2024-01-15", "dec": "1.25", "t": "23:30:15.123456"}
+
+
+# @pytest.mark.parametrize("json_impl", _JSON_IMPL)
+# def test_json_timedelta(json_impl: SupportsJson) -> None:
+#     from datetime import timedelta
+#     start_date = pendulum.parse("2005-04-02T20:37:37.358236Z")
+#     delta = pendulum.interval(start_date, pendulum.now())
+#     assert isinstance(delta, timedelta)
+#     print(str(delta.as_timedelta()))
+
+current_custom_encoder = _custom_encoder
+
+
+@pytest.fixture(autouse=True)
+def run_around_tests():
+    json.set_custom_encoder(None)
+    try:
+        yield
+    finally:
+        json.set_custom_encoder(current_custom_encoder)
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_named_tuple(json_impl: SupportsJson) -> None:
+    assert (
+        json_impl.dumps(NamedTupleTest("STR", Decimal("1.3333")))
+        == '{"str_field":"STR","dec_field":"1.3333"}'
+    )
+    with io.BytesIO() as b:
+        json_impl.typed_dump(NamedTupleTest("STR", Decimal("1.3333")), b)
+        assert (
+            b.getvalue().decode("utf-8") == '{"str_field":"STR","dec_field":"%s1.3333"}' % _DECIMAL
+        )
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_data_class(json_impl: SupportsJson) -> None:
+    assert (
+        json_impl.dumps(DataClassTest(str_field="AAA"))
+        == '{"str_field":"AAA","int_field":5,"dec_field":"0.5"}'
+    )
+    with io.BytesIO() as b:
+        json_impl.typed_dump(DataClassTest(str_field="AAA"), b)
+        assert (
+            b.getvalue().decode("utf-8")
+            == '{"str_field":"AAA","int_field":5,"dec_field":"%s0.5"}' % _DECIMAL
+        )
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_encode(json_impl: SupportsJson) -> None:
+    j = json_impl.dumps(JSON_TYPED_DICT)
+    d = json_impl.loads(j)
+    # all our values are strings
+    assert all(isinstance(v, str) for v in d.values())
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_typed_dumps_loads(json_impl: SupportsJson) -> None:
+    s = json_impl.typed_dumps(JSON_TYPED_DICT_NESTED)
+    b = json_impl.typed_dumpb(JSON_TYPED_DICT_NESTED)
+
+    assert json_impl.typed_loads(s) == JSON_TYPED_DICT_NESTED_DECODED
+    assert json_impl.typed_loadb(b) == JSON_TYPED_DICT_NESTED_DECODED
+
+    # Test load/dump naked
+    dt = pendulum.now()
+    s = json_impl.typed_dumps(dt)
+    assert json_impl.typed_loads(s) == dt
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_json_typed_encode(json_impl: SupportsJson) -> None:
+    with io.BytesIO() as b:
+        json_impl.typed_dump(JSON_TYPED_DICT, b)
+        j = b.getvalue().decode("utf-8")
+    # use normal decoder
+    d = json_impl.loads(j)
+    # we have pua chars
+    assert d["decimal"][0] == _DECIMAL
+    assert d["wei"][0] == _WEI
+    # decode all
+    d_d = {k: custom_pua_decode(v) for k, v in d.items()}
+    assert d_d == JSON_TYPED_DICT_DECODED
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_pua_detection(json_impl: SupportsJson) -> None:
+    with io.BytesIO() as b:
+        json_impl.typed_dump(JSON_TYPED_DICT, b)
+        content_b = b.getvalue()
+    assert may_have_pua(content_b)
+    with open(json_case_path("rasa_event_bot_metadata"), "rb") as f:
+        content_b = f.read()
+    assert not may_have_pua(content_b)
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_garbage_pua_string(json_impl: SupportsJson) -> None:
+    for c in range(PUA_START, PUA_START + PUA_CHARACTER_MAX):
+        garbage = f"{chr(c)}GABAGE🤷"
+        with io.BytesIO() as b:
+            json_impl.typed_dump(garbage, b)
+            content_b = b.getvalue()
+        assert may_have_pua(content_b)
+        # if cannot parse, the initial object is returned
+        assert custom_pua_decode(json_impl.loadb(content_b)) == garbage
+
+
+def test_change_pua_start() -> None:
+    import inspect
+
+    os.environ[known_env.DLT_JSON_TYPED_PUA_START] = "0x0FA179"
+    from importlib import reload
+
+    try:
+        reload(inspect.getmodule(SupportsJson))
+        from dlt.common.json import PUA_START as MOD_PUA_START
+
+        assert MOD_PUA_START == int("0x0FA179", 16)
+    finally:
+        # restore old start
+        os.environ[known_env.DLT_JSON_TYPED_PUA_START] = hex(PUA_START)
+        from importlib import reload
+
+        reload(inspect.getmodule(SupportsJson))
+        from dlt.common.json import PUA_START as MOD_PUA_START
+
+        assert MOD_PUA_START == PUA_START
+
+
+def test_load_and_compare_all_impls() -> None:
+    with open(json_case_path("rasa_event_bot_metadata"), "rb") as f:
+        content_b = f.read()
+
+    docs = [impl.loadb(content_b) for impl in _JSON_IMPL]
+    dump_s = [impl.dumps(docs[idx]) for idx, impl in enumerate(_JSON_IMPL)]
+    dump_b = [impl.dumpb(docs[idx]) for idx, impl in enumerate(_JSON_IMPL)]
+
+    # same docs, same output
+    for idx in range(0, len(docs) - 1):
+        assert docs[idx] == docs[idx + 1]
+        assert dump_s[idx] == dump_s[idx + 1]
+        assert dump_b[idx] == dump_b[idx + 1]
+
+
+class Pow:
+    my_number: int
+
+    def __init__(self, my_number: int) -> None:
+        self.my_number = my_number
+
+    def result(self) -> str:
+        return f"{self.my_number*self.my_number}"
+
+
+def roundtrip(json_impl: SupportsJson) -> None:
+    x = Pow(my_number=2)
+    s = json_impl.dumps(x)
+    assert json_impl.loads(s) == "4"
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_serialize_custom_types_no_encoder(json_impl: SupportsJson) -> None:
+    with pytest.raises(TypeError, match="is not JSON serializable"):
+        roundtrip(json_impl)
+
+
+@pytest.mark.parametrize("json_impl", _JSON_IMPL)
+def test_serialize_custom_types_with_encoder(json_impl: SupportsJson) -> None:
+    calls = 0
+
+    def my_custom_encoder(obj: Any) -> JsonSerializable:
+        nonlocal calls
+        calls += 1
+        if isinstance(obj, Pow):
+            return obj.result()
+        raise TypeError(repr(obj) + " is not JSON serializable")
+
+    json_impl.set_custom_encoder(my_custom_encoder)
+    roundtrip(json_impl)
+    assert calls == 1

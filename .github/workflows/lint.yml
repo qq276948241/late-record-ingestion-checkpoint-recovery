@@ -1,0 +1,62 @@
+
+name: lint | code & tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+
+  run_lint:
+    name: lint
+    defaults:
+      run:
+        shell: bash
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+
+    steps:
+
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.10"
+          activate-environment: true
+          enable-cache: true
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --all-extras --no-extra hub --group airflow --group providers --group pipeline --group sources --group sentry-sdk --group dbt
+
+      - name: Run make lint
+        run: make lint
+
+      # emscripten drops the marker-excluded deps (orjson), so this catches a hard
+      # import of one of them that plain CPython lint cannot see
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Check dlt imports under emscripten
+        run: make lint-emscripten
+
+      - name: Check filesizes
+        uses: ppremk/lfs-warning@v3.2
+        with:
+          filesizelimit: 50000
+          exclusionPatterns: |
+            **/*.py
+            **/*.lock
+            **/*.md
+            **/*.ipynb
+            **/package-lock.json

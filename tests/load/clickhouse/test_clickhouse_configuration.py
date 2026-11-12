@@ -1,0 +1,213 @@
+from typing import Iterator
+
+import pytest
+from pytest_mock import MockerFixture
+
+from dlt.common.configuration.resolve import resolve_configuration
+from dlt.common.destination.exceptions import DestinationTerminalException
+from dlt.common.libs.sql_alchemy_compat import make_url
+from dlt.common.utils import custom_environ, digest128
+from dlt.destinations import clickhouse
+from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
+from dlt.destinations.impl.clickhouse.configuration import (
+    ClickHouseCredentials,
+    ClickHouseClientConfiguration,
+)
+from dlt.destinations.impl.clickhouse.sql_client import ClickHouseSqlClient
+from tests.load.utils import yield_client_with_storage
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.fixture(scope="function")
+def client() -> Iterator[ClickHouseClient]:
+    yield from yield_client_with_storage("clickhouse")  # type: ignore
+
+
+def test_clickhouse_connection_string_with_all_params() -> None:
+    url = (
+        "clickhouse://user1:pass1@host1:9000/testdb?allow_experimental_lightweight_delete=1&"
+        "allow_experimental_object_type=1&connect_timeout=230&date_time_input_format=best_effort&"
+        "enable_http_compression=1&secure=0&send_receive_timeout=1000"
+    )
+
+    creds = ClickHouseCredentials()
+    creds.parse_native_representation(url)
+
+    assert creds.database == "testdb"
+    assert creds.username == "user1"
+    assert creds.password == "pass1"
+    assert creds.host == "host1"
+    assert creds.port == 9000
+    assert creds.secure == 0
+    assert creds.connect_timeout == 230
+    assert creds.send_receive_timeout == 1000
+
+    expected = make_url(url)
+
+    # Test URL components regardless of query param order.
+    assert make_url(creds.to_native_representation()) == expected
+
+
+def test_clickhouse_credentials_resolved() -> None:
+    with custom_environ(
+        {
+            "CREDENTIALS__HOST": "localhost",
+            "CREDENTIALS__PORT": "9000",
+            "CREDENTIALS__USERNAME": "user",
+            "CREDENTIALS__PASSWORD": "pass",
+            "CREDENTIALS__DATABASE": "test_db",
+            "CREDENTIALS__S3_EXTRA_CREDENTIALS": '{"role_arn": "my_arn"}',
+        }
+    ):
+        config = resolve_configuration(ClickHouseCredentials())
+
+        assert config.host == "localhost"
+        assert config.port == 9000
+        assert config.username == "user"
+        assert config.password == "pass"
+        assert config.s3_extra_credentials
+        assert config.s3_extra_credentials["role_arn"] == "my_arn"
+
+
+def test_clickhouse_factory_select_sequential_consistency() -> None:
+    dest = clickhouse(select_sequential_consistency=0)
+    assert dest.config_params["select_sequential_consistency"] == 0
+
+    dest = clickhouse()
+    assert "select_sequential_consistency" not in dest.config_params
+
+
+@pytest.mark.parametrize(
+    "connection_string,expected_fingerprint",
+    [
+        pytest.param("", "", id="empty"),
+        pytest.param(
+            "clickhouse://user1:pass1@host1:9000/db1",
+            digest128("host1"),
+            id="legacy_host_only_custom_port",
+        ),
+        pytest.param(
+            "clickhouse://user1:pass1@host1:9440/db1",
+            digest128("host1"),
+            id="legacy_host_only_default_port",
+        ),
+    ],
+)
+def test_clickhouse_fingerprint(connection_string: str, expected_fingerprint: str) -> None:
+    if connection_string:
+        credentials = resolve_configuration(
+            ClickHouseCredentials(),
+            explicit_value=connection_string,
+        )
+        config = ClickHouseClientConfiguration(credentials=credentials)
+    else:
+        config = ClickHouseClientConfiguration()
+
+    assert config.fingerprint() == expected_fingerprint
+
+
+def test_clickhouse_connection_settings(client: ClickHouseClient) -> None:
+    """Test experimental settings are set correctly for the session."""
+    # with client.sql_client.open_connection() as conn:
+    conn = client.sql_client.native_connection
+    cursor1 = conn.cursor()
+    cursor2 = conn.cursor()
+
+    cursors = [cursor1, cursor2]
+
+    for cursor in cursors:
+        cursor.execute("SELECT name, value FROM system.settings")
+        res = cursor.fetchall()
+
+        assert ("allow_experimental_lightweight_delete", "1") in res
+        assert ("enable_http_compression", "1") in res
+        assert ("date_time_input_format", "best_effort") in res
+        assert ("select_sequential_consistency", "1") in res
+
+
+def test_clickhouse_session_timezone(client: ClickHouseClient) -> None:
+    credentials = client.config.credentials.copy()
+    assert "session_timezone" not in credentials.get_query()
+
+    credentials.session_timezone = "Asia/Tokyo"
+    assert credentials.get_query()["session_timezone"] == "Asia/Tokyo"
+
+    sql_client = ClickHouseSqlClient(
+        client.sql_client.dataset_name,
+        client.sql_client.staging_dataset_name,
+        [],
+        credentials,
+        client.capabilities,
+        client.config,
+    )
+    with sql_client:
+        assert sql_client.execute_sql("SELECT timezone()")[0][0] == "Asia/Tokyo"
+
+
+def test_client_has_dataset(client: ClickHouseClient) -> None:
+    # with client.sql_client as sql_client:
+    assert client.sql_client.has_dataset()
+    separator = client.config.dataset_table_separator
+
+    def _assert_has_dataset() -> None:
+        assert not client.sql_client.has_dataset()
+        client.sql_client.create_dataset()
+        assert client.sql_client.has_dataset()
+        client.sql_client.drop_dataset()
+        assert not client.sql_client.has_dataset()
+
+    try:
+        # change separator
+        client.config.dataset_table_separator = "_"
+        _assert_has_dataset()
+
+        client.config.dataset_table_separator = ""
+        _assert_has_dataset()
+    finally:
+        client.config.dataset_table_separator = separator
+
+
+def test_client_table_name_and_paths(client: ClickHouseClient) -> None:
+    dataset_name = client.sql_client.dataset_name
+
+    # we have could and local database names different
+    databases = ["default", "dlt", "dlt_data"]
+
+    assert client.sql_client.make_qualified_table_name_path(None, quote=False)[0] in databases
+    parts = client.sql_client.make_qualified_table_name_path("test_table", quote=False)
+    assert parts[0] in databases
+    assert parts[1] == f"{dataset_name}___test_table"
+
+    client.config.dataset_table_separator = "###"
+
+    assert client.sql_client.make_qualified_table_name_path(None, quote=False)[0] in databases
+    parts = client.sql_client.make_qualified_table_name_path("test_table", quote=False)
+    assert parts[0] in databases
+    assert parts[1] == f"{dataset_name}###test_table"
+
+
+@pytest.mark.parametrize("engine", ["Atomic", "Replicated", "Shared"])
+def test_staging_optimized_accepts_supported_engines(
+    client: ClickHouseClient, mocker: MockerFixture, engine: str
+) -> None:
+    mocker.patch.object(client.sql_client, "execute_sql", return_value=[(engine,)])
+    client._verify_database_supports_exchange()
+
+
+@pytest.mark.parametrize("engine", ["Ordinary", "Lazy", "Memory"])
+def test_staging_optimized_rejects_unsupported_engines(
+    client: ClickHouseClient, mocker: MockerFixture, engine: str
+) -> None:
+    mocker.patch.object(client.sql_client, "execute_sql", return_value=[(engine,)])
+    with pytest.raises(DestinationTerminalException, match="Atomic or Replicated or Shared"):
+        client._verify_database_supports_exchange()
+
+
+def test_staging_optimized_rejects_missing_engine(
+    client: ClickHouseClient, mocker: MockerFixture
+) -> None:
+    mocker.patch.object(client.sql_client, "execute_sql", return_value=[])
+    with pytest.raises(DestinationTerminalException, match="unknown"):
+        client._verify_database_supports_exchange()

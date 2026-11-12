@@ -1,0 +1,108 @@
+name: dlt
+
+on:
+  pull_request:
+    branches: [ master, devel, runtime ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # checks wether anything outside docs has changed, if not, most of the tests can be skipped
+  # lint will check this and if lint is not run, no other tests will be run
+  get_docs_changes:
+    name: docs changes
+    uses: ./.github/workflows/get_docs_changes.yml
+
+  # check for secret-requiring jobs: secrets are only available for internal (same-repo) PRs under pull_request.
+  # fork PRs with the `ci from fork` label are handled separately by fork_tests_with_secrets.yml (pull_request_target).
+  authorize_secrets:
+    name: secrets (internal PRs)
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize') }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - run: true
+
+  # testing and linting of docs snippets is always run to catch problems in the docs
+  # NOTE: we could splint linting and testing of docs so linter can also always run for fork PRs
+  docs_check:
+    uses: ./.github/workflows/docs_check.yml
+    secrets: inherit
+
+  # NOTE: we build docs the same way as on cloudflare, so we can catch problems early
+  docs_build:
+    uses: ./.github/workflows/docs_build.yml
+
+  lint:
+    name: lint
+    needs: get_docs_changes
+    uses: ./.github/workflows/lint.yml
+    if: needs.get_docs_changes.outputs.changes_outside_docs == 'true'
+
+  test_common:
+    name: common
+    needs: [lint]
+    uses: ./.github/workflows/test_common.yml
+
+  test_dashboard:
+    name: dashboard
+    needs: [lint]
+    uses: ./.github/workflows/test_tools_dashboard.yml
+
+  #
+  # Destination and Sources local tests, do not provide secrets
+  # Other tests that do not require remote connections
+  #
+  test_destinations_local:
+    name: local
+    needs: test_common
+    uses: ./.github/workflows/test_destinations_local.yml
+
+  test_sources_local:
+    name: src local
+    needs: test_common
+    uses: ./.github/workflows/test_sources_local.yml
+
+  test_hub:
+    name: hub
+    needs: lint
+    uses: ./.github/workflows/test_hub.yml
+
+  test_tools_airflow:
+    name: airflow
+    needs: lint
+    uses: ./.github/workflows/test_tools_airflow.yml
+
+  test_tools_build_images:
+    name: build images
+    needs: lint
+    uses: ./.github/workflows/test_tools_build_images.yml
+
+  #
+  # Remote destination tests and docs examples, needs secrets,
+  # so we depend on authorize and forward secrets
+  #
+  test_destinations_remote:
+    name: remote
+    needs: [authorize_secrets, test_common]
+    uses: ./.github/workflows/test_destinations_remote.yml
+    secrets: inherit
+    with:
+      run_full_test_suite: ${{ contains(github.event.pull_request.labels.*.name, 'ci full') || github.event_name == 'schedule' }}
+
+  #
+  # Other tools and tests that require secrets
+  #
+  test_tools_dbt_runner:
+    name: dbt
+    needs: [test_common, authorize_secrets]
+    uses: ./.github/workflows/test_tools_dbt_runner.yml
+    secrets: inherit
+
+  # dbt cloud tests currently are disabled, TODO: explain why
+  # test_tools_dbt_cloud:
+  #   needs: [test_common, authorize_secrets]
+  #   uses: ./.github/workflows/test_tools_dbt_cloud.yml
+  #   secrets: inherit

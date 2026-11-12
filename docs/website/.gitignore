@@ -1,0 +1,37 @@
+# Dependencies
+/node_modules
+
+# Production
+/build
+
+# preprocessed docs
+/docs_processed
+
+# Generated files
+/docs/hub/command-line-interface.md
+/docs/hub/reference/api/*-api.md
+/docs/hub/reference/python-sdk/
+.docusaurus
+.cache-loader
+jaffle_shop
+
+# Misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ignore all versions, there are generated dynamically
+versions.json
+versioned_docs
+versioned_sidebars
+versioned_redirects
+.dlt-repo
+
+# compiled redirects (built from redirects.js + versioned_redirects/*.js)
+redirects.compiled.js

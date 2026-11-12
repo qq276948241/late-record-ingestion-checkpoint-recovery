@@ -1,0 +1,192 @@
+---
+title: Getting started with dlt
+sidebar_label: Introduction
+description: Introduction to dlt
+keywords: [introduction, who, what, how]
+---
+# Getting started
+
+:::info
+Looking for the managed [dltHub platform](https://dlthub.com/products/dlthub), [dltHub AI Harness](https://dlthub.com/features/ai-harness), transformations, or data quality features? See the [dltHub docs](hub/getting-started/introduction.md).
+:::
+
+![dlt pacman](/img/dlt-pacman.gif)
+
+## What is dlt?
+
+dlt is an [open-source Python library](https://dlthub.com/product/dlt) that loads data from various, often messy data sources into well-structured datasets. It provides lightweight Python interfaces to extract, load, inspect and transform the data. dlt and the dlt docs are built from the ground up to be used with coding agents: [Agent-native workflow](hub/ingestion/rest-api-source.md) will take your pipeline code to data in a notebook for over [11,000+ sources](https://dlthub.com/context).
+
+dlt is designed to be easy to use, flexible, and scalable:
+
+- dlt extracts data from [REST APIs](./tutorial/rest-api), [SQL databases](./tutorial/sql-database), [cloud storage](./tutorial/filesystem), [Python data structures](./tutorial/load-data-from-an-api), and [many more](./dlt-ecosystem/verified-sources)
+- dlt infers [schemas](./general-usage/schema) and [data types](./general-usage/schema/#data-types), [normalizes the data](./general-usage/schema/#data-normalizer), and handles nested data structures.
+- dlt supports a variety of [popular destinations](./dlt-ecosystem/destinations/) and has an interface to add [custom destinations](./dlt-ecosystem/destinations/destination) to create reverse ETL pipelines.
+- dlt automates pipeline maintenance with [incremental loading](./general-usage/incremental-loading), [schema evolution](./general-usage/schema-evolution), and [schema and data contracts](./general-usage/schema-contracts).
+- dlt supports [Python and SQL data access](general-usage/dataset-access/dataset.md), [transformations](dlt-ecosystem/transformations) and supports [pipeline inspection](hub/ingestion/dashboard.md) and [visualizing data in Marimo Notebooks](general-usage/dataset-access/marimo).
+- dlt can be deployed anywhere Python runs, be it on [Airflow](./walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer), [serverless functions](./walkthroughs/deploy-a-pipeline/deploy-with-google-cloud-functions), or any other cloud deployment of your choice.
+
+To get started with dlt, install the library using pip (use [clean virtual environment](reference/installation) for your experiments!):
+
+```cli
+pip install dlt
+```
+
+:::tip Working with the dltHub platform?
+If you want the managed platform, the dltHub AI Harness, transformations, and data quality features, get started here:
+
+```cli
+uvx dlthub-start@latest
+```
+
+See [Deploy your first pipeline](hub/getting-started/onboarding.md) for a walkthrough, or the
+[dltHub docs](hub/getting-started/introduction.md) for the full picture.
+:::
+
+:::tip
+If you'd like to try out dlt without installing it on your machine, check out the [Google Colab demo](https://colab.research.google.com/drive/1NfSB1DpwbbHX9_t5vlalBTf13utwpMGx?usp=sharing).
+:::
+
+## Load data with dlt from …
+
+<Tabs
+  groupId="source-type"
+  defaultValue="rest-api"
+  values={[
+    {"label": "REST APIs", "value": "rest-api"},
+    {"label": "SQL databases", "value": "sql-database"},
+    {"label": "Cloud storages or files", "value": "filesystem"},
+    {"label": "Python data structures", "value": "python-data"},
+]}>
+  <TabItem value="rest-api">
+
+Use dlt's [REST API source](./tutorial/rest-api) to extract data from any REST API. Define the API endpoints you'd like to fetch data from, the pagination method, and authentication, and dlt will handle the rest:
+
+```py
+import dlt
+from dlt.sources.rest_api import rest_api_source
+
+source = rest_api_source({
+    "client": {
+        "base_url": "https://api.example.com/",
+        "auth": {
+            "token": dlt.secrets["your_api_token"],
+        },
+        "paginator": {
+            "type": "json_link",
+            "next_url_path": "paging.next",
+        },
+    },
+    "resources": ["posts", "comments"],
+})
+
+pipeline = dlt.pipeline(
+    pipeline_name="rest_api_example",
+    destination="duckdb",
+    dataset_name="rest_api_data",
+)
+
+load_info = pipeline.run(source)
+
+# print load info and posts table as data frame
+print(load_info)
+print(pipeline.dataset().posts.df())
+```
+
+:::tip
+LLMs are great at generating REST API pipelines!
+
+* [Follow LLM tutorial](hub/ingestion/rest-api-source.md) and start with one of [11,000+ sources](https://dlthub.com/context)
+* Follow the [REST API source tutorial](./tutorial/rest-api) to learn more about the source configuration and pagination methods.
+:::
+
+  </TabItem>
+  <TabItem value="sql-database">
+
+Use the [SQL source](./tutorial/sql-database) to extract data from databases like PostgreSQL, MySQL, SQLite, Oracle, and more.
+
+```py
+from dlt.sources.sql_database import sql_database
+
+source = sql_database(
+    "mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam"
+)
+
+pipeline = dlt.pipeline(
+    pipeline_name="sql_database_example",
+    destination="duckdb",
+    dataset_name="sql_data",
+)
+
+load_info = pipeline.run(source)
+
+# print load info and the "family" table as data frame
+print(load_info)
+print(pipeline.dataset().family.df())
+```
+
+Follow the [SQL source tutorial](./tutorial/sql-database) to learn more about the source configuration and supported databases.
+
+  </TabItem>
+  <TabItem value="filesystem">
+
+The [Filesystem](./tutorial/filesystem) source extracts data from AWS S3, Google Cloud Storage, Google Drive, Azure, or a local file system.
+
+```py
+from dlt.sources.filesystem import filesystem
+
+resource = filesystem(
+    bucket_url="s3://example-bucket",
+    file_glob="*.csv"
+)
+
+pipeline = dlt.pipeline(
+    pipeline_name="filesystem_example",
+    destination="duckdb",
+    dataset_name="filesystem_data",
+)
+
+load_info = pipeline.run(resource)
+
+# print load info and the "example" table as data frame
+print(load_info)
+print(pipeline.dataset().example.df())
+```
+
+Follow the [filesystem source tutorial](./tutorial/filesystem) to learn more about the source configuration and supported storage services.
+
+  </TabItem>
+  <TabItem value="python-data">
+
+dlt can load data from Python generators or directly from Python data structures:
+
+```py
+import dlt
+
+@dlt.resource(table_name="foo_data")
+def foo():
+    for i in range(10):
+        yield {"id": i, "name": f"This is item {i}"}
+
+pipeline = dlt.pipeline(
+    pipeline_name="python_data_example",
+    destination="duckdb",
+)
+
+load_info = pipeline.run(foo)
+
+# print load info and the "foo_data" table as data frame
+print(load_info)
+print(pipeline.dataset().foo_data.df())
+```
+
+Check out the [Python data structures tutorial](./tutorial/load-data-from-an-api) to learn about dlt fundamentals and advanced usage scenarios.
+
+  </TabItem>
+
+</Tabs>
+
+## Join the dlt community
+
+1. Give the library a ⭐ and check out the code on [GitHub](https://github.com/dlt-hub/dlt).
+1. Ask questions and share how you use the library on [Slack](https://dlthub.com/community).
+1. Report problems and make feature requests [here](https://github.com/dlt-hub/dlt/issues/new/choose).

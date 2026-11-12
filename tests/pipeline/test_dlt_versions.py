@@ -1,0 +1,1043 @@
+import os
+import re
+from datetime import datetime, timezone  # noqa: I251
+from typing import Any, List, Optional, Dict
+import sys
+from subprocess import CalledProcessError
+import pytest
+import tempfile
+import shutil
+from contextlib import contextmanager
+from unittest.mock import patch
+from importlib.metadata import version as pkg_version
+
+import dlt
+from dlt.common import json, pendulum
+from dlt.common.known_env import DLT_DATA_DIR
+from dlt.common.json import custom_pua_decode
+from dlt.common.normalizers.json.helpers import get_propagation_mapping
+from dlt.common.runners import Venv
+from dlt.common.storages.exceptions import StorageMigrationError
+from dlt.common.utils import custom_environ, set_working_dir
+from dlt.common.storages import FileStorage
+from dlt.common.schema.typing import (
+    LOADS_TABLE_NAME,
+    PIPELINE_STATE_TABLE_NAME,
+    SCHEMA_ENGINE_VERSION,
+    VERSION_TABLE_NAME,
+    TStoredSchema,
+)
+from dlt.common.configuration.resolve import resolve_configuration
+from dlt.destinations import duckdb, filesystem
+from dlt.destinations.sql_client import SqlClientBase
+from dlt.destinations.impl.duckdb.configuration import DuckDbClientConfiguration
+from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
+from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+from dlt.destinations.impl.filesystem.sql_client import FilesystemSqlClient
+from dlt.destinations.path_utils import prepare_datetime_params
+
+from tests.pipeline.cases.github_pipeline.filesystem_layout_pipeline import LAYOUT, PIPELINES
+
+from tests.pipeline.utils import airtable_emojis, load_table_counts, assert_load_info
+from tests.utils import get_test_storage_root
+
+
+@contextmanager
+def test_workspace(extra_env: Optional[Dict[str, str]] = None):
+    # store dlt data in test storage (like create_test_run_context)
+    env = {DLT_DATA_DIR: dlt.current.run_context().data_dir}
+
+    # allow test-specific overrides (eg. destination credentials)
+    if extra_env:
+        env.update(extra_env)
+
+    # execute in test storage
+    with set_working_dir(get_test_storage_root()):
+        with custom_environ(env):
+            yield
+
+
+def test_simulate_default_naming_convention_change() -> None:
+    # checks that (future) change in the naming convention won't affect existing pipelines
+    pipeline = dlt.pipeline("simulated_snake_case", destination="duckdb")
+    assert pipeline.naming.name() == "snake_case"
+    pipeline.run(airtable_emojis().with_resources("📆 Schedule", "🦚Peacock", "🦚WidePeacock"))
+    # normalized names
+    assert pipeline.last_trace.last_normalize_info.row_counts["_schedule"] == 3
+    assert "_schedule" in pipeline.default_schema.tables
+
+    # mock the mod
+    # from dlt.common.normalizers import utils
+
+    with patch("dlt.common.schema.normalizers.DEFAULT_NAMING_MODULE", "duck_case"):
+        duck_pipeline = dlt.pipeline("simulated_duck_case", destination="duckdb")
+        assert duck_pipeline.naming.name() == "duck_case"
+        print(airtable_emojis().schema.naming.name())
+
+        # run new and old pipelines
+        duck_pipeline.run(
+            airtable_emojis().with_resources("📆 Schedule", "🦚Peacock", "🦚WidePeacock")
+        )
+        print(duck_pipeline.last_trace.last_normalize_info.row_counts)
+        assert duck_pipeline.last_trace.last_normalize_info.row_counts["📆 Schedule"] == 3
+        assert "📆 Schedule" in duck_pipeline.default_schema.tables
+
+        # old pipeline should keep its naming convention
+        pipeline.run(airtable_emojis().with_resources("📆 Schedule", "🦚Peacock", "🦚WidePeacock"))
+        # normalized names
+        assert pipeline.last_trace.last_normalize_info.row_counts["_schedule"] == 3
+        assert pipeline.naming.name() == "snake_case"
+
+
+GITHUB_PIPELINE_NAME = "dlt_github_pipeline"
+
+skip_on_312 = pytest.mark.skipif(
+    sys.version_info >= (3, 12),
+    reason="Old dlt versions (<1.0) do not run on Python 3.12+",
+)
+GITHUB_DATASET = "github_3"
+
+
+@skip_on_312
+def test_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace(
+        {
+            # save database outside of pipeline dir
+            "DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"
+        }
+    ):
+        # create virtual env with (0.3.0) before the current schema upgrade
+        with Venv.create(
+            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+        ) as venv:
+            # NOTE: we force a newer duckdb into the 0.3.0 dlt version to get compatible duckdb storage
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            # load 20 issues
+            print(
+                venv.run_script(
+                    "../tests/pipeline/cases/github_pipeline/github_pipeline.py",
+                    "duckdb",
+                    "20",
+                )
+            )
+            # load schema and check _dlt_loads definition
+            github_schema: TStoredSchema = json.loads(
+                test_storage.load(
+                    f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/schemas/github.schema.json"
+                )
+            )
+            assert github_schema["engine_version"] == 5
+            assert "schema_version_hash" not in github_schema["tables"][LOADS_TABLE_NAME]["columns"]
+            # check the dlt state table
+            assert {
+                "version_hash" not in github_schema["tables"][PIPELINE_STATE_TABLE_NAME]["columns"]
+            }
+            # make sure that assignees are complex
+            assert (
+                github_schema["tables"]["issues"]["columns"]["assignee"]["data_type"] == "complex"
+            )
+            # make sure that root key propagation is enabled
+            root_prop_config = github_schema["normalizers"]["json"]["config"]["propagation"]["root"]
+            assert root_prop_config["_dlt_id"] == "_dlt_root_id"
+
+            # check loads table without attaching to pipeline
+            duckdb_cfg = resolve_configuration(
+                DuckDbClientConfiguration()._bind_dataset_name(dataset_name=GITHUB_DATASET),
+                sections=("destination", "duckdb"),
+            )
+            with DuckDbSqlClient(
+                GITHUB_DATASET,
+                "%s_staging",
+                duckdb_cfg.credentials,
+                duckdb().capabilities(),
+            ) as client:
+                rows = client.execute_sql(f"SELECT * FROM {LOADS_TABLE_NAME}")
+                # make sure we have just 4 columns
+                assert len(rows[0]) == 4
+                rows = client.execute_sql("SELECT * FROM issues")
+                assert len(rows) == 20
+                rows = client.execute_sql(f"SELECT * FROM {PIPELINE_STATE_TABLE_NAME}")
+                # only 5 columns + 2 dlt columns
+                assert len(rows[0]) == 5 + 2
+            # inspect old state
+            state_dict = json.loads(
+                test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/state.json")
+            )
+            assert "_version_hash" not in state_dict
+            # the legacy `Z` suffix must still decode to the same instant
+            legacy_incremental = state_dict["sources"]["github"]["resources"]["load_issues"][
+                "incremental"
+            ]["created_at"]
+            created_at_value = custom_pua_decode(legacy_incremental["last_value"])
+            assert isinstance(created_at_value, datetime)
+            assert created_at_value == pendulum.parse("2021-04-16T04:34:05Z")
+            # legacy state predates start_value field
+            assert "start_value" not in legacy_incremental
+
+        # execute in current version
+        venv = Venv.restore_current()
+        # load all issues
+        try:
+            print(
+                venv.run_script(
+                    "../tests/pipeline/cases/github_pipeline/github_pipeline.py", "duckdb"
+                )
+            )
+        except CalledProcessError as cpe:
+            print(f"script stdout: {cpe.stdout}")
+            print(f"script stderr: {cpe.stderr}")
+            raise
+        # hash hash in schema
+        github_schema = json.loads(
+            test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/schemas/github.schema.json")
+        )
+        assert github_schema["engine_version"] == SCHEMA_ENGINE_VERSION
+        assert github_schema["tables"]["issues"]["columns"]["assignee"]["data_type"] == "json"
+        assert "schema_version_hash" in github_schema["tables"][LOADS_TABLE_NAME]["columns"]
+        # root propagation dropped from normalizer config
+        norm_config = github_schema["normalizers"]["json"]["config"]
+        assert norm_config["root_key_propagation"] is True
+        assert "root" not in norm_config["propagation"]
+        # print(github_schema["tables"][PIPELINE_STATE_TABLE_NAME])
+        # load state
+        state_dict = json.loads(
+            test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/state.json")
+        )
+        assert "_version_hash" in state_dict
+        assert state_dict["_state_engine_version"] == 4
+        assert state_dict["destination_type"] == "dlt.destinations.duckdb"
+        assert state_dict["destination_name"] is None
+
+        with DuckDbSqlClient(
+            GITHUB_DATASET, "%s_staging", duckdb_cfg.credentials, duckdb().capabilities()
+        ) as client:
+            rows = client.execute_sql(f"SELECT * FROM {LOADS_TABLE_NAME} ORDER BY inserted_at")
+            # we have two loads
+            assert len(rows) == 2
+            assert len(rows[0]) == 5
+            # none inserted after schema migration in load 1
+            assert rows[0][4] is None
+            # hash of schema present in current load (2)
+            assert rows[1][4] == github_schema["version_hash"]
+            # make sure all 100 records loaded (we do incremental load)
+            rows = client.execute_sql("SELECT * FROM issues")
+            assert len(rows) == 100
+            # two schema versions
+            rows = client.execute_sql(f"SELECT * FROM {VERSION_TABLE_NAME}")
+            assert len(rows) == 2
+            rows = client.execute_sql(f"SELECT * FROM {PIPELINE_STATE_TABLE_NAME} ORDER BY version")
+            # we have hash columns
+            assert len(rows[0]) == 6 + 2
+            assert len(rows) == 2
+            # none inserted after schema migration in load 1
+            assert rows[0][7] is None
+            # hash of schema present in current load (2)
+            assert rows[1][7] == state_dict["_version_hash"]
+
+        # attach to existing pipeline
+        pipeline = dlt.attach(
+            GITHUB_PIPELINE_NAME, destination=duckdb(credentials=duckdb_cfg.credentials)
+        )
+        assert_github_pipeline_end_state(pipeline, github_schema, 2)
+
+
+@skip_on_312
+def test_dataset_on_schema_stored_by_old_dlt(test_storage: FileStorage) -> None:
+    """`dlt.dataset` reads the stored schema straight from the destination, without any pipeline
+    state, so it must migrate it like every other stored schema load.
+    """
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+        # 0.3.0 stores an engine 5 schema in the destination
+        with Venv.create(
+            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+        ) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            print(
+                venv.run_script(
+                    "../tests/pipeline/cases/github_pipeline/github_pipeline.py", "duckdb", "20"
+                )
+            )
+
+        duckdb_cfg = resolve_configuration(
+            DuckDbClientConfiguration()._bind_dataset_name(dataset_name=GITHUB_DATASET),
+            sections=("destination", "duckdb"),
+        )
+        dataset = dlt.dataset(duckdb(credentials=duckdb_cfg.credentials), GITHUB_DATASET)
+
+        issues = dataset.schema.tables["issues"]
+        # 9 -> 10 renamed the data type and derived row and parent keys from the old hints
+        assert issues["columns"]["assignee"]["data_type"] == "json"
+        assert issues["columns"]["_dlt_id"]["row_key"] is True
+        assignees = dataset.schema.tables["issues__assignees"]
+        assert assignees["columns"]["_dlt_parent_id"]["parent_key"] is True
+        assert "foreign_key" not in assignees["columns"]["_dlt_parent_id"]
+        # 10 -> 11 pins the legacy path separator behavior
+        assert dataset.schema._normalizers_config["use_break_path_on_normalize"] is False
+
+        assert len(dataset.issues.fetchall()) == 20
+
+
+@pytest.mark.parametrize(
+    "initially_compressed", (True, False), ids=("initially_compressed", "initially_uncompressed")
+)
+def test_filesystem_with_gzip_extension_update(
+    initially_compressed: bool, test_storage: FileStorage
+) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    def assert_no_gz_files(table_names: List[str]) -> None:
+        """
+        Asserts that none of the files for the given table names have a '.gz' extension.
+        Additionally, verifies whether each file is actually gzip-compressed based on
+        the `initially_compressed` flag.
+        """
+        for table_name in table_names:
+            table_path = os.path.join("_storage/data/github_3/", table_name)
+            files = test_storage.list_folder_files(table_path)
+            for file in files:
+                assert not file.endswith(".gz")
+                if initially_compressed:
+                    assert test_storage.is_gzipped(file)
+                else:
+                    assert not test_storage.is_gzipped(file)
+
+    with test_workspace(
+        {
+            # disable compression depending on test param
+            "DATA_WRITER__DISABLE_COMPRESSION": str(not initially_compressed),
+        }
+    ):
+        # create virtual env with (1.14.0) where compressed files did not receive the .gz extension
+        with Venv.create(tempfile.mkdtemp(), ["dlt==1.14.0"]) as venv:
+            try:
+                venv.run_script("github_pipeline.py", "filesystem", "20")
+                # sanity check that indeed there are no .gz extensions with version 1.14.0
+                assert_no_gz_files(["issues", "issues__assignees", "issues__labels"])
+
+            except CalledProcessError as cpe:
+                print(f"script stdout: {cpe.stdout}")
+                print(f"script stderr: {cpe.stderr}")
+                raise
+
+        # rerun the pipeline with the current dlt version
+        venv = Venv.restore_current()
+        venv.run_script("github_pipeline.py", "filesystem", "20")
+        # ensure .gz extensions is still not added
+        assert_no_gz_files(["issues", "issues__assignees", "issues__labels"])
+
+        pipeline = dlt.attach(GITHUB_PIPELINE_NAME, destination=filesystem("_storage/data"))
+
+        # ensure duckdb reader handles compressed files without .gz extension
+        with pipeline.sql_client() as sql_client:
+            with sql_client.execute_query("SELECT * FROM issues") as curr:
+                assert 40 == len(curr.df())
+
+        # ensure storage version 1, aka, the legacy version where .gz is not added
+        with pipeline.destination_client() as client:
+            assert isinstance(client, FilesystemClient)
+            # Migration should've happened
+            assert client.storage_versions[0] == 1
+            assert client.storage_versions[1] == 2
+
+        # load jsonl data
+        @dlt.resource
+        def jsonl_data(file_format="jsonl"):
+            yield [
+                {"id": 1, "name": "Dawei"},
+                {"id": 2, "name": "Xiaoyun"},
+            ]
+
+        # load csv data
+        @dlt.resource(file_format="csv")
+        def csv_data():
+            yield {"id": 2, "name": "Xiaoyun"}
+
+        load_info = pipeline.run([jsonl_data(), csv_data()])
+        assert_load_info(load_info)
+        # ensure .gz extensions is still not added
+        assert_no_gz_files(["jsonl_data", "csv_data"])
+
+        # ensure duckdb reader works as well
+        with pipeline.sql_client() as sql_client:
+            with sql_client.execute_query("SELECT * FROM jsonl_data") as curr:
+                assert 2 == len(curr.df())
+            with sql_client.execute_query("SELECT * FROM csv_data") as curr:
+                assert 1 == len(curr.df())
+
+
+@skip_on_312
+def test_filesystem_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    # execute in test storage
+    with test_workspace():
+        with Venv.create(tempfile.mkdtemp(), ["dlt==0.4.9", "setuptools<80"]) as venv:
+            try:
+                print(venv.run_script("github_pipeline.py", "filesystem", "20"))
+            except CalledProcessError as cpe:
+                print(f"script stdout: {cpe.stdout}")
+                print(f"script stderr: {cpe.stderr}")
+                raise
+        # load all issues
+        venv = Venv.restore_current()
+        try:
+            print(venv.run_script("github_pipeline.py", "filesystem"))
+        except CalledProcessError as cpe:
+            print(f"script stdout: {cpe.stdout}")
+            print(f"script stderr: {cpe.stderr}")
+            raise
+        # hash hash in schema
+        github_schema = json.loads(
+            test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/schemas/github.schema.json")
+        )
+        # attach to existing pipeline
+        pipeline = dlt.attach(GITHUB_PIPELINE_NAME, destination=filesystem("_storage/data"))
+        # assert end state
+        pipeline = assert_github_pipeline_end_state(pipeline, github_schema, 2)
+        # load new state
+        fs_client = pipeline._fs_client()
+        state_files = sorted(fs_client.list_table_files("_dlt_pipeline_state"))
+        # first file is in old format
+        state_1 = json.loads(fs_client.read_text(state_files[0], encoding="utf-8"))
+        assert "dlt_load_id" in state_1
+        # seconds is new
+        state_2 = json.loads(fs_client.read_text(state_files[1], encoding="utf-8"))
+        assert "_dlt_load_id" in state_2
+
+
+def assert_github_pipeline_end_state(
+    pipeline: dlt.Pipeline, orig_schema: TStoredSchema, schema_updates: int
+) -> dlt.Pipeline:
+    # get tables counts
+    table_counts = load_table_counts(pipeline)
+    assert table_counts == {"issues": 100, "issues__assignees": 31, "issues__labels": 34}
+    dlt_counts = load_table_counts(pipeline, *pipeline.default_schema.dlt_table_names())
+    assert dlt_counts == {"_dlt_version": schema_updates, "_dlt_loads": 2, "_dlt_pipeline_state": 2}
+
+    # check state
+    incremental_state = pipeline.state["sources"]["github"]["resources"]["load_issues"][
+        "incremental"
+    ]["created_at"]
+    created_at_value = incremental_state["last_value"]
+    assert isinstance(created_at_value, datetime)
+    assert created_at_value == pendulum.parse("2023-02-17T09:52:12Z")
+    # start_value snapshots the previous (legacy) run's last_value, so the covered range
+    # for this current-version run is [legacy_last_value, new_last_value)
+    start_value = incremental_state["start_value"]
+    assert isinstance(start_value, datetime)
+    assert start_value == pendulum.parse("2021-04-16T04:34:05Z")
+    pipeline = pipeline.drop()
+    # print(pipeline.working_dir)
+    assert pipeline.dataset_name == GITHUB_DATASET
+    assert pipeline.default_schema_name is None
+    # sync from destination
+    pipeline.sync_destination()
+    # print(pipeline.working_dir)
+    # we have updated schema
+    assert pipeline.default_schema.ENGINE_VERSION == SCHEMA_ENGINE_VERSION
+    # make sure that schema hash retrieved from the destination is exactly the same as the schema hash that was in storage before the schema was wiped
+    assert pipeline.default_schema.stored_version_hash == orig_schema["version_hash"]
+
+    return pipeline
+
+
+@skip_on_312
+def test_load_package_with_dlt_update(test_storage: FileStorage) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    # execute in test storage
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+        # create virtual env with (0.3.0) before the current schema upgrade
+        with Venv.create(
+            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+        ) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            # extract and normalize on old version but DO NOT LOAD
+            print(
+                venv.run_script("../tests/pipeline/cases/github_pipeline/github_extract.py", "70")
+            )
+            print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_normalize.py"))
+        # switch to current version and make sure the load package loads and schema migrates
+        venv = Venv.restore_current()
+        try:
+            print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_load.py"))
+        except CalledProcessError as cpe:
+            print("STDERR", cpe.stderr)
+            print("STDOUT", cpe.stdout)
+            raise
+        duckdb_cfg = resolve_configuration(
+            DuckDbClientConfiguration()._bind_dataset_name(dataset_name=GITHUB_DATASET),
+            sections=("destination", "duckdb"),
+        )
+        with DuckDbSqlClient(
+            GITHUB_DATASET, "%s_staging", duckdb_cfg.credentials, duckdb().capabilities()
+        ) as client:
+            rows = client.execute_sql("SELECT * FROM issues")
+            assert len(rows) == 70
+        github_schema = json.loads(
+            test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/schemas/github.schema.json")
+        )
+        # attach to existing pipeline
+        pipeline = dlt.attach(
+            GITHUB_PIPELINE_NAME, destination=duckdb(credentials=duckdb_cfg.credentials)
+        )
+        # get the schema from schema storage before we sync
+        github_schema = json.loads(
+            test_storage.load(f".dlt/pipelines/{GITHUB_PIPELINE_NAME}/schemas/github.schema.json")
+        )
+        pipeline = pipeline.drop()
+        pipeline.sync_destination()
+        assert pipeline.default_schema.ENGINE_VERSION == SCHEMA_ENGINE_VERSION
+        # schema version does not match `dlt.attach` does not update to the right schema by itself
+        assert pipeline.default_schema.stored_version_hash != github_schema["version_hash"]
+        # state has hash
+        assert pipeline.state["_version_hash"] is not None
+        # but in db there's no hash - we loaded an old package with backward compatible schema
+        with pipeline.sql_client() as client:
+            rows = client.execute_sql(f"SELECT * FROM {PIPELINE_STATE_TABLE_NAME}")
+            # no hash
+            assert len(rows[0]) == 5 + 2
+            assert len(rows) == 1
+            # this will extract state and update state schema
+            with pipeline.managed_state(extract_state=True):
+                pass
+            # this will sync schema to destination
+            pipeline.sync_schema()
+            # we have hash now
+            rows = client.execute_sql(f"SELECT * FROM {PIPELINE_STATE_TABLE_NAME}")
+            assert len(rows[0]) == 6 + 2
+
+
+@skip_on_312
+def test_normalize_package_with_dlt_update(test_storage: FileStorage) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    # execute in test storage
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+        # create virtual env with (0.3.0) before the current schema upgrade
+        with Venv.create(
+            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+        ) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            # extract only
+            print(
+                venv.run_script("../tests/pipeline/cases/github_pipeline/github_extract.py", "70")
+            )
+        # switch to current version and normalize existing extract package
+        # here we test possible switch in package format between storages
+        pipeline = dlt.attach(GITHUB_PIPELINE_NAME)
+        with pytest.raises(StorageMigrationError) as mig_ex:
+            pipeline.normalize()
+        assert mig_ex.value.from_version == "1.0.0"
+
+        # delete all files in extracted folder
+        for file in pipeline._pipeline_storage.list_folder_files("normalize/extracted"):
+            pipeline._pipeline_storage.delete(file)
+        # now we can migrate the storage
+        pipeline.normalize()
+        assert pipeline._get_normalize_storage().version == "1.0.1"
+
+
+@skip_on_312
+def test_scd2_pipeline_update(test_storage: FileStorage) -> None:
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+        # run scd2 pipeline on 0.4.10
+        venv_dir = tempfile.mkdtemp()
+        # venv_dir == "tmp/dlt0410"
+        with Venv.create(venv_dir, ["dlt[duckdb]==0.4.10", "setuptools<80"]) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+
+            print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_scd2.py"))
+            # get data from original db
+            duckdb_cfg = resolve_configuration(
+                DuckDbClientConfiguration()._bind_dataset_name(dataset_name=GITHUB_DATASET),
+                sections=("destination", "duckdb"),
+            )
+            with DuckDbSqlClient(
+                GITHUB_DATASET,
+                "%s_staging",
+                duckdb_cfg.credentials,
+                duckdb().capabilities(),
+            ) as client:
+                issues = client.execute_sql("SELECT * FROM issues ORDER BY id")
+                issues__assignees = client.execute_sql(
+                    "SELECT * FROM issues__assignees ORDER BY id"
+                )
+                issues__labels = client.execute_sql("SELECT * FROM issues__labels ORDER BY id")
+
+                assert len(issues) == 100
+
+        venv = Venv.restore_current()
+        # load same data again
+        print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_scd2.py"))
+        pipeline = dlt.attach(GITHUB_PIPELINE_NAME)
+        # unique on row_key got swapped from True to False
+        assert pipeline.default_schema.tables["issues"]["columns"]["_dlt_id"]["unique"] is False
+        # datasets must be the same
+        with DuckDbSqlClient(
+            GITHUB_DATASET,
+            "%s_staging",
+            duckdb_cfg.credentials,
+            duckdb().capabilities(),
+        ) as client:
+            issues_n = client.execute_sql("SELECT * FROM issues ORDER BY id")
+            issues__assignees_n = client.execute_sql("SELECT * FROM issues__assignees ORDER BY id")
+            issues__labels_n = client.execute_sql("SELECT * FROM issues__labels ORDER BY id")
+        assert issues == issues_n
+        assert issues__assignees == issues__assignees_n
+        assert issues__labels == issues__labels_n
+
+        # retire some ids
+        print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_scd2.py", "6272"))
+        with DuckDbSqlClient(
+            GITHUB_DATASET,
+            "%s_staging",
+            duckdb_cfg.credentials,
+            duckdb().capabilities(),
+        ) as client:
+            issues_retired = client.execute_sql(
+                "SELECT number FROM issues WHERE _dlt_valid_to IS NOT NULL"
+            )
+
+        assert len(issues_retired) == 1
+        assert issues_retired[0][0] == 6272
+        # root propagation is still there
+        normalizer_config = pipeline.default_schema.data_item_normalizer.get_normalizer_config(
+            pipeline.default_schema
+        )
+        propagation = get_propagation_mapping(
+            normalizer_config["propagation"], "issues", is_root=True
+        )
+        assert propagation == {"_dlt_id": "_dlt_root_id"}
+        # print(pipeline.default_schema.to_pretty_yaml())
+
+
+@skip_on_312
+def test_normalize_path_separator_legacy_behavior(test_storage: FileStorage) -> None:
+    """Pre 1.4.1 normalized identifiers with path separators into single underscore,
+    this behavior must be preserved if the schema is updated.
+    """
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    # execute in test storage
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+        venv_dir = tempfile.mkdtemp()
+        # create virtual env with (0.3.0) before the current schema upgrade
+        with Venv.create(
+            venv_dir, ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+        ) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            try:
+                print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_rev.py"))
+            except CalledProcessError as cpe:
+                print(f"script stdout: {cpe.stdout}")
+                print(f"script stderr: {cpe.stderr}")
+                raise
+
+        venv = Venv.restore_current()
+        # load same data again
+        try:
+            print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_rev.py"))
+        except CalledProcessError as cpe:
+            print(f"script stdout: {cpe.stdout}")
+            print(f"script stderr: {cpe.stderr}")
+            raise
+        pipeline = dlt.attach(GITHUB_PIPELINE_NAME)
+        print(pipeline.default_schema.to_pretty_yaml())
+        # migration set the backward compat flag
+        assert pipeline.default_schema._normalizers_config["use_break_path_on_normalize"] is False
+        # make sure that schema didn't change
+        assert pipeline.default_schema.data_table_names() == ["issues_2"]
+        table_ = pipeline.default_schema.tables["issues_2"]
+        assert set(table_["columns"].keys()) == {
+            "id",
+            "issue_id",
+            "_dlt_id",
+            "_dlt_load_id",
+        }
+
+
+def test_seen_null_first_columns_cleaned_on_upgrade(test_storage: FileStorage) -> None:
+    """Old dlt versions create incomplete columns with seen-null-first hint for null-only data.
+    When attaching the pipeline with current dlt, those columns must be removed from the schema.
+    Loading new data with null-only columns must produce the correct warning.
+    """
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_null_cols.duckdb"}):
+        # run with old dlt that creates seen-null-first columns
+        with Venv.create(tempfile.mkdtemp(), ["dlt[duckdb]==1.14.0", "setuptools<80"]) as venv:
+            venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+            try:
+                venv.run_script("../tests/pipeline/cases/github_pipeline/null_columns_pipeline.py")
+            except CalledProcessError as cpe:
+                print(f"script stdout: {cpe.stdout}")
+                print(f"script stderr: {cpe.stderr}")
+                raise
+
+        # read raw schema dict — seen-null-first column should be present
+        raw_schema: TStoredSchema = json.loads(
+            test_storage.load(
+                ".dlt/pipelines/null_columns_test/schemas/null_columns_test.schema.json"
+            )
+        )
+        items_cols = raw_schema["tables"]["items"]["columns"]
+        assert "optional_field" in items_cols
+        assert items_cols["optional_field"].get("x-normalizer", {}).get("seen-null-first") is True
+        assert "data_type" not in items_cols["optional_field"]
+
+        # attach with current dlt — migration must remove the seen-null-first column
+        pipeline = dlt.attach("null_columns_test")
+        assert "optional_field" not in pipeline.default_schema.tables["items"]["columns"]
+
+        # run again with null-only data — should produce warning, not crash
+        @dlt.resource(table_name="items", write_disposition="append")
+        def more_items():
+            yield [
+                {"id": 3, "name": "Charlie", "optional_field": None},
+            ]
+
+        load_info = pipeline.run(more_items())
+        assert_load_info(load_info)
+        # optional_field still not in schema (it's null-only)
+        assert "optional_field" not in pipeline.default_schema.tables["items"]["columns"]
+
+
+@skip_on_312
+def test_engine_8_upsert_seen_data_migration_update(test_storage: FileStorage) -> None:
+    """read legacy_upsert_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_legacy.duckdb"}):
+        # old dlt 0.4.4 writes a schema at engine 8 (before seen-data). the data has no `id`, so the
+        # declared primary key stays incomplete; the table still gets a `_dlt_id` column.
+        with Venv.create(tempfile.mkdtemp(), ["dlt[duckdb]==0.4.4", "setuptools<80"]) as venv:
+            # force a compatible duckdb so the current version can open the same database file
+            venv.install_deps(venv.context, ["duckdb==" + pkg_version("duckdb")])
+            try:
+                print(venv.run_script("legacy_upsert_pipeline.py", "old"))
+            except CalledProcessError as cpe:
+                print(f"script output: {cpe.output}")
+                raise
+
+        # sanity: the persisted schema is engine 8 with an incomplete, seen-data-less primary key
+        legacy_schema = json.loads(
+            test_storage.load(".dlt/pipelines/legacy_upsert/schemas/legacy_upsert.schema.json")
+        )
+        assert legacy_schema["engine_version"] == 8
+        renamed = legacy_schema["tables"]["renamed_store"]
+        assert "x-normalizer" not in renamed
+        assert "_dlt_id" in renamed["columns"]
+        # primary key is declared but incomplete (no data_type) and nullable
+        assert renamed["columns"]["id"]["primary_key"] is True
+        assert "data_type" not in renamed["columns"]["id"]
+        assert renamed["columns"]["id"]["nullable"] is True
+
+        venv = Venv.restore_current()
+        try:
+            # 2nd run on the current dlt: an incremental whose window selects no rows. loading
+            # migrates engine 8 -> current and the 8 -> 9 migration stamps seen-data on the legacy
+            # table. the run yields no rows, so `_handle_empty_tables` no longer rewrites the stored
+            # disposition - the table stays merge/delete-insert and loads cleanly instead of raising
+            # "No primary key defined".
+            print(venv.run_script("legacy_upsert_pipeline.py", "current"))
+            # 3rd run: load a row that carries the primary key. the incomplete `id` column gets a
+            # type and is added (nullable) to the destination table, and the row is upserted.
+            print(venv.run_script("legacy_upsert_pipeline.py", "load"))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        # the primary key column is now complete and the row was actually loaded
+        pipeline = dlt.attach("legacy_upsert")
+        assert "data_type" in pipeline.default_schema.tables["renamed_store"]["columns"]["id"]
+        with pipeline.sql_client() as client:
+            rows = client.execute_sql("SELECT id, ts, val FROM renamed_store WHERE id = 1")
+        assert len(rows) == 1
+        assert rows[0][0] == 1 and rows[0][2] == "c"
+
+
+def test_load_normalized_refresh_package_from_1_25(test_storage: FileStorage) -> None:
+    """read refresh_normalized_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace(
+        {"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_refresh_normalized.duckdb"}
+    ):
+        # dlt 1.25.0 leaves a normalized package with refresh `dropped_tables` in its state
+        with Venv.create(tempfile.mkdtemp(), ["dlt[duckdb]==1.25.0"]) as venv:
+            # force a compatible duckdb so the current version can open the same database file
+            venv.install_deps(venv.context, ["duckdb==" + pkg_version("duckdb")])
+            try:
+                print(venv.run_script("refresh_normalized_pipeline.py", "old"))
+            except CalledProcessError as cpe:
+                print(f"script output: {cpe.output}")
+                raise
+
+        # the current dlt loads the pending package: drops are applied and recorded. the old
+        # package state has no `refresh` key so it stays None
+        venv = Venv.restore_current()
+        try:
+            output = venv.run_script("refresh_normalized_pipeline.py", "load")
+            print(output)
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+        assert "REFRESH: None" in output
+        assert "DROPPED: ['items']" in output
+        assert "TRUNCATED: []" in output
+
+        # the loaded package state records the applied drops
+        pipeline = dlt.attach("refresh_normalized")
+        load_id = pipeline.list_completed_load_packages()[-1]
+        package_state = pipeline.get_load_package_state(load_id)
+        assert package_state["applied_dropped_tables"] == ["items"]
+        # `items` was dropped and re-created with only the second run's row
+        assert load_table_counts(pipeline, "items") == {"items": 1}
+
+
+def test_load_filesystem_package_with_date_layout_from_1_25(test_storage: FileStorage) -> None:
+    """read filesystem_layout_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace():
+        with Venv.create(tempfile.mkdtemp(), ["dlt==1.25.0"]) as venv:
+            try:
+                old_output = venv.run_script("filesystem_layout_pipeline.py", "old")
+                print(old_output)
+            except CalledProcessError as cpe:
+                print(f"script output: {cpe.output}")
+                raise
+
+        venv = Venv.restore_current()
+        try:
+            output = venv.run_script("filesystem_layout_pipeline.py", "load")
+            print(output)
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        def layout_paths(script_output: str, pipeline_name: str, load_id: str) -> List[str]:
+            prefix = f"FILE:{pipeline_name}:"
+            return [
+                line[len(prefix) :].replace("\\", "/")
+                for line in script_output.splitlines()
+                if line.startswith(prefix) and load_id in line
+            ]
+
+        layout_prefix = LAYOUT.split("{load_id}")[0]
+        for pipeline_name, current_datetime in PIPELINES.items():
+            pipeline = dlt.attach(pipeline_name)
+            old_load_id, new_load_id = sorted(pipeline.list_completed_load_packages())
+            # the old dlt rendered the first package, the current dlt the second one
+            for load_id, rendered in ((old_load_id, old_output), (new_load_id, output)):
+                package_state = pipeline.get_load_package_state(load_id)
+                assert "placeholders" not in package_state
+                # both versions render the creation time that the old dlt wrote to the package
+                # state, in UTC. a naive `current_datetime` from the config is UTC
+                params = prepare_datetime_params(
+                    datetime.fromisoformat(current_datetime) if current_datetime else None,
+                    package_state["created_at"],
+                )
+                expected = layout_prefix.format(table_name="items", **params) + load_id + "."
+                pattern = re.escape(expected)
+                if current_datetime and rendered is old_output:
+                    # dlt 1.25 rendered `{timestamp}` of the naive config string in the system
+                    # timezone, the current dlt renders it in UTC. the date placeholders are
+                    # the wall clock of the string in both
+                    pattern = pattern.replace(
+                        re.escape(f"{params['timestamp']}-{params['timestamp_ms']}"), r"\d+-\d+"
+                    )
+                paths = layout_paths(rendered, pipeline_name, load_id)
+                assert len(paths) == 1, paths
+                assert re.search(pattern, paths[0]), paths[0]
+
+
+def _run_datetime_key_case(old_version: str, strategy: str) -> None:
+    """Loads the datetime-key case with an old dlt."""
+    with Venv.create(tempfile.mkdtemp(), [f"dlt[duckdb]=={old_version}", "setuptools<80"]) as venv:
+        # force a compatible duckdb so the current version can open the same database file
+        venv.install_deps(venv.context, ["duckdb==" + pkg_version("duckdb")])
+        try:
+            print(venv.run_script("datetime_key_pipeline.py", strategy))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+
+@skip_on_312
+def test_scd2_datetime_rows_not_reversioned_after_dlt_update(test_storage: FileStorage) -> None:
+    """read datetime_key_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_datetime_key.duckdb"}):
+        _run_datetime_key_case("0.4.10", "scd2")
+
+        pipeline = dlt.attach("datetime_key")
+        with pipeline.sql_client() as client:
+            old_rows = client.execute_sql("SELECT _dlt_id, _dlt_valid_to FROM events ORDER BY id")
+        assert len(old_rows) == 3
+        assert all(row[1] is None for row in old_rows)
+
+        venv = Venv.restore_current()
+        try:
+            print(venv.run_script("datetime_key_pipeline.py", "scd2"))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        with pipeline.sql_client() as client:
+            new_rows = client.execute_sql("SELECT _dlt_id, _dlt_valid_to FROM events ORDER BY id")
+        # unchanged data must not be re-versioned: a moved row hash would retire all three rows
+        assert len(new_rows) == 3
+        assert [row[0] for row in old_rows] == [row[0] for row in new_rows]
+        assert all(row[1] is None for row in new_rows)
+
+
+@skip_on_312
+def test_upsert_datetime_key_hash_stable_after_dlt_update(test_storage: FileStorage) -> None:
+    """read datetime_key_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace(
+        {"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_datetime_upsert.duckdb"}
+    ):
+        # 0.4.x has no `upsert` strategy, so the oldest version that keys on a hash is 1.25.0
+        _run_datetime_key_case("1.25.0", "upsert")
+
+        pipeline = dlt.attach("datetime_key")
+        with pipeline.sql_client() as client:
+            old_rows = client.execute_sql("SELECT _dlt_id FROM events ORDER BY occurred_at")
+        assert len(old_rows) == 3
+
+        venv = Venv.restore_current()
+        try:
+            print(venv.run_script("datetime_key_pipeline.py", "upsert"))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        with pipeline.sql_client() as client:
+            new_rows = client.execute_sql("SELECT _dlt_id FROM events ORDER BY occurred_at")
+        # the datetime primary key is the hash, so a moved rendering inserts copies instead
+        assert len(new_rows) == 3
+        assert [row[0] for row in old_rows] == [row[0] for row in new_rows]
+
+
+def _incremental_state(pipeline: dlt.Pipeline) -> Dict[str, Any]:
+    return pipeline.state["sources"]["datetime_key"]["resources"]["events"]["incremental"][
+        "occurred_at"
+    ]
+
+
+def test_incremental_boundary_hashes_stable_after_dlt_update(test_storage: FileStorage) -> None:
+    """read datetime_key_pipeline.py docstring for test case details."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+
+    with test_workspace(
+        {"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_datetime_incremental.duckdb"}
+    ):
+        _run_datetime_key_case("1.25.0", "incremental")
+
+        pipeline = dlt.attach("datetime_key")
+        assert load_table_counts(pipeline, "events") == {"events": 3}
+        # both rows on the max cursor are remembered so the next run can skip them
+        old_hashes = set(_incremental_state(pipeline)["unique_hashes"])
+        assert len(old_hashes) == 2
+
+        venv = Venv.restore_current()
+        try:
+            print(venv.run_script("datetime_key_pipeline.py", "incremental"))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        pipeline = dlt.attach("datetime_key")
+        # the same rows must hash the same, or the two boundary rows are loaded a second time
+        assert load_table_counts(pipeline, "events") == {"events": 3}
+        assert set(_incremental_state(pipeline)["unique_hashes"]) == old_hashes
+
+        # a row past the boundary rebuilds the set in the short format
+        try:
+            print(venv.run_script("datetime_key_pipeline.py", "incremental", "advance"))
+        except CalledProcessError as cpe:
+            print(f"script output: {cpe.output}")
+            raise
+
+        pipeline = dlt.attach("datetime_key")
+        assert load_table_counts(pipeline, "events") == {"events": 4}
+        new_hashes = _incremental_state(pipeline)["unique_hashes"]
+        assert len(new_hashes) == 1
+        assert len(new_hashes[0]) == 12
+
+
+def test_trace_of_newer_dlt_is_ignored_by_older_dlt(test_storage: FileStorage) -> None:
+    """1.32 added fields to the trace metrics. dlt 1.31 cannot unpickle such a trace and ignores
+    it, and the current dlt reads the trace that 1.31 writes afterwards."""
+    shutil.copytree(
+        "tests/pipeline/cases/github_pipeline", get_test_storage_root(), dirs_exist_ok=True
+    )
+    with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_trace_compat.duckdb"}):
+        pipeline = dlt.pipeline("trace_compat", destination="duckdb", dataset_name="trace_data")
+        assert_load_info(pipeline.run([{"id": 1}], table_name="items"))
+        assert pipeline.last_trace is not None
+
+        with Venv.create(tempfile.mkdtemp(), ["dlt[duckdb]==1.31.0"]) as venv:
+            # force a compatible duckdb so both versions can open the same database file
+            venv.install_deps(venv.context, ["duckdb==" + pkg_version("duckdb")])
+            try:
+                # the trace of the current version is ignored, the pipeline keeps working
+                output = venv.run_script("trace_compat_pipeline.py", "read")
+                print(output)
+                assert "TRACE: None" in output
+                output = venv.run_script("trace_compat_pipeline.py", "run")
+                print(output)
+            except CalledProcessError as cpe:
+                print(f"script output: {cpe.output}")
+                raise
+        assert "TRACE: None" not in output
+
+        # the trace written by 1.31 loads, it has no files count
+        pipeline = dlt.attach("trace_compat")
+        trace = pipeline.last_trace
+        assert trace is not None
+        extract_info = trace.last_extract_info
+        extract_metrics = extract_info.metrics[extract_info.loads_ids[0]][0]
+        assert extract_metrics["table_metrics"]["items"].files_count is None
+        assert load_table_counts(pipeline, "items") == {"items": 2}

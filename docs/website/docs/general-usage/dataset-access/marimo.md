@@ -1,0 +1,109 @@
+---
+title: Explore data with marimo
+description: Explore your data with marimo
+keywords: [data, dataset, sql, ibis, marimo]
+---
+# Explore your data with marimo
+
+:::tip
+For an agent-driven workflow, see the [dltHub AI Harness data exploration toolkit](../../hub/ai-harness/toolkits.md#data-exploration), whose skills profile your dlt dataset, plan charts, and assemble a marimo notebook from them with a coding agent.
+:::
+
+[marimo](https://github.com/marimo-team/marimo) is a reactive Python notebook. It completely revamps the Jupyter notebook experience. Whenever code is executed or you interact with a UI element, dependent cells are re-executed ensuring consistency between code and displayed outputs.
+
+This page shows how dlt + marimo + [ibis](../../dlt-ecosystem/transformations/python.md#using-ibis) provide a rich environment to explore loaded data, write data transformations, and create data applications.
+
+## Prerequisites
+
+Install the required dependencies:
+
+```cli
+pip install marimo ibis-framework mowidgets duckdb
+```
+
+## Launch marimo
+
+Use this command to launch marimo (replace `my_notebook.py` with desired name). It will print a link to access the notebook web app.
+
+```sh
+marimo edit my_notebook.py
+
+> Edit my_notebook.py in your browser 📝
+>   ➜  URL: http://localhost:2718?access_token=Qfo_Hj2RbXqiqM4VT3XOwA 
+```
+
+Here's a screenshot of the interface you should see:
+
+![empty marimo notebook](./static/marimo_notebook.png)
+
+To run an existing local marimo notebook:
+
+```sh
+marimo run my_notebook.py
+```
+
+## Features
+
+### Use custom dlt widgets
+
+Inside your marimo notebook, you can use composable widgets built and maintained by the dlt team. This requires the `mowidgets` package (Python 3.11+).
+
+Import them from `dlt.helpers.marimo` and pass them to the `render()` function:
+
+```py
+#%% cell 1
+from dlt.helpers.marimo import render, load_package_viewer, pipeline_selector
+
+#%% cell 2
+render(pipeline_selector)
+
+#%% cell 3
+render(load_package_viewer, pipeline_path="/path/to/pipeline")
+```
+
+Available widgets: `pipeline_selector`, `load_package_viewer`, `schema_viewer`.
+
+![Example marimo widget](https://storage.googleapis.com/dlt-blog-images/marimo-widget-screenshot.png)
+
+### View dataset tables and columns
+
+After loading data with dlt, you can access it via the [dataset interface](./dataset.md), including a [native ibis connection](../../dlt-ecosystem/transformations/python.md#using-ibis).
+
+In marimo, the **Datasources** panel provides a GUI to explore data tables and columns. When a cell contains a variable that's an ibis connection, it is automatically registered.
+
+![marimo dataset viewer with ibis](./static/marimo_dataset.png)
+
+### Accessing data with SQL
+
+Clicking on the **Add table to notebook** button will create a new SQL cell that you can use to query data. The output cell provides a rich and interactive results dataframe.
+
+:::note
+The **Datasources** displays a limited range of data types.
+:::
+
+![marimo SQL editor with ibis](./static/marimo_sql.png)
+
+### Accessing data with Python
+
+You can also retrieve Ibis tables (lazy expressions) using Python. The **Datasources** panel will show under **Python** the output schema of your Ibis query, and the cell output will display detailed query planning.
+
+Use `.execute()`, `.to_pandas()`, `.to_polars()`, or `.to_pyarrow()` to execute the Ibis expression and retrieve data that can displayed in a rich and interactive dataframe.
+
+:::note
+The **Datasources** displays a limited range of data types.
+:::
+
+![marimo Python cell using the dlt dataset interface](./static/marimo_python.png)
+
+### Create a dashboard and data apps
+
+Marimo notebooks can also be [deployed as web applications with interactive UI and charts](https://docs.marimo.io/guides/apps/) and the code hidden. Try adding [marimo UI input elements](https://docs.marimo.io/guides/interactivity/), rich markdown, and charts (matplotlib, plotly, altair, etc.). Combined, dlt + marimo + ibis make it easy to build a simple dashboard on top of fresh data.
+
+To run such a notebook on the dltHub platform, where it is served as an interactive job and can be shared with your workspace or via a public link, see [Build and deploy a marimo notebook](../../hub/data-apps/build-marimo-notebook.md).
+
+## Further reading
+
+- [Access loaded data in Python using dlt datasets](./dataset.md).
+- [Learn about marimo dataframe and SQL features](https://docs.marimo.io/guides/working_with_data/)
+- [Explore databases using the marimo GUI](https://docs.marimo.io/guides/coming_from/streamlit/)
+- [Learn about marimo if you're coming from Streamlit](https://docs.marimo.io/guides/coming_from/streamlit/)

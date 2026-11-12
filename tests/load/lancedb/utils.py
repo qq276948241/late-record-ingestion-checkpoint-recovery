@@ -1,0 +1,171 @@
+from typing import TYPE_CHECKING, Callable, Union, List, Any, Dict, cast
+
+import numpy as np
+from lancedb.embeddings import TextEmbeddingFunction
+from lancedb.table import Table as LanceTable
+
+import dlt
+from dlt.common.typing import TColumnNames
+from dlt.extract.resource import DltResource
+
+from tests.load.utils import destinations_configs, DestinationTestConfiguration
+
+
+if TYPE_CHECKING:
+    from dlt.destinations.impl.lance.lance_client import LanceClient
+    from dlt.destinations.impl.lancedb.lancedb_client import LanceDBClient
+
+    TLanceDestinationClient = Union[LanceDBClient, LanceClient]
+else:
+    TLanceDestinationClient = Any
+
+
+LANCE_DEST_CONFS = destinations_configs(default_vector_configs=True, subset=("lance", "lancedb"))
+
+
+def is_lancedb_client(client: TLanceDestinationClient) -> bool:
+    """Checks if client is instance of LanceDBClient without requiring that class to be imported."""
+    return client.__class__.__name__ == "LanceDBClient"
+
+
+def is_lance_client(client: TLanceDestinationClient) -> bool:
+    """Checks if client is instance of LanceClient without requiring that class to be imported."""
+    return client.__class__.__name__ == "LanceClient"
+
+
+def open_lance_table(client: TLanceDestinationClient, table_name: str) -> LanceTable:
+    # NOTE: we cannot use `isinstance` because classes are only imported for type checking
+    if is_lancedb_client(client):
+        from dlt.destinations.impl.lancedb.lancedb_client import LanceDBClient
+
+        assert isinstance(client, LanceDBClient)
+        qualified_table_name = client.make_qualified_table_name(table_name)
+        return client.db_client.open_table(qualified_table_name)
+    elif is_lance_client(client):
+        from dlt.destinations.impl.lance.lance_client import LanceClient
+
+        assert isinstance(client, LanceClient)
+        return client.open_lancedb_table(table_name)
+
+
+def get_table_location(client: TLanceDestinationClient, table_name: str) -> str:
+    tbl = open_lance_table(client, table_name)
+    if is_lancedb_client(client):
+        return tbl._dataset_uri
+    elif is_lance_client(client):
+        return tbl._location
+    else:
+        raise ValueError("Unexpected client type")
+
+
+def get_adapter(destination_config: DestinationTestConfiguration) -> Callable[..., DltResource]:
+    """Returns appropriate adapter function for given destination configuration.
+
+    For `lance` destination, wraps the adapter to accept `no_remove_orphans` (the `lancedb`
+    destination convention) and translates it to `remove_orphans` so tests can use a
+    uniform interface.
+    """
+    if destination_config.destination_type == "lance":
+        from dlt.destinations.impl.lance.lance_adapter import lance_adapter
+
+        def _lance_adapter(
+            data: Any,
+            embed: TColumnNames = None,
+            merge_key: TColumnNames = None,
+            no_remove_orphans: bool = False,
+        ) -> DltResource:
+            return lance_adapter(
+                data, embed=embed, merge_key=merge_key, remove_orphans=not no_remove_orphans
+            )
+
+        return _lance_adapter
+    elif destination_config.destination_type == "lancedb":
+        from dlt.destinations.impl.lancedb.lancedb_adapter import lancedb_adapter
+
+        return lancedb_adapter
+    else:
+        raise ValueError(f"Unexpected destination type: {destination_config.destination_type}")
+
+
+def get_vectorize_hint(destination_config: DestinationTestConfiguration) -> str:
+    """Returns appropriate vectorize hint key for destination configuration."""
+    if destination_config.destination_type == "lance":
+        from dlt.destinations.impl.lance.lance_adapter import VECTORIZE_HINT
+    elif destination_config.destination_type == "lancedb":
+        from dlt.destinations.impl.lancedb.lancedb_adapter import VECTORIZE_HINT
+    else:
+        raise ValueError(f"Unexpected destination type: {destination_config.destination_type}")
+    return VECTORIZE_HINT
+
+
+def assert_unordered_dicts_equal(
+    dict_list1: List[Dict[str, Any]], dict_list2: List[Dict[str, Any]]
+) -> None:
+    """
+    Assert that two lists of dictionaries contain the same dictionaries, ignoring None values.
+
+    Args:
+        dict_list1 (List[Dict[str, Any]]): The first list of dictionaries to compare.
+        dict_list2 (List[Dict[str, Any]]): The second list of dictionaries to compare.
+
+    Raises:
+        AssertionError: If the lists have different lengths or contain different dictionaries.
+    """
+    assert len(dict_list1) == len(dict_list2), "Lists have different length"
+
+    dict_set1 = {tuple(sorted((k, v) for k, v in d.items() if v is not None)) for d in dict_list1}
+    dict_set2 = {tuple(sorted((k, v) for k, v in d.items() if v is not None)) for d in dict_list2}
+
+    assert dict_set1 == dict_set2, "Lists contain different dictionaries"
+
+
+# TODO: merge with assert_table in main pipeline utils...
+def assert_table(
+    pipeline: dlt.Pipeline,
+    table_name: str,
+    expected_items_count: int = None,
+    items: List[Any] = None,
+) -> None:
+    client = pipeline.destination_client()
+    client = cast(TLanceDestinationClient, client)
+    records = open_lance_table(client, table_name).to_arrow().to_pylist()
+
+    if expected_items_count is not None:
+        assert expected_items_count == len(records)
+
+    if items is None:
+        return
+
+    drop_keys = [
+        "_dlt_id",
+        "_dlt_load_id",
+        dlt.config.get("destination.lancedb.credentials.vector_field_name", str) or "vector",
+    ]
+    objects_without_dlt_or_special_keys = [
+        {k: v for k, v in record.items() if k not in drop_keys} for record in records
+    ]
+
+    assert_unordered_dicts_equal(objects_without_dlt_or_special_keys, items)
+
+
+class MockEmbeddingFunc(TextEmbeddingFunction):
+    def generate_embeddings(
+        self,
+        texts: Union[List[str], np.ndarray],  # type: ignore[type-arg,unused-ignore]
+        *args,
+        **kwargs,
+    ) -> List[np.ndarray]:  # type: ignore[type-arg,unused-ignore]
+        return [np.array(None)]
+
+    def ndims(self) -> int:
+        return 2
+
+
+def mock_embed(
+    dim: int = 10,
+) -> str:
+    return str(np.random.random_sample(dim))
+
+
+def chunk_document(doc: str, chunk_size: int = 10) -> List[str]:
+    return [doc[i : i + chunk_size] for i in range(0, len(doc), chunk_size)]

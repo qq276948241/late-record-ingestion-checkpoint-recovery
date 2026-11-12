@@ -1,0 +1,366 @@
+import os
+from datetime import datetime  # noqa: I251
+from typing import ClassVar, Optional
+
+import pytest
+
+import dlt
+from dlt.common import json
+from dlt.common.destination.configuration import ParquetFormatConfiguration
+from dlt.common.libs.pyarrow import columns_to_arrow
+from dlt.common.libs.pydantic import DltConfig
+from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
+from dlt.common.time import ensure_pendulum_datetime, pendulum
+
+from dlt.destinations import duckdb
+from dlt.pipeline.exceptions import PipelineStepFailed
+
+from tests.cases import TABLE_UPDATE_ALL_INT_PRECISIONS, TABLE_UPDATE_ALL_TIMESTAMP_PRECISIONS
+from tests.load.duckdb.test_duckdb_table_builder import add_timezone_false_on_precision
+from tests.load.utils import (
+    destinations_configs,
+    DestinationTestConfiguration,
+)
+from tests.pipeline.utils import airtable_emojis, assert_table_counts, load_table_counts
+from tests.utils import data_to_item_format
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_duck_case_names(destination_config: DestinationTestConfiguration) -> None:
+    # we want to have nice tables
+    os.environ["SCHEMA__NAMING"] = "duck_case"
+    pipeline = destination_config.setup_pipeline("test_duck_case_names")
+    # create tables and columns with emojis and other special characters
+    pipeline.run(
+        airtable_emojis().with_resources("📆 Schedule", "🦚Peacock", "🦚WidePeacock"),
+        **destination_config.run_kwargs,
+    )
+    pipeline.run(
+        [{"🐾Feet": 2, "1+1": "two", "\nhey": "value"}],
+        table_name="🦚Peacocks🦚",
+        **destination_config.run_kwargs,
+    )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts == {
+        "📆 Schedule": 3,
+        "🦚Peacock": 1,
+        "🦚Peacock__peacock": 3,
+        "🦚Peacocks🦚": 1,
+        "🦚WidePeacock": 1,
+        "🦚WidePeacock__Peacock": 3,
+    }
+
+    # this will fail - duckdb preserves case but is case insensitive when comparing identifiers
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        pipeline.run(
+            [{"🐾Feet": 2, "1+1": "two", "🐾feet": "value"}],
+            table_name="🦚peacocks🦚",
+            **destination_config.run_kwargs,
+        )
+    assert isinstance(pip_ex.value.__context__, SchemaIdentifierNormalizationCollision)
+    assert pip_ex.value.__context__.conflict_identifier_name == "🦚Peacocks🦚"
+    assert pip_ex.value.__context__.identifier_name == "🦚peacocks🦚"
+    assert pip_ex.value.__context__.identifier_type == "table"
+
+    # show tables and columns
+    with pipeline.sql_client() as client:
+        with client.execute_query("DESCRIBE 🦚peacocks🦚;") as q:
+            tables = q.df()
+    assert tables["column_name"].tolist() == ["🐾Feet", "1+1", "hey", "_dlt_load_id", "_dlt_id"]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_duck_precision_types(destination_config: DestinationTestConfiguration) -> None:
+    import pyarrow as pa
+    import pandas as pd
+
+    now_s = ensure_pendulum_datetime("2022-05-23T13:26:46+01:00")
+    now_ms = ensure_pendulum_datetime("2022-05-23T13:26:46.167+01:00")
+    now_us = ensure_pendulum_datetime("2022-05-23T13:26:46.167231+01:00")
+
+    # create pandas DataFrame with nanosecond precision timestamp
+    df_ns = pd.DataFrame({"col4_ts": ["2022-05-23T13:26:46.167231345+01:00"]})
+    df_ns["col4_ts"] = pd.to_datetime(df_ns["col4_ts"])
+
+    # enable nanoseconds in parquet writer
+    dest_ = duckdb(parquet_format=ParquetFormatConfiguration(version="2.6"))
+    pipeline = destination_config.setup_pipeline("test_duck_all_precision_types", destination=dest_)
+    row = [
+        {
+            "col1_ts": now_s,
+            "col2_ts": now_ms,
+            "col3_ts": now_us,
+            "col4_ts": None,
+            "col1_int": -128,
+            "col2_int": 16383,
+            "col3_int": 2**32 // 2 - 1,
+            "col4_int": 2**64 // 2 - 1,
+            "col5_int": 2**64 // 2 - 1,
+        }
+    ]
+
+    with pipeline._maybe_destination_capabilities() as caps:
+        # create pyarrow schema
+        columns_schema = add_timezone_false_on_precision(
+            TABLE_UPDATE_ALL_TIMESTAMP_PRECISIONS + TABLE_UPDATE_ALL_INT_PRECISIONS
+        )
+        arrow_schema = columns_to_arrow({c["name"]: c for c in columns_schema}, caps, "UTC")
+
+    def _verify_schema(arrow_schema_: pa.Schema, bit128type: pa.DataType) -> None:
+        # also assert the intermediate arrow_schema produced from columns
+        expected_names = [
+            "col1_ts",
+            "col2_ts",
+            "col3_ts",
+            "col4_ts",
+            "col1_int",
+            "col2_int",
+            "col3_int",
+            "col4_int",
+            "col5_int",
+        ]
+        expected_types = [
+            pa.timestamp("s"),
+            pa.timestamp("ms"),
+            pa.timestamp("us"),
+            pa.timestamp("ns"),
+            pa.int8(),
+            pa.int16(),
+            pa.int32(),
+            pa.int64(),
+            bit128type,
+        ]
+        for idx, (exp_name, exp_type) in enumerate(zip(expected_names, expected_types)):
+            field = arrow_schema_.field(idx)
+            assert field.name == exp_name
+            assert field.type == exp_type
+
+    # we can't really handle integers > 64 bit
+    _verify_schema(arrow_schema, pa.int64())
+    # create PyArrow table and update col4_ts with nanosecond precision from pandas DataFrame
+    table = pa.Table.from_pylist(row, arrow_schema)
+    table = table.set_column(3, "col4_ts", pa.array(df_ns["col4_ts"]))
+    # add pandas column
+    row[0]["col4_ts"] = df_ns["col4_ts"]
+
+    pipeline.run(
+        table,
+        table_name="row",
+        **destination_config.run_kwargs,
+        columns=columns_schema,
+    )
+
+    with pipeline.sql_client() as client:
+        table = client.native_connection.sql("SELECT * FROM row").fetch_arrow_table()
+
+    # only us has TZ aware timestamp in duckdb, also we have UTC here
+    _verify_schema(table.schema, pa.decimal128(38, 0))
+
+    table_row = table.to_pylist()[0]
+    table_row["col1_ts"] = ensure_pendulum_datetime(table_row["col1_ts"])
+    table_row["col2_ts"] = ensure_pendulum_datetime(table_row["col2_ts"])
+    table_row["col3_ts"] = ensure_pendulum_datetime(table_row["col3_ts"])
+    table_row["col4_ts"] = ensure_pendulum_datetime(table_row["col4_ts"])
+    table_row.pop("col4_ts")
+    row[0].pop("col4_ts")
+    assert table_row == row[0]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_new_nested_prop_parquet(destination_config: DestinationTestConfiguration) -> None:
+    from pydantic import BaseModel
+
+    class EventDetail(BaseModel):
+        detail_id: str
+        is_complete: bool
+
+    class EventV1(BaseModel):
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
+
+        ver: int
+        id: str  # noqa
+        details: EventDetail
+
+    duck_factory = duckdb("test_duck.db")
+
+    pipeline = destination_config.setup_pipeline(
+        "test_new_nested_prop_parquet", dataset_name="test_dataset"
+    )
+    pipeline.destination = duck_factory  # type: ignore
+
+    event = {"ver": 1, "id": "id1", "details": {"detail_id": "detail_1", "is_complete": False}}
+
+    pipeline.run(
+        [event],
+        table_name="events",
+        columns=EventV1,
+        loader_file_format="parquet",
+        schema_contract="evolve",
+    )
+    print(pipeline.default_schema.to_pretty_yaml())
+
+    # we will use a different pipeline with a separate schema but writing to the same dataset and to the same table
+    # the table schema is identical to the previous one with a single field ("time") added
+    # this will create a different order of columns than in the destination database ("time" will map to "_dlt_id")
+    # duckdb copies columns by column index so that will fail
+
+    class EventDetailV2(BaseModel):
+        detail_id: str
+        is_complete: bool
+        time: Optional[datetime]
+
+    class EventV2(BaseModel):
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
+
+        ver: int
+        id: str  # noqa
+        details: EventDetailV2
+
+    event["details"]["time"] = pendulum.now()  # type: ignore
+
+    pipeline = destination_config.setup_pipeline(
+        "test_new_nested_prop_parquet_2", dataset_name="test_dataset"
+    )
+    pipeline.destination = duck_factory  # type: ignore
+    pipeline.run(
+        [event],
+        table_name="events",
+        columns=EventV2,
+        loader_file_format="parquet",
+        schema_contract="evolve",
+    )
+    print(pipeline.default_schema.to_pretty_yaml())
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_jsonl_reader(destination_config: DestinationTestConfiguration) -> None:
+    pipeline = destination_config.setup_pipeline("test_jsonl_reader")
+
+    data = [{"a": 1, "b": 2}, {"a": 1}]
+    pipeline.run(data, table_name="data", loader_file_format="jsonl")
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_append_column_with_hint(destination_config: DestinationTestConfiguration) -> None:
+    pipeline = destination_config.setup_pipeline("test_append_column_with_hint")
+
+    data = [{"a": 1, "b": 2}, {"a": 1}]
+    pipeline.run(data, table_name="data")
+    # nullability info is not ignored on ALTER TABLE
+    # duckdb prevents adding any constraints on ALTER TABLE
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        pipeline.run([{"c": "X"}], table_name="data", columns={"c": {"nullable": False}})
+    assert pip_ex.value.step == "load"
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_provoke_parallel_parquet_same_table(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    @dlt.resource(name="events", file_format="parquet")
+    def _get_shuffled_events(repeat: int = 1):
+        for _ in range(repeat):
+            with open(
+                "tests/normalize/cases/github.events.load_page_1_duck.json", "r", encoding="utf-8"
+            ) as f:
+                issues = json.load(f)
+                yield issues
+
+    os.environ["DATA_WRITER__BUFFER_MAX_ITEMS"] = "200"
+    os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "200"
+
+    pipeline = destination_config.setup_pipeline("test_provoke_parallel_parquet_same_table")
+    pipeline.run(_get_shuffled_events(50), **destination_config.run_kwargs)
+
+    assert_table_counts(
+        pipeline,
+        expected_counts={
+            "events": 5000,
+            "events__payload__pull_request__base__repo__topics": 14500,
+            "events__payload__commits": 3850,
+            "events__payload__pull_request__requested_reviewers": 1200,
+            "events__payload__pull_request__labels": 1300,
+            "events__payload__issue__labels": 150,
+            "events__payload__issue__assignees": 50,
+        },
+    )
+    metrics = pipeline.last_trace.last_normalize_info.metrics[
+        pipeline.last_trace.last_normalize_info.loads_ids[0]
+    ][0]
+    event_files = [m for m in metrics["job_metrics"].keys() if m.startswith("events.")]
+    assert len(event_files) == 5000 // 200
+    assert all(m.endswith("parquet") for m in event_files)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_duckdb_credentials_separation(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    p1 = dlt.pipeline("p1", destination=duckdb(credentials=":pipeline:"))
+    p2 = dlt.pipeline("p2", destination=duckdb(credentials=":pipeline:"))
+
+    p1.run([1, 2, 3], table_name="p1_data")
+    p1_dataset = p1.dataset()
+
+    p2.run([1, 2, 3], table_name="p2_data")
+    p2_dataset = p2.dataset()
+
+    # both dataset should have independent duckdb databases
+    # destinations should be bounded to pipelines still
+    print(p1_dataset.p1_data.fetchall())
+    print(p2_dataset.p2_data.fetchall())
+
+    assert "p1" in p1_dataset.sql_client.credentials._conn_str()
+    assert "p2" in p2_dataset.sql_client.credentials._conn_str()
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_duckdb_destination_handover(destination_config: DestinationTestConfiguration) -> None:
+    # pipeline should be able to handover default pipeline factory to another pipeline
+    p1 = dlt.pipeline("p1", destination="duckdb")
+    p1.run([1, 2, 3], table_name="digits")
+
+    # p2 sees tables from p1 so duckdb database file was handed over
+    p2 = dlt.pipeline("p2", destination=p1.destination, dataset_name=p1.dataset_name)
+    with p2.sql_client() as c:
+        assert len(c.execute_sql("SELECT * FROM digits")) == 3
+
+    p2.run(["a", "b", "c"], table_name="letters")
+
+    with p1.sql_client() as c:
+        assert len(c.execute_sql("SELECT * FROM letters")) == 3

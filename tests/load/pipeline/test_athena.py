@@ -1,0 +1,534 @@
+import os
+import pytest
+import datetime  # noqa: I251
+from typing import Iterator, Any
+import sqlglot.expressions as sge
+
+import dlt
+from dlt.common import pendulum
+from dlt.common.configuration.specs.aws_credentials import AwsCredentials
+from dlt.common.destination.exceptions import DestinationTransientException, UnsupportedDataType
+from dlt.common.utils import uniq_id
+from dlt.common.libs.sqlglot import resolve_timestamp_cast, build_typed_literal
+
+from dlt.destinations.exceptions import CantExtractTablePrefix
+from dlt.destinations.adapters import athena_partition, athena_adapter
+from dlt.pipeline.exceptions import PipelineStepFailed
+
+
+from tests.cases import table_update_and_row, assert_all_data_types_row
+from tests.load.pipeline.utils import TableBucketTestClient, simple_nested_source
+from tests.pipeline.utils import assert_load_info, load_table_counts
+from tests.pipeline.utils import load_table_counts
+
+from tests.load.utils import (
+    TEST_FILE_LAYOUTS,
+    FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,
+    FILE_LAYOUT_CLASSIC,
+    FILE_LAYOUT_TABLE_NAME_ONLY,
+    FILE_LAYOUT_TABLE_FOLDER_ONLY,
+    FILE_LAYOUT_TABLE_NOT_FIRST,
+    destinations_configs,
+    DestinationTestConfiguration,
+)
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True,
+        subset=["athena"],
+        with_table_format="iceberg",
+    ),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize(
+    "lf_enabled", [True, False, None], ids=["lf-on", "lf-off", "lf-passthrough"]
+)
+def test_athena_lakeformation_config_gating(
+    destination_config: DestinationTestConfiguration, lf_enabled: bool, mocker, monkeypatch
+) -> None:
+    # Configure Lake Formation gating via env (read by client config)
+    if lf_enabled is not None:
+        monkeypatch.setenv("DESTINATION__LAKEFORMATION_CONFIG__ENABLED", str(lf_enabled))
+
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    with pipeline.destination_client() as client:
+        mocked_manage = mocker.patch(
+            "dlt.destinations.impl.athena.athena.AthenaClient.manage_lf_tags"
+        )
+        # avoid side effects in parent update_stored_schema; gating still runs in AthenaClient
+        mocker.patch(
+            "dlt.destinations.job_client_impl.SqlJobClientWithStagingDataset.update_stored_schema",
+            return_value=None,
+        )
+
+        client.update_stored_schema()
+        # disable and enable flag with add / remove tags respectively, None will skip
+        if lf_enabled is not None:
+            mocked_manage.assert_called()
+        else:
+            mocked_manage.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"]),
+    ids=lambda x: x.name,
+)
+def test_athena_destinations(destination_config: DestinationTestConfiguration) -> None:
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    @dlt.resource(name="items", write_disposition="append")
+    def items():
+        yield {
+            "id": 1,
+            "name": "item",
+            "sub_items": [{"id": 101, "name": "sub item 101"}, {"id": 101, "name": "sub item 102"}],
+        }
+
+    pipeline.run(items, **destination_config.run_kwargs)
+
+    # see if we have athena tables with items
+    table_counts = load_table_counts(
+        pipeline, *[t["name"] for t in pipeline.default_schema._schema_tables.values()]
+    )
+    assert table_counts["items"] == 1
+    assert table_counts["items__sub_items"] == 2
+    assert table_counts[pipeline.default_schema.loads_table_name] == 1
+
+    # load again with schema evolution
+    @dlt.resource(name="items", write_disposition="append")
+    def items2():
+        yield {
+            "id": 1,
+            "name": "item",
+            "new_field": "hello",
+            "sub_items": [
+                {
+                    "id": 101,
+                    "name": "sub item 101",
+                    "other_new_field": "hello 101",
+                },
+                {
+                    "id": 101,
+                    "name": "sub item 102",
+                    "other_new_field": "hello 102",
+                },
+            ],
+        }
+
+    pipeline.run(items2, **destination_config.run_kwargs)
+    table_counts = load_table_counts(
+        pipeline, *[t["name"] for t in pipeline.default_schema._schema_tables.values()]
+    )
+    assert table_counts["items"] == 2
+    assert table_counts["items__sub_items"] == 4
+    assert table_counts[pipeline.default_schema.loads_table_name] == 2
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"]),
+    ids=lambda x: x.name,
+)
+def test_athena_all_datatypes_and_timestamps(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    # TIME is not supported
+    column_schemas, data_types = table_update_and_row(exclude_types=["time"])
+
+    # apply the exact columns definitions so we process json and wei types correctly!
+    @dlt.resource(table_name="data_types", write_disposition="append", columns=column_schemas)
+    def my_resource() -> Iterator[Any]:
+        yield [data_types] * 10
+
+    @dlt.source(max_table_nesting=0)
+    def my_source() -> Any:
+        return my_resource
+
+    info = pipeline.run(my_source(), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    with pipeline.sql_client() as sql_client:
+        table_name = sql_client.make_qualified_table_name("data_types")
+
+        db_rows = sql_client.execute_sql(f"SELECT * FROM {table_name}")
+        assert len(db_rows) == 10
+        db_row = list(db_rows[0])
+        # content must equal
+        assert_all_data_types_row(
+            sql_client.capabilities,
+            db_row[:-2],
+            parse_json_strings=True,
+            schema=column_schemas,
+        )
+
+        # now let's query the data with timestamps and dates.
+        # https://docs.aws.amazon.com/athena/latest/ug/engine-versions-reference-0003.html#engine-versions-reference-0003-timestamp-changes
+
+        # use string representation TIMESTAMP(2)
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = TIMESTAMP '2022-05-23 13:26:45.176'"
+        )
+        assert len(db_rows) == 10
+        # no rows - TIMESTAMP(6) not supported
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = TIMESTAMP '2022-05-23 13:26:45.176145'"
+        )
+        assert len(db_rows) == 0
+        # use pendulum
+        # that will pass
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = %s",
+            pendulum.datetime(2022, 5, 23, 13, 26, 45, 176000),
+        )
+        assert len(db_rows) == 10
+        # that will return empty list
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = %s",
+            pendulum.datetime(2022, 5, 23, 13, 26, 45, 176145),
+        )
+        assert len(db_rows) == 0
+
+        # use datetime
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = %s",
+            datetime.datetime(2022, 5, 23, 13, 26, 45, 176000),
+        )
+        assert len(db_rows) == 10
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col4 = %s",
+            datetime.datetime(2022, 5, 23, 13, 26, 45, 176145),
+        )
+        assert len(db_rows) == 0
+
+        # check date
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col10 = DATE '2023-02-27'"
+        )
+        assert len(db_rows) == 10
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col10 = %s", pendulum.date(2023, 2, 27)
+        )
+        assert len(db_rows) == 10
+        db_rows = sql_client.execute_sql(
+            f"SELECT * FROM {table_name} WHERE col10 = %s", datetime.date(2023, 2, 27)
+        )
+        assert len(db_rows) == 10
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"], with_table_format=None),
+    ids=lambda x: x.name,
+)
+def test_athena_cast_timestamp_6_on_hive(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """`CAST(... AS TIMESTAMP(6))` must execute on Hive (non-iceberg) athena tables.
+
+    Rows are inserted at full microsecond precision to mirror what `pendulum.now()`
+    produces in real pipelines. Athena Hive's TIMESTAMP(3) column silently truncates
+    the inserted value to millisecond on write; iceberg retains the full microsecond.
+    The TIMESTAMP(6) cast in the WHERE clause executes against both backings.
+    """
+
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    # microsecond-precision instants — Hive truncates these to .100/.200/.300 ms
+    # on storage; iceberg retains the full value
+    row_ts = [
+        pendulum.datetime(2026, 5, 18, 12, 0, 0, 100147),
+        pendulum.datetime(2026, 5, 18, 12, 0, 0, 200369),
+        pendulum.datetime(2026, 5, 18, 12, 0, 0, 300578),
+    ]
+
+    @dlt.resource(
+        table_name="ts_rows",
+        write_disposition="append",
+        columns=[
+            {"name": "id", "data_type": "bigint", "nullable": False},
+            {"name": "ts", "data_type": "timestamp", "nullable": False},
+        ],
+    )
+    def ts_rows() -> Iterator[Any]:
+        yield [{"id": i, "ts": ts} for i, ts in enumerate(row_ts, start=1)]
+
+    info = pipeline.run(ts_rows, **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # build the same CAST that `resolve_timestamp_cast` produces on the athena
+    # dialect: TIMESTAMP(6) wrapping a microsecond-precision literal. this lets
+    # the incremental WHERE clause keep microsecond precision; athena Hive
+    # columns are stored at TIMESTAMP(3) but the engine accepts the TIMESTAMP(6)
+    # cast in the comparison and truncates implicitly.
+    caps = pipeline.destination_client().capabilities
+    cursor_value = pendulum.datetime(2026, 5, 18, 12, 0, 0, 150147)  # between row 1 and row 2
+    sqlglot_type, lower, _ = resolve_timestamp_cast(cursor_value, None, caps)
+    assert sqlglot_type is not None
+    assert sqlglot_type.sql(dialect="athena") == "TIMESTAMP(6)"
+    literal = build_typed_literal(lower, sqlglot_type).sql(dialect="athena")
+    assert "TIMESTAMP(6)" in literal
+    assert "150147" in literal
+
+    with pipeline.sql_client() as sql_client:
+        table_name = sql_client.make_qualified_table_name("ts_rows")
+
+        # cursor sits between row 1 and row 2 regardless of truncation
+        # (Hive sees .100/.200/.300 ms; iceberg sees .100147/.200369/.300578 us)
+        rows = sql_client.execute_sql(
+            f"SELECT id FROM {table_name} WHERE ts > {literal} ORDER BY id"
+        )
+        assert [r[0] for r in rows] == [2, 3]
+
+        # boundary: cursor equals row 2's pre-truncation value. on iceberg the
+        # exact-microsecond match excludes row 2; on Hive both row 2 and the
+        # cursor land in the same .200 ms bucket, also excluding row 2.
+        cursor_at_row2 = pendulum.datetime(2026, 5, 18, 12, 0, 0, 200369)
+        _, lower_at_row2, _ = resolve_timestamp_cast(cursor_at_row2, None, caps)
+        boundary_literal = build_typed_literal(lower_at_row2, sqlglot_type).sql(dialect="athena")
+        rows = sql_client.execute_sql(
+            f"SELECT id FROM {table_name} WHERE ts > {boundary_literal} ORDER BY id"
+        )
+        assert [r[0] for r in rows] == [3]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"]),
+    ids=lambda x: x.name,
+)
+def test_athena_blocks_time_column(destination_config: DestinationTestConfiguration) -> None:
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    column_schemas, data_types = table_update_and_row()
+
+    # apply the exact columns definitions so we process json and wei types correctly!
+    @dlt.resource(table_name="data_types", write_disposition="append", columns=column_schemas)
+    def my_resource() -> Iterator[Any]:
+        yield [data_types] * 10
+
+    @dlt.source(max_table_nesting=0)
+    def my_source() -> Any:
+        return my_resource
+
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        pipeline.run(my_source(), **destination_config.run_kwargs)
+    assert isinstance(pip_ex.value.__cause__, UnsupportedDataType)
+    assert pip_ex.value.__cause__.data_type == "time"
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True,
+        subset=["athena"],
+        # exclude Athena with S3 Tables Catalog because its code paths do not use file layouts
+        is_athena_s3_tables=False,
+    ),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("layout", TEST_FILE_LAYOUTS)
+def test_athena_file_layouts(destination_config: DestinationTestConfiguration, layout) -> None:
+    # test wether strange file layouts still work in all staging configs
+    pipeline = destination_config.setup_pipeline("athena_file_layout", dev_mode=True)
+    os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = layout
+
+    resources = [
+        dlt.resource([1, 2, 3], name="items1"),
+        dlt.resource([1, 2, 3, 4, 5, 6, 7], name="items2"),
+    ]
+
+    # layouts that should not work should raise exception
+    if layout in [
+        FILE_LAYOUT_CLASSIC,  # table not in own folder
+        FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,  # table not in own folder
+        FILE_LAYOUT_TABLE_NAME_ONLY,  # table not in own folder, dlt appends `.{ext}`
+        FILE_LAYOUT_TABLE_FOLDER_ONLY,  # dlt names the file `.{ext}` and Athena skips hidden files
+        FILE_LAYOUT_TABLE_NOT_FIRST,  # table not the first variable
+    ]:
+        with pytest.raises(CantExtractTablePrefix):
+            pipeline.run(resources, **destination_config.run_kwargs)
+        return
+
+    info = pipeline.run(resources, **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    table_counts = load_table_counts(pipeline)
+    assert table_counts == {"items1": 3, "items2": 7}
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"], with_table_format="iceberg"),
+    ids=lambda x: x.name,
+)
+def test_athena_partitioned_iceberg_table(destination_config: DestinationTestConfiguration):
+    """Load an iceberg table with partition hints and verify partitions are created correctly."""
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    data_items = [
+        (1, "A", datetime.date.fromisoformat("2021-01-01")),
+        (2, "A", datetime.date.fromisoformat("2021-01-02")),
+        (3, "A", datetime.date.fromisoformat("2021-01-03")),
+        (4, "A", datetime.date.fromisoformat("2021-02-01")),
+        (5, "A", datetime.date.fromisoformat("2021-02-02")),
+        (6, "B", datetime.date.fromisoformat("2021-01-01")),
+        (7, "B", datetime.date.fromisoformat("2021-01-02")),
+        (8, "B", datetime.date.fromisoformat("2021-01-03")),
+        (9, "B", datetime.date.fromisoformat("2021-02-01")),
+        (10, "B", datetime.date.fromisoformat("2021-03-02")),
+    ]
+
+    @dlt.resource(table_format="iceberg")
+    def partitioned_table():
+        yield [{"id": i, "category": c, "created_at": d} for i, c, d in data_items]
+
+    athena_adapter(
+        partitioned_table,
+        partition=[
+            "category",
+            athena_partition.month("created_at"),
+        ],
+    )
+
+    info = pipeline.run(partitioned_table, **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # Get partitions from metadata
+    with pipeline.sql_client() as sql_client:
+        tbl_name = sql_client.make_qualified_table_name("partitioned_table$partitions")
+        rows = sql_client.execute_sql(f"SELECT partition FROM {tbl_name}")
+        # newer Athena client returns partition as dict, older as formatted string
+        partition_keys = set()
+        for r in rows:
+            val = r[0]
+            if isinstance(val, dict):
+                partition_keys.add(frozenset(val.items()))
+            else:
+                partition_keys.add(val)
+
+        data_rows = sql_client.execute_sql(
+            "SELECT id, category, created_at FROM"
+            f" {sql_client.make_qualified_table_name('partitioned_table')}"
+        )
+
+    # All data is in table
+    assert len(data_rows) == len(data_items)
+    assert set(data_rows) == set(data_items)
+
+    # Compare with expected partitions
+    # Months are number of months since epoch
+    expected_partitions = {
+        frozenset({("category", "A"), ("created_at_month", "612")}),
+        frozenset({("category", "A"), ("created_at_month", "613")}),
+        frozenset({("category", "B"), ("created_at_month", "612")}),
+        frozenset({("category", "B"), ("created_at_month", "613")}),
+        frozenset({("category", "B"), ("created_at_month", "614")}),
+    }
+
+    assert partition_keys == expected_partitions
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True,
+        subset=["athena"],
+        is_athena_s3_tables=True,
+    ),
+    ids=lambda x: x.name,
+)
+def test_athena_s3_tables(destination_config: DestinationTestConfiguration) -> None:
+    """This test checks the S3 Tables bucket is actually used when setting an S3 Tables Catalog.
+
+    All other tests use Athena to query the data, but here we directly check the bucket.
+    """
+
+    pipe = destination_config.setup_pipeline("test_table_bucket", dev_mode=True)
+    pipe.run(simple_nested_source())
+
+    credentials = pipe.destination_client().config.credentials
+    assert isinstance(credentials, AwsCredentials)
+    table_bucket_test_client = TableBucketTestClient(credentials)
+    assert table_bucket_test_client.namespace_exists(pipe.dataset_name)
+    assert table_bucket_test_client.table_exists(pipe.dataset_name, "lists")
+    assert table_bucket_test_client.table_exists(pipe.dataset_name, "lists__value")
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True,
+        subset=["athena"],
+        # exclude S3 Tables Catalog, not relevant for this test
+        is_athena_s3_tables=False,
+    ),
+    ids=lambda x: x.name,
+)
+def test_athena_no_query_result_bucket(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test that query_result_bucket=None resolves and reaches Athena without
+    ConfigFieldMissingException.
+
+    Our CI Athena workgroup does not have managed query results enabled, so the pipeline
+    will fail at load time with an Athena-side error about missing output location. This
+    verifies that the config resolution accepts None and the error comes from Athena itself.
+    See: https://github.com/dlt-hub/dlt/issues/3565
+    """
+    # create destination and force query_result_bucket=None to override secrets
+    dest = destination_config.destination_factory(athena_work_group="primary")
+    dest.config_params["query_result_bucket"] = None
+
+    pipeline = destination_config.setup_pipeline(
+        "athena_" + uniq_id(), dev_mode=True, destination=dest
+    )
+
+    @dlt.resource(name="items", write_disposition="append")
+    def items():
+        yield {"id": 1, "name": "item"}
+
+    # pipeline should fail at load with an Athena-side error about output location,
+    # NOT with ConfigFieldMissingException
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        pipeline.run(items, **destination_config.run_kwargs)
+    assert isinstance(pip_ex.value.__cause__, DestinationTransientException)
+    # athena rejects queries when no output location is set and workgroup doesn't manage it
+    assert "output location" in str(pip_ex.value.__cause__).lower() or "ResultConfiguration" in str(
+        pip_ex.value.__cause__
+    )
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["athena"], supports_merge=False),
+    ids=lambda x: x.name,
+)
+def test_athena_merge_without_iceberg_falls_back_to_append(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Non-iceberg tables on Athena have no merge strategies — fall back to append."""
+    pipeline = destination_config.setup_pipeline("athena_" + uniq_id(), dev_mode=True)
+
+    @dlt.resource(name="items", write_disposition="merge", primary_key="id")
+    def items():
+        yield [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+    info = pipeline.run(items, **destination_config.run_kwargs)
+    assert_load_info(info)
+    table_counts = load_table_counts(pipeline, "items")
+    assert table_counts["items"] == 2
+
+    # second load appends (no dedup since merge is not supported)
+    info = pipeline.run(items, **destination_config.run_kwargs)
+    assert_load_info(info)
+    table_counts = load_table_counts(pipeline, "items")
+    assert table_counts["items"] == 4

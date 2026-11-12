@@ -1,0 +1,826 @@
+from datetime import datetime, timezone  # noqa: I251
+from typing import List, Tuple
+from zoneinfo import ZoneInfo
+
+import pytest
+import dlt.destinations.path_utils
+
+from dlt.common import logger, pendulum
+from dlt.common.storages import LoadStorage
+from dlt.common.storages.load_package import ParsedLoadJobFileName
+
+from dlt.common.normalizers.naming import NamingConvention, direct, duck_case, snake_case, sql_cs_v1
+
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs.timezone_context import TimezoneContext
+
+from dlt.destinations.path_utils import (
+    create_path,
+    prepare_datetime_params,
+    get_table_prefix_layout,
+    get_unsafe_prefix_separators,
+    get_file_format_and_compression,
+)
+
+from dlt.destinations.exceptions import InvalidFilesystemLayout, CantExtractTablePrefix
+from tests.common.storages.utils import start_loading_file, load_storage
+
+
+TestLoad = Tuple[str, ParsedLoadJobFileName]
+
+
+def dummy_callback(*args, **kwargs):
+    assert len(args) == 5
+    return "-".join(args)
+
+
+def dummy_callback2(*args, **kwargs):
+    assert len(args) == 5
+    return "random-value"
+
+
+EXTRA_PLACEHOLDERS = {
+    "type": "one-for-all",
+    "vm": "beam",
+    "module": "__MODULE__",
+    "bobo": "is-name",
+    "callback": dummy_callback,
+    "random_value": dummy_callback2,
+}
+
+# tz-aware: a naive value would make every `{timestamp}` expectation below depend on
+# the machine timezone, which is exactly what layout paths must never do
+frozen_datetime = pendulum.DateTime(
+    year=2024,
+    month=4,
+    day=14,
+    hour=8,
+    minute=32,
+    second=0,
+    microsecond=0,
+    tzinfo=pendulum.UTC,
+)
+
+# Each layout example is a tuple of
+# 1. layout to expand,
+# 2. expected path,
+# 3. valid or not flag,
+# 4. the list of expected invalid or unknown placeholders.
+ALL_LAYOUTS = (  # type: ignore
+    # Usual placeholders
+    (
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{ext}",
+        "schema-name/mocked-table/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{schema_name}.{table_name}.{load_id}.{file_id}.{ext}",
+        "schema-name.mocked-table.mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}88{load_id}-u-{file_id}.{ext}",
+        "mocked-table88mocked-load-id-u-mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    # Additional placeholders
+    (
+        "{table_name}/{curr_date}/{load_id}.{file_id}.{ext}{timestamp}",
+        f"mocked-table/{str(frozen_datetime.date())}/mocked-load-id.mocked-file-id.jsonl{int(frozen_datetime.timestamp())}",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{YYYY}-{MM}-{DD}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('YYYY-MM-DD')}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{YYYY}-{MMM}-{D}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('YYYY-MMM-D').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{DD}/{HH}/{m}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('DD/HH/m').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{D}/{HH}/{mm}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('D/HH/mm').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{timestamp}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{int(frozen_datetime.timestamp())}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/dayofweek-{ddd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/dayofweek-{frozen_datetime.format('ddd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{ddd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('ddd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{Q}/{MM}/{ddd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('Q/MM/ddd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{YY}-{MM}-{D}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('YY-MM-D').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{Y}-{M}-{D}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('Y-M-D').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{HH}/{mm}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('HH/mm').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{mm}/{ss}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('mm/ss').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{mm}/{s}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('mm/s').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{ss}/{s}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('ss/s').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{SSS}/{SS}/{S}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('SSS/SS/S').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{SS}/{S}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('SS/S').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/ms={SSS}/mcs={SSSS}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/ms={frozen_datetime.format('SSS').lower()}/mcs={frozen_datetime.format('SSSS').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{H}/{m}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('H/m').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{M}/{dddd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('M/dddd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{M}/{ddd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('M/ddd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{M}/{dd}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('M/dd').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{M}/{d}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{frozen_datetime.format('M/d').lower()}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{load_package_timestamp}/{d}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{int(frozen_datetime.timestamp())}/{frozen_datetime.format('d')}/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    # Extra placehodlers
+    (
+        "{table_name}/{timestamp}/{type}-{vm}-{module}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{int(frozen_datetime.timestamp())}/one-for-all-beam-__MODULE__/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{timestamp}/{type}-{bobo}-{module}/{load_id}.{file_id}.{ext}",
+        f"mocked-table/{int(frozen_datetime.timestamp())}/one-for-all-is-name-__MODULE__/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{type}/{bobo}/{module}/{load_id}.{file_id}.{ext}",
+        "mocked-table/one-for-all/is-name/__MODULE__/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{callback}/{callback}/{type}/{load_id}.{file_id}.{ext}",
+        "mocked-table/schema-name-mocked-table-mocked-load-id-mocked-file-id-jsonl/schema-name-mocked-table-mocked-load-id-mocked-file-id-jsonl/one-for-all/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{table_name}/{random_value}/{callback}/{load_id}.{file_id}.{ext}",
+        "mocked-table/random-value/schema-name-mocked-table-mocked-load-id-mocked-file-id-jsonl/mocked-load-id.mocked-file-id.jsonl",
+        True,
+        [],
+    ),
+    # {table_name} terminates the layout, so the appended {ext} provides the prefix separator
+    ("{table_name}", "mocked-table.jsonl", True, []),
+    ("{schema_name}/{table_name}", "schema-name/mocked-table.jsonl", True, []),
+    ("{timestamp}{table_name}", f"{int(frozen_datetime.timestamp())}mocked-table.jsonl", True, []),
+    ("{ddd}/{MMM}/{table_name}", "sun/apr/mocked-table.jsonl", True, []),
+    (
+        "{Y}/{timestamp}/{table_name}",
+        f"{frozen_datetime.format('YYYY')}/{int(frozen_datetime.timestamp())}/mocked-table.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{Y}/{timestamp_ms}/{table_name}",
+        f"{frozen_datetime.year}/{str(int(frozen_datetime.timestamp()*1000))}/mocked-table.jsonl",
+        True,
+        [],
+    ),
+    (
+        "{Y}/{load_package_timestamp_ms}/{table_name}",
+        f"{frozen_datetime.year}/{str(int(frozen_datetime.timestamp()*1000))}/mocked-table.jsonl",
+        True,
+        [],
+    ),
+    ("{load_id}/{ext}/{table_name}", "mocked-load-id/jsonl/mocked-table", True, []),
+    (
+        "{HH}/{mm}/{schema_name}",
+        f"{frozen_datetime.format('HH/mm')}/schema-name.jsonl",
+        True,
+        [],
+    ),
+    ("{type}/{bobo}/{table_name}", "one-for-all/is-name/mocked-table.jsonl", True, []),
+    # invalid placeholders
+    ("{illegal_placeholder}{table_name}", "", False, ["illegal_placeholder"]),
+    ("{unknown_placeholder}/{volume}/{table_name}", "", False, ["unknown_placeholder", "volume"]),
+    (
+        "{table_name}/{abc}/{load_id}.{ext}{timestamp}-{random}",
+        "",
+        False,
+        ["abc", "random"],
+    ),
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_unsafe_separator_warnings() -> None:
+    # the warning is emitted once per layout and naming convention, process-wide
+    dlt.destinations.path_utils._log_unsafe_prefix_separators.cache_clear()
+
+
+@pytest.fixture
+def test_load(load_storage: LoadStorage) -> TestLoad:
+    load_id, filename = start_loading_file(load_storage, "test file")  # type: ignore[arg-type]
+    info = ParsedLoadJobFileName.parse(filename)
+    return load_id, info
+
+
+@pytest.mark.parametrize("layout,expected_path,is_valid,invalid_placeholders", ALL_LAYOUTS)
+def test_layout_validity(
+    layout: str,
+    expected_path: str,
+    is_valid: bool,
+    invalid_placeholders: List[str],
+    mocker,
+) -> None:
+    job_info = ParsedLoadJobFileName(
+        table_name="mocked-table",
+        file_id="mocked-file-id",
+        retry_count=0,
+        file_format="jsonl",
+    )
+    load_id = "mocked-load-id"
+    mocker.patch("pendulum.now", return_value=frozen_datetime)
+    mocker.patch(
+        "pendulum.DateTime.timestamp",
+        return_value=frozen_datetime.timestamp(),
+    )
+
+    mocker.patch(
+        "dlt.common.storages.load_package.ParsedLoadJobFileName.parse",
+        return_value=job_info,
+    )
+
+    now_timestamp = frozen_datetime
+    if is_valid:
+        path = create_path(
+            layout,
+            schema_name="schema-name",
+            load_id=load_id,
+            load_package_timestamp=now_timestamp,
+            file_name=job_info.file_name(),
+            extra_placeholders=EXTRA_PLACEHOLDERS,
+        )
+        assert path == expected_path
+        assert len(path.split("/")) == len(layout.split("/"))
+        # a replace or a drop selects by prefix, which must not match a longer table name
+        try:
+            prefix_layout = get_table_prefix_layout(layout)
+        except CantExtractTablePrefix:
+            pass
+        else:
+            assert path.startswith(
+                prefix_layout.format(schema_name="schema-name", table_name=job_info.table_name)
+            )
+            assert not path.startswith(
+                prefix_layout.format(schema_name="schema-name", table_name="mocked")
+            )
+    else:
+        with pytest.raises(InvalidFilesystemLayout) as exc:
+            create_path(
+                layout,
+                schema_name="schema-name",
+                load_id=load_id,
+                load_package_timestamp=now_timestamp,
+                file_name=job_info.file_name(),
+                extra_placeholders=EXTRA_PLACEHOLDERS,
+            )
+        assert set(exc.value.invalid_placeholders) == set(invalid_placeholders)
+
+
+def test_create_path(test_load: TestLoad) -> None:
+    load_id, job_info = test_load
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        file_name=job_info.file_name(),
+    )
+    assert path == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{job_info.file_format}"
+
+    # extension gets added automatically
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}",
+        schema_name="schema_name",
+        load_id=load_id,
+        file_name=job_info.file_name(),
+    )
+    assert (
+        path == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{job_info.full_extension()}"
+    )
+
+    compressed_job_info = job_info._replace(is_compressed=True)
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}",
+        schema_name="schema_name",
+        load_id=load_id,
+        file_name=compressed_job_info.file_name(),
+    )
+    assert (
+        path
+        == f"schema_name/mock_table/{load_id}.{compressed_job_info.file_id}.{compressed_job_info.full_extension()}"
+    )
+
+
+def test_get_table_prefix_layout() -> None:
+    prefix_layout = get_table_prefix_layout("{schema_name}/{table_name}/{load_id}.{file_id}.{ext}")
+    assert prefix_layout == "{schema_name}/{table_name}/"
+    assert (
+        prefix_layout.format(schema_name="my_schema", table_name="my_table")
+        == "my_schema/my_table/"
+    )
+
+    prefix_layout = get_table_prefix_layout(
+        "some_random{schema_name}/stuff_in_between/{table_name}/{load_id}"
+    )
+    assert prefix_layout == "some_random{schema_name}/stuff_in_between/{table_name}/"
+    assert (
+        prefix_layout.format(schema_name="my_schema", table_name="my_table")
+        == "some_randommy_schema/stuff_in_between/my_table/"
+    )
+
+    # disallow missing table_name
+    with pytest.raises(CantExtractTablePrefix):
+        get_table_prefix_layout("some_random{schema_name}/stuff_in_between/")
+
+    # disallow other params before table_name
+    with pytest.raises(CantExtractTablePrefix):
+        get_table_prefix_layout("{file_id}some_random{table_name}/stuff_in_between/")
+
+    # disallow any placeholders before table name (ie. Athena)
+    with pytest.raises(CantExtractTablePrefix):
+        get_table_prefix_layout(
+            "{schema_name}some_random{table_name}/stuff_in_between/",
+            supported_prefix_placeholders=[],
+        )
+
+    # disallow table_name without following separator
+    with pytest.raises(CantExtractTablePrefix):
+        get_table_prefix_layout("{schema_name}/{table_name}{load_id}.{file_id}.{ext}")
+
+
+@pytest.mark.parametrize(
+    "layout,expected_prefix",
+    [
+        # {table_name} at end → dot appended for the implicit extension
+        ("{table_name}", "{table_name}."),
+        # full path prefix at end → dot appended
+        ("{schema_name}/{table_name}", "{schema_name}/{table_name}."),
+        # dot from {ext} suffices
+        ("{table_name}.{ext}", "{table_name}."),
+        # dot before another placeholder also separates
+        ("{table_name}.{load_id}", "{table_name}."),
+        # slash separator suffices
+        ("{table_name}/", "{table_name}/"),
+        # slash before the next placeholder suffices
+        ("{schema_name}/{table_name}/{load_id}.{ext}", "{schema_name}/{table_name}/"),
+    ],
+)
+def test_get_table_prefix_layout_table_name_at_end(layout: str, expected_prefix: str) -> None:
+    """The prefix keeps the separator when {table_name} terminates the layout.
+
+    The prefix of `event` then does not match the files of the sibling table `events`.
+    """
+    assert get_table_prefix_layout(layout) == expected_prefix
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["{table_name}/", "{schema_name}/{table_name}/", "{table_name}/_{ext}"],
+    ids=["table_folder_only", "schema_and_table_folder", "underscore_file_name"],
+)
+def test_table_own_folder_rejects_hidden_file_name(layout: str) -> None:
+    """A destination that reads a folder as a table skips files starting with '.' or '_'."""
+    # the same layouts are valid when the destination does not read a folder as a table
+    assert get_table_prefix_layout(layout)
+
+    with pytest.raises(CantExtractTablePrefix):
+        get_table_prefix_layout(
+            layout, supported_prefix_placeholders=["schema_name"], table_needs_own_folder=True
+        )
+
+
+SNAKE_CASE = snake_case.NamingConvention()
+
+UNSAFE_SEPARATOR_CASES = [
+    (SNAKE_CASE, "{table_name}", []),
+    (SNAKE_CASE, "{table_name}/{load_id}.{file_id}.{ext}", []),
+    (SNAKE_CASE, "{schema_name}.{table_name}.{load_id}.{ext}", []),
+    # `_` and digits can occur in a snake_case table name so `event` also matches `event__child`
+    (SNAKE_CASE, "{table_name}_{load_id}.{file_id}.{ext}", ["_"]),
+    (SNAKE_CASE, "{table_name}88{load_id}-u-{file_id}.{ext}", ["8"]),
+    # only the character right after {table_name} is kept, a longer literal cannot separate
+    (SNAKE_CASE, "{table_name}.literal.{load_id}.{ext}", []),
+    (SNAKE_CASE, "{table_name}x.{load_id}.{ext}", ["x"]),
+    # the whole literal before {table_name} is kept, so one unusable character is enough
+    (SNAKE_CASE, "{schema_name}.literal.{table_name}/{load_id}.{ext}", []),
+    (SNAKE_CASE, "{schema_name}_literal_{table_name}/{load_id}.{ext}", ["_literal_"]),
+    # both boundaries unsafe, reported once
+    (SNAKE_CASE, "{schema_name}_{table_name}_{load_id}.{ext}", ["_"]),
+    # duck_case and direct keep `/` in identifiers so even the default layout is ambiguous
+    (duck_case.NamingConvention(), "{table_name}/{load_id}.{file_id}.{ext}", ["/"]),
+    (direct.NamingConvention(), "{table_name}/{load_id}.{file_id}.{ext}", ["/"]),
+    (sql_cs_v1.NamingConvention(), "{table_name}/{load_id}.{file_id}.{ext}", []),
+    # direct strips its PATH_SEPARATOR from identifiers but still joins nested tables with it
+    (direct.NamingConvention(), "{table_name}▶{load_id}.{ext}", ["▶"]),
+]
+
+
+@pytest.mark.parametrize(
+    "naming,layout,expected",
+    UNSAFE_SEPARATOR_CASES,
+    ids=lambda val: val.name() if isinstance(val, NamingConvention) else str(val),
+)
+def test_get_unsafe_prefix_separators(
+    naming: NamingConvention, layout: str, expected: List[str]
+) -> None:
+    prefix = get_table_prefix_layout(layout)
+    assert get_unsafe_prefix_separators(prefix, naming) == expected
+    # the check only warns, it never changes the prefix
+    assert get_table_prefix_layout(layout, naming=naming) == prefix
+
+
+def test_unsafe_prefix_separators_warn_once(mocker) -> None:
+    logger_mock = mocker.patch("dlt.destinations.path_utils.logger")
+    layout = "{schema_name}_{table_name}_{load_id}.{ext}"
+    get_table_prefix_layout(layout, naming=SNAKE_CASE)
+
+    logger_mock.warning.assert_called_once()
+    message = logger_mock.warning.call_args[0][0]
+    assert layout in message
+    assert "'_'" in message
+    assert "snake_case" in message
+    assert "warn_unsafe_layout_separators=False" in message
+
+
+def test_unsafe_prefix_separators_warning_quotes_original_layout(mocker) -> None:
+    logger_mock = mocker.patch("dlt.destinations.path_utils.logger")
+    # {ext} is appended internally, the user must not see a layout they did not write
+    get_table_prefix_layout("{table_name}_{load_id}", naming=SNAKE_CASE)
+
+    message = logger_mock.warning.call_args[0][0]
+    assert "{table_name}_{load_id}`" in message
+    assert "{ext}" not in message
+
+
+def test_no_unsafe_separator_warning_without_naming(mocker) -> None:
+    logger_mock = mocker.patch("dlt.destinations.path_utils.logger")
+    get_table_prefix_layout("{table_name}_{load_id}.{ext}")
+    get_table_prefix_layout("{table_name}/{load_id}.{ext}", naming=SNAKE_CASE)
+
+    logger_mock.warning.assert_not_called()
+
+
+def test_create_path_uses_provided_load_package_timestamp(test_load: TestLoad) -> None:
+    load_id, job_info = test_load
+    now = pendulum.now()
+    timestamp = str(int(now.timestamp()))
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        load_package_timestamp=now,
+        file_name=job_info.file_name(),
+    )
+
+    assert timestamp in path
+    assert path.endswith(f"{timestamp}.{job_info.file_format}")
+
+
+@pytest.mark.parametrize(
+    "tz_name", [None, "UTC", "Europe/Berlin", "Asia/Kolkata"], ids=lambda tz: str(tz)
+)
+def test_datetime_params_do_not_follow_context_timezone(tz_name: str) -> None:
+    """A path renders the same in every context timezone, or one table splits across two prefixes."""
+    # 23:30 UTC is already the next day in Berlin and in Kolkata, so a leak is visible in the day
+    moment = datetime(2024, 1, 15, 23, 30, tzinfo=timezone.utc)
+
+    if tz_name is None:
+        params = prepare_datetime_params(load_package_timestamp=moment)
+    else:
+        with Container().injectable_context(TimezoneContext(tz_name)):
+            params = prepare_datetime_params(load_package_timestamp=moment)
+
+    assert params["curr_date"] == "2024-01-15"
+    assert params["YYYY"] == "2024"
+    assert params["MM"] == "01"
+    assert params["DD"] == "15"
+    assert params["HH"] == "23"
+    assert params["load_package_timestamp"] == str(int(moment.timestamp()))
+    assert params["timestamp"] == str(int(moment.timestamp()))
+
+
+@pytest.mark.parametrize(
+    "current_datetime,expected",
+    [
+        (datetime(2024, 1, 15, 23, 30), ("2024-01-15", "23")),
+        (pendulum.datetime(2024, 1, 15, 23, 30, tz="Europe/Berlin"), ("2024-01-15", "23")),
+        (
+            datetime(2024, 1, 15, 23, 30, tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata")),
+            ("2024-01-16", "05"),
+        ),
+    ],
+    ids=["naive_is_utc", "pendulum_keeps_timezone", "stdlib_keeps_timezone"],
+)
+def test_datetime_params_from_current_datetime(
+    current_datetime: datetime, expected: Tuple[str, str]
+) -> None:
+    params = prepare_datetime_params(current_datetime=current_datetime)
+    assert (params["curr_date"], params["HH"]) == expected
+
+
+def test_create_path_resolves_current_datetime(test_load: TestLoad) -> None:
+    """Check the flow when the current_datetime is passed
+
+    Happy path checks
+
+    1. Callback,
+    2. pendulum.DateTime
+
+    Failures when neither callback nor the value is not of pendulum.DateTime
+    """
+    load_id, job_info = test_load
+    now = pendulum.now()
+    timestamp = int(now.timestamp())
+    now_timestamp = now
+    calls = 0
+
+    def current_datetime_callback():
+        nonlocal calls
+        calls += 1
+        return now
+
+    created_path_1 = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        current_datetime=current_datetime_callback,
+        load_package_timestamp=now_timestamp,
+        file_name=job_info.file_name(),
+    )
+
+    created_path_2 = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        current_datetime=now,
+        load_package_timestamp=now_timestamp,
+        file_name=job_info.file_name(),
+    )
+
+    assert created_path_1 == created_path_2
+    assert (
+        created_path_1 == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{timestamp}.jsonl"
+    )
+    assert (
+        created_path_2 == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{timestamp}.jsonl"
+    )
+
+    # expect only one call
+    assert calls == 1
+
+    # If the value for current_datetime is not pendulum.DateTime
+    # it should fail with RuntimeError exception
+    with pytest.raises(AttributeError):
+        create_path(
+            "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+            schema_name="schema_name",
+            load_id=load_id,
+            current_datetime="now",  # type: ignore
+            load_package_timestamp=now_timestamp,
+            file_name=job_info.file_name(),
+        )
+    with pytest.raises(RuntimeError):
+        create_path(
+            "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+            schema_name="schema_name",
+            load_id=load_id,
+            current_datetime=lambda: 1234,  # type: ignore
+            load_package_timestamp=now_timestamp,
+            file_name=job_info.file_name(),
+        )
+
+
+def test_create_path_uses_current_moment_if_current_datetime_is_not_given(
+    test_load: TestLoad, mocker
+) -> None:
+    load_id, job_info = test_load
+    logger_spy = mocker.spy(logger, "info")
+    now = datetime(2024, 4, 14, 3, 4, 5, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    mocker.patch.object(dlt.destinations.path_utils, "datetime", FixedDatetime)
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        file_name=job_info.file_name(),
+    )
+    timestamp = int(now.timestamp())
+    assert path == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{timestamp}.jsonl"
+    logger_spy.assert_called_once_with("`current_datetime` is not set. dlt uses the current time.")
+
+
+def test_create_path_uses_load_package_timestamp_as_current_datetime(
+    test_load: TestLoad, mocker
+) -> None:
+    load_id, job_info = test_load
+    now = pendulum.now()
+    timestamp = int(now.timestamp())
+    now_timestamp = now
+    logger_spy = mocker.spy(logger, "info")
+    ensure_datetime_spy = mocker.spy(dlt.destinations.path_utils, "ensure_datetime_in_tz")
+    path = create_path(
+        "{schema_name}/{table_name}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        load_package_timestamp=now_timestamp,
+        file_name=job_info.file_name(),
+    )
+    assert path == f"schema_name/mock_table/{load_id}.{job_info.file_id}.{timestamp}.jsonl"
+    logger_spy.assert_called_once_with(
+        "`current_datetime` is not set. dlt uses the load package timestamp."
+    )
+    # pinned to UTC, so the path never moves with the context timezone
+    ensure_datetime_spy.assert_called_once_with(now_timestamp, timezone.utc)
+
+
+def test_create_path_resolves_extra_placeholders(test_load: TestLoad) -> None:
+    load_id, job_info = test_load
+
+    class Counter:
+        def __init__(self) -> None:
+            self.count = 0
+
+        def inc(self, *args, **kwargs):
+            schema_name, table_name, passed_load_id, file_id, ext = args
+            assert len(args) == 5
+            assert schema_name == "schema_name"
+            assert table_name == "mock_table"
+            assert passed_load_id == load_id
+            assert file_id == job_info.file_id
+            assert ext == job_info.file_format
+            self.count += 1
+            return "boo"
+
+    counter = Counter()
+    extra_placeholders = {
+        "value": 1,
+        "callable_1": counter.inc,
+        "otter": counter.inc,
+        "otters": "lab",
+        "dlt": "labs",
+        "dlthub": "platform",
+        "x": "files",
+    }
+    now = pendulum.now()
+    timestamp = int(now.timestamp())
+    now_timestamp = now
+    created_path = create_path(
+        "{schema_name}/{table_name}/{callable_1}-{otter}/{load_id}.{file_id}.{timestamp}.{ext}",
+        schema_name="schema_name",
+        load_id=load_id,
+        extra_placeholders=extra_placeholders,
+        file_name=job_info.file_name(),
+        load_package_timestamp=now_timestamp,
+    )
+    assert (
+        created_path
+        == f"schema_name/mock_table/boo-boo/{load_id}.{job_info.file_id}.{timestamp}.jsonl"
+    )
+    assert counter.count == 2
+
+
+FILE_PATHS_AND_EXPECTED = [
+    # (file_path, expected_format, expected_compression)
+    ("file.jsonl", "jsonl", False),
+    ("file.csv", "csv", False),
+    ("file.parquet", "parquet", False),
+    ("file.txt", "txt", False),
+    ("file.jsonl.gz", "jsonl", True),
+    ("file.csv.gz", "csv", True),
+    ("file.parquet.gz", "parquet", True),
+    ("file.txt.gz", "txt", True),
+    ("path/to/file.jsonl", "jsonl", False),
+    ("path/to/file.jsonl.gz", "jsonl", True),
+    ("complex_path/schema-name/table/load.file_id.jsonl", "jsonl", False),
+    ("complex_path/schema-name/table/load.file_id.jsonl.gz", "jsonl", True),
+    ("complex_path/schema-name/table/load.file_id.csv", "csv", False),
+    ("complex_path/schema-name/table/load.file_id.csv.gz", "csv", True),
+    ("complex_path/schema-name/table/load.file_id.parquet", "parquet", False),
+    ("complex_path/schema-name/table/load.file_id.parquet.gz", "parquet", True),
+    # Edge cases
+    ("file_without_extension", "", False),
+    ("file_without_extension.gz", "", True),
+    (".hidden_file.jsonl", "jsonl", False),
+    (".hidden_file.jsonl.gz", "jsonl", True),
+]
+
+
+@pytest.mark.parametrize(
+    "file_path,expected_format,expected_compression",
+    FILE_PATHS_AND_EXPECTED,
+)
+def test_get_file_format_and_compression(
+    file_path: str, expected_format: str, expected_compression: bool
+) -> None:
+    file_format, is_compressed = get_file_format_and_compression(file_path)
+    assert file_format == expected_format
+    assert is_compressed == expected_compression

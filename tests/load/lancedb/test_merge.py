@@ -1,0 +1,478 @@
+from typing import TYPE_CHECKING, List, Generator, Any, cast
+
+import numpy as np
+import pandas as pd
+import pytest
+from pandas import DataFrame
+from pandas.testing import assert_frame_equal
+
+import dlt
+from dlt.common import pendulum
+from dlt.common.typing import DictStrAny, DictStrStr
+
+from tests.load.lancedb.utils import LANCE_DEST_CONFS, chunk_document, get_adapter, open_lance_table
+from tests.load.utils import (
+    DestinationTestConfiguration,
+    destinations_configs,
+    sequence_generator,
+)
+from tests.pipeline.utils import (
+    assert_load_info,
+)
+
+if TYPE_CHECKING:
+    from tests.load.lancedb.utils import TLanceDestinationClient
+else:
+    TLanceDestinationClient = Any
+
+
+# Mark all tests as essential, don't remove.
+pytestmark = pytest.mark.essential
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_lancedb_remove_nested_orphaned_records(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_lancedb_remove_nested_orphaned_records",
+        dev_mode=True,
+    )
+
+    @dlt.resource(
+        table_name="parent",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        primary_key="id",
+        merge_key="id",
+    )
+    def identity_resource(
+        data: List[DictStrAny],
+    ) -> Generator[List[DictStrAny], None, None]:
+        yield data
+
+    run_1 = [
+        {
+            "id": 1,
+            "child": [
+                {"bar": 1, "grandchild": [{"baz": 1}, {"baz": 2}]},
+                {"bar": 2, "grandchild": [{"baz": 3}]},
+            ],
+        },
+        {"id": 2, "child": [{"bar": 3, "grandchild": [{"baz": 4}]}]},
+        {
+            "id": 3,
+            "child": [
+                {"bar": 10, "grandchild": [{"baz": 5}]},
+                {"bar": 11, "grandchild": [{"baz": 6}, {"baz": 7}]},
+            ],
+        },
+    ]
+    info = pipeline.run(identity_resource(run_1))
+    assert_load_info(info)
+
+    run_2 = [
+        {
+            "id": 1,
+            "child": [{"bar": 1, "grandchild": [{"baz": 1}]}],
+        },  # Removes bar_2, baz_2 and baz_3.
+        {
+            "id": 2,
+            "child": [{"bar": 4, "grandchild": [{"baz": 8}]}],
+        },  # Removes bar_3, baz_4.
+    ]
+    info = pipeline.run(identity_resource(run_2))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        client = cast(TLanceDestinationClient, client)
+        expected_parent_data = pd.DataFrame(
+            data=[
+                {"id": 1},
+                {"id": 2},
+                {"id": 3},
+            ]
+        )
+
+        expected_child_data = pd.DataFrame(
+            data=[
+                {"bar": 1},
+                {"bar": 4},
+                {"bar": 10},
+                {"bar": 11},
+            ]
+        )
+
+        expected_grandchild_data = pd.DataFrame(
+            data=[
+                {"baz": 1},
+                {"baz": 8},
+                {"baz": 5},
+                {"baz": 6},
+                {"baz": 7},
+            ]
+        )
+
+        parent_tbl = open_lance_table(client, "parent")
+        child_tbl = open_lance_table(client, "parent__child")
+        grandchild_tbl = open_lance_table(client, "parent__child__grandchild")
+
+        actual_parent_df = (
+            parent_tbl.to_arrow().to_pandas().sort_values(by="id").reset_index(drop=True)
+        )
+        actual_child_df = (
+            child_tbl.to_arrow().to_pandas().sort_values(by="bar").reset_index(drop=True)
+        )
+        actual_grandchild_df = (
+            grandchild_tbl.to_arrow().to_pandas().sort_values(by="baz").reset_index(drop=True)
+        )
+
+        expected_parent_data = expected_parent_data.sort_values(by="id").reset_index(drop=True)
+        expected_child_data = expected_child_data.sort_values(by="bar").reset_index(drop=True)
+        expected_grandchild_data = expected_grandchild_data.sort_values(by="baz").reset_index(
+            drop=True
+        )
+
+        assert_frame_equal(actual_parent_df[["id"]], expected_parent_data)
+        assert_frame_equal(actual_child_df[["bar"]], expected_child_data)
+        assert_frame_equal(actual_grandchild_df[["baz"]], expected_grandchild_data)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_lancedb_remove_orphaned_records_root_table(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_lancedb_remove_orphaned_records_root_table",
+        dev_mode=True,
+    )
+
+    @dlt.resource(
+        table_name="root",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        primary_key=["doc_id", "chunk_hash"],
+        merge_key=["doc_id"],
+    )
+    def identity_resource(
+        data: List[DictStrAny],
+    ) -> Generator[List[DictStrAny], None, None]:
+        yield data
+
+    get_adapter(destination_config)(identity_resource)
+
+    run_1 = [
+        {"doc_id": 1, "chunk_hash": "1a"},
+        {"doc_id": 2, "chunk_hash": "2a"},
+        {"doc_id": 2, "chunk_hash": "2b"},
+        {"doc_id": 2, "chunk_hash": "2c"},
+        {"doc_id": 3, "chunk_hash": "3a"},
+        {"doc_id": 3, "chunk_hash": "3b"},
+    ]
+    info = pipeline.run(identity_resource(run_1))
+    assert_load_info(info)
+
+    run_2 = [
+        {"doc_id": 2, "chunk_hash": "2d"},
+        {"doc_id": 2, "chunk_hash": "2e"},
+        {"doc_id": 3, "chunk_hash": "3b"},
+    ]
+    info = pipeline.run(identity_resource(run_2))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        client = cast(TLanceDestinationClient, client)
+        expected_root_table_df = (
+            pd.DataFrame(
+                data=[
+                    {"doc_id": 1, "chunk_hash": "1a"},
+                    {"doc_id": 2, "chunk_hash": "2d"},
+                    {"doc_id": 2, "chunk_hash": "2e"},
+                    {"doc_id": 3, "chunk_hash": "3b"},
+                ]
+            )
+            .sort_values(by=["doc_id", "chunk_hash"])
+            .reset_index(drop=True)
+        )
+
+        tbl = open_lance_table(client, "root")
+
+        actual_root_df: DataFrame = (
+            tbl.to_arrow()
+            .to_pandas()
+            .sort_values(by=["doc_id", "chunk_hash"])
+            .reset_index(drop=True)
+        )[["doc_id", "chunk_hash"]]
+
+        assert_frame_equal(actual_root_df, expected_root_table_df)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_lancedb_remove_orphaned_records_root_table_string_doc_id(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_lancedb_remove_orphaned_records_root_table_string_doc_id",
+        dev_mode=True,
+    )
+
+    @dlt.resource(
+        table_name="root",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        primary_key=["doc_id", "chunk_hash"],
+        merge_key=["doc_id"],
+    )
+    def identity_resource(
+        data: List[DictStrAny],
+    ) -> Generator[List[DictStrAny], None, None]:
+        yield data
+
+    get_adapter(destination_config)(identity_resource)
+
+    run_1 = [
+        {"doc_id": "A", "chunk_hash": "1a"},
+        {"doc_id": "B", "chunk_hash": "2a"},
+        {"doc_id": "B", "chunk_hash": "2b"},
+        {"doc_id": "B", "chunk_hash": "2c"},
+        {"doc_id": "C", "chunk_hash": "3a"},
+        {"doc_id": "C", "chunk_hash": "3b"},
+    ]
+    info = pipeline.run(identity_resource(run_1))
+    assert_load_info(info)
+
+    run_2 = [
+        {"doc_id": "B", "chunk_hash": "2d"},
+        {"doc_id": "B", "chunk_hash": "2e"},
+        {"doc_id": "C", "chunk_hash": "3b"},
+    ]
+    info = pipeline.run(identity_resource(run_2))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        client = cast(TLanceDestinationClient, client)
+        expected_root_table_df = (
+            pd.DataFrame(
+                data=[
+                    {"doc_id": "A", "chunk_hash": "1a"},
+                    {"doc_id": "B", "chunk_hash": "2d"},
+                    {"doc_id": "B", "chunk_hash": "2e"},
+                    {"doc_id": "C", "chunk_hash": "3b"},
+                ]
+            )
+            .sort_values(by=["doc_id", "chunk_hash"])
+            .reset_index(drop=True)
+        )
+
+        tbl = open_lance_table(client, "root")
+
+        actual_root_df: DataFrame = (
+            tbl.to_arrow()
+            .to_pandas()
+            .sort_values(by=["doc_id", "chunk_hash"])
+            .reset_index(drop=True)
+        )[["doc_id", "chunk_hash"]]
+
+        assert_frame_equal(actual_root_df, expected_root_table_df)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_lancedb_root_table_remove_orphaned_records_with_real_embeddings(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    @dlt.resource(
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        table_name="document",
+        primary_key=["doc_id", "chunk"],
+        merge_key="doc_id",
+    )
+    def documents(docs: List[DictStrAny]) -> Generator[DictStrAny, None, None]:
+        for doc in docs:
+            doc_id = doc["doc_id"]
+            for chunk in chunk_document(doc["text"]):
+                chunk_doc = {"doc_id": doc_id, "doc_text": doc["text"], "chunk": chunk}
+                # add column on the second run
+                if "created_at" in doc:
+                    chunk_doc["created_at"] = doc["created_at"]
+                yield chunk_doc
+
+    @dlt.source()
+    def documents_source(
+        docs: List[DictStrAny],
+    ) -> Any:
+        return documents(docs)
+
+    get_adapter(destination_config)(
+        documents,
+        embed=["chunk"],
+    )
+
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_lancedb_root_table_remove_orphaned_records_with_real_embeddings",
+        dev_mode=True,
+    )
+
+    initial_docs = [
+        {
+            "text": (
+                "This is the first document. It contains some text that will be chunked and"
+                " embedded. (I don't want to be seen in updated run's embedding chunk texts btw)"
+            ),
+            "doc_id": 1,
+        },
+        {
+            "text": "Here's another document. It's a bit different from the first one.",
+            "doc_id": 2,
+        },
+    ]
+
+    info = pipeline.run(documents_source(initial_docs))
+    assert_load_info(info)
+
+    updated_docs = [
+        {
+            "text": "This is the first document, but it has been updated with new content.",
+            "doc_id": 1,
+            "created_at": pendulum.now().date(),
+        },
+        {
+            "text": "This is a completely new document that wasn't in the initial set.",
+            "doc_id": 3,
+            "created_at": pendulum.now().date(),
+        },
+    ]
+
+    info = pipeline.run(documents_source(updated_docs))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        client = cast(TLanceDestinationClient, client)
+        tbl = open_lance_table(client, "document")
+        df = tbl.to_arrow().to_pandas()
+
+        # Check (non-empty) embeddings as present, and that orphaned embeddings have been discarded.
+        assert len(df) == 21
+        assert "vector" in df.columns
+        for _, vector in enumerate(df["vector"]):
+            assert isinstance(vector, np.ndarray)
+            assert vector.size > 0
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_lancedb_compound_merge_key_root_table(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_lancedb_compound_merge_key_root_table",
+        dev_mode=True,
+    )
+
+    @dlt.resource(
+        table_name="root",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        primary_key=["doc_id", "chunk_hash"],
+        merge_key=["doc_id", "chunk_hash"],
+    )
+    def identity_resource(
+        data: List[DictStrAny],
+    ) -> Generator[List[DictStrAny], None, None]:
+        yield data
+
+    get_adapter(destination_config)(identity_resource, no_remove_orphans=True)
+
+    run_1 = [
+        {"doc_id": 1, "chunk_hash": "a", "foo": "bar", "child": [{"val": 1}, {"val": 2}]},
+        {"doc_id": 1, "chunk_hash": "b", "foo": "coo", "child": [{"val": 3}]},
+    ]
+    info = pipeline.run(identity_resource(run_1))
+    assert_load_info(info)
+
+    run_2 = [
+        {"doc_id": 1, "chunk_hash": "a", "foo": "aat", "child": [{"val": 1}]},
+        {"doc_id": 1, "chunk_hash": "c", "foo": "loot", "child": [{"val": 4}]},
+    ]
+    info = pipeline.run(identity_resource(run_2))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        client = cast(TLanceDestinationClient, client)
+        expected_root_table_df = (
+            pd.DataFrame(
+                data=[
+                    {"doc_id": 1, "chunk_hash": "a", "foo": "aat"},
+                    {"doc_id": 1, "chunk_hash": "b", "foo": "coo"},
+                    {"doc_id": 1, "chunk_hash": "c", "foo": "loot"},
+                ]
+            )
+            .sort_values(by=["doc_id", "chunk_hash", "foo"])
+            .reset_index(drop=True)
+        )
+
+        tbl = open_lance_table(client, "root")
+
+        actual_root_df: DataFrame = (
+            tbl.to_arrow()
+            .to_pandas()
+            .sort_values(by=["doc_id", "chunk_hash", "foo"])
+            .reset_index(drop=True)
+        )[["doc_id", "chunk_hash", "foo"]]
+
+        assert_frame_equal(actual_root_df, expected_root_table_df)
+
+        expected_child_df = (
+            pd.DataFrame(data=[{"val": 1}, {"val": 2}, {"val": 3}, {"val": 4}])
+            .sort_values(by="val")
+            .reset_index(drop=True)
+        )
+
+        child_tbl = open_lance_table(client, "root__child")
+        actual_child_df = (
+            child_tbl.to_arrow().to_pandas().sort_values(by="val").reset_index(drop=True)
+        )[["val"]]
+
+        assert_frame_equal(actual_child_df, expected_child_df)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    LANCE_DEST_CONFS,
+    ids=lambda x: x.name,
+)
+def test_must_provide_at_least_primary_key_on_merge_disposition(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """We need upsert merge's deterministic _dlt_id to perform orphan removal.
+    Hence, we require at least the primary key required (raises exception if missing).
+    Specify a merge key for custom orphan identification."""
+    generator_instance1 = sequence_generator()
+
+    @dlt.resource(write_disposition={"disposition": "merge", "strategy": "upsert"})
+    def some_data() -> Generator[DictStrStr, Any, None]:
+        yield from next(generator_instance1)
+
+    pipeline = destination_config.setup_pipeline(
+        pipeline_name="test_must_provide_both_primary_and_merge_key_on_merge_disposition",
+        dev_mode=True,
+    )
+    with pytest.raises(Exception):
+        load_info = pipeline.run(
+            some_data(),
+        )
+        assert_load_info(load_info)

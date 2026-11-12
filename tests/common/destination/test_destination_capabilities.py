@@ -1,0 +1,359 @@
+from typing import cast
+
+import pytest
+
+from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+from dlt.common.destination.exceptions import DestinationCapabilitiesException, UnsupportedDataType
+from dlt.common.destination.utils import (
+    prepare_load_table,
+    resolve_merge_strategy,
+    verify_schema_capabilities,
+    verify_supported_data_types,
+)
+from dlt.common.exceptions import TerminalValueError
+from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
+from dlt.common.schema.schema import Schema
+from dlt.common.schema.utils import new_table
+from dlt.common.storages.load_package import ParsedLoadJobFileName
+from dlt.destinations.impl.bigquery.bigquery_adapter import AUTODETECT_SCHEMA_HINT
+from dlt.destinations.impl.databricks.databricks_adapter import INSERT_API_HINT
+
+
+def test_resolve_merge_strategy() -> None:
+    schema = Schema("schema")
+
+    table = new_table("table", write_disposition="merge")
+    delta_table = new_table("delta_table", table_format="delta", write_disposition="merge")
+    iceberg_table = new_table("delta_table", table_format="iceberg", write_disposition="merge")
+
+    schema.update_table(table)
+    schema.update_table(delta_table)
+    schema.update_table(iceberg_table)
+
+    assert resolve_merge_strategy(schema.tables, table, is_prepared=False) is None
+    assert resolve_merge_strategy(schema.tables, delta_table, is_prepared=False) is None
+    assert resolve_merge_strategy(schema.tables, iceberg_table, is_prepared=False) is None
+
+    # try default merge dispositions
+    from dlt.destinations import athena, filesystem, duckdb
+
+    assert (
+        resolve_merge_strategy(schema.tables, table, filesystem().capabilities(), is_prepared=False)
+        is None
+    )
+    assert (
+        resolve_merge_strategy(
+            schema.tables, delta_table, filesystem().capabilities(), is_prepared=False
+        )
+        == "upsert"
+    )
+    assert (
+        resolve_merge_strategy(
+            schema.tables, iceberg_table, athena().capabilities(), is_prepared=False
+        )
+        == "delete-insert"
+    )
+
+    # unknown table formats
+    assert (
+        resolve_merge_strategy(
+            schema.tables, iceberg_table, filesystem().capabilities(), is_prepared=False
+        )
+        == "upsert"
+    )
+    assert (
+        resolve_merge_strategy(
+            schema.tables, delta_table, athena().capabilities(), is_prepared=False
+        )
+        is None
+    )
+
+    # not supported strategy
+    schema.tables["delta_table"]["x-merge-strategy"] = "delete-insert"  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(DestinationCapabilitiesException):
+        resolve_merge_strategy(
+            schema.tables, delta_table, filesystem().capabilities(), is_prepared=False
+        )
+
+    # non-default strategy
+    schema.tables["table"]["x-merge-strategy"] = "scd2"  # type: ignore[typeddict-unknown-key]
+    assert (
+        resolve_merge_strategy(schema.tables, table, filesystem().capabilities(), is_prepared=False)
+        is None
+    )
+    assert (
+        resolve_merge_strategy(schema.tables, table, duckdb().capabilities(), is_prepared=False)
+        == "scd2"
+    )
+
+    # scd2 not supported on filesystem for iceberg table format
+    iceberg_scd2 = new_table("iceberg_scd2", table_format="iceberg", write_disposition="merge")
+    schema.update_table(iceberg_scd2)
+    schema.tables["iceberg_scd2"]["x-merge-strategy"] = "scd2"  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(DestinationCapabilitiesException):
+        resolve_merge_strategy(
+            schema.tables, iceberg_scd2, filesystem().capabilities(), is_prepared=False
+        )
+
+    # scd2 not supported on filesystem for native (no table format)
+    native_scd2 = new_table("native_scd2", write_disposition="merge")
+    schema.update_table(native_scd2)
+    schema.tables["native_scd2"]["x-merge-strategy"] = "scd2"  # type: ignore[typeddict-unknown-key]
+    assert (
+        resolve_merge_strategy(
+            schema.tables, native_scd2, filesystem().capabilities(), is_prepared=False
+        )
+        is None
+    )
+
+    # a prepared table is used as it is: a job client may remove hints that the schema still has
+    fs_caps = filesystem().capabilities()
+    iceberg_upsert = new_table("iceberg_upsert", table_format="iceberg", write_disposition="merge")
+    schema.update_table(iceberg_upsert)
+    prepared = prepare_load_table(schema.tables, schema.tables["iceberg_upsert"], fs_caps)
+    prepared["x-merge-strategy"] = "insert-only"  # type: ignore[typeddict-unknown-key]
+    assert (
+        resolve_merge_strategy(schema.tables, prepared, fs_caps, is_prepared=True) == "insert-only"
+    )
+    assert resolve_merge_strategy(schema.tables, prepared, fs_caps, is_prepared=False) == "upsert"
+    prepared.pop("table_format")
+    assert resolve_merge_strategy(schema.tables, prepared, fs_caps, is_prepared=True) is None
+
+
+def test_verify_capabilities_ident_collisions() -> None:
+    schema = Schema("schema")
+    table = new_table(
+        "table",
+        write_disposition="merge",
+        columns=[{"name": "col1", "data_type": "bigint"}, {"name": "COL1", "data_type": "bigint"}],
+    )
+    schema.update_table(table, normalize_identifiers=False)
+    from dlt.destinations import athena, filesystem
+
+    # case sensitive - no name collision
+    exceptions = verify_schema_capabilities(schema, filesystem().capabilities(), "filesystem")
+    assert len(exceptions) == 0
+    # case insensitive - collision on column name
+    exceptions = verify_schema_capabilities(schema, athena().capabilities(), "filesystem")
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], SchemaIdentifierNormalizationCollision)
+    assert exceptions[0].identifier_type == "column"
+
+    table = new_table(
+        "TABLE", write_disposition="merge", columns=[{"name": "col1", "data_type": "bigint"}]
+    )
+    schema.update_table(table, normalize_identifiers=False)
+    exceptions = verify_schema_capabilities(schema, filesystem().capabilities(), "filesystem")
+    assert len(exceptions) == 0
+    # case insensitive - collision on table name
+    exceptions = verify_schema_capabilities(schema, athena().capabilities(), "filesystem")
+    assert len(exceptions) == 2
+    assert isinstance(exceptions[1], SchemaIdentifierNormalizationCollision)
+    assert exceptions[1].identifier_type == "table"
+
+
+def test_verify_capabilities_data_types() -> None:
+    schema = Schema("schema")
+    table = new_table(
+        "table",
+        write_disposition="merge",
+        columns=[{"name": "col1", "data_type": "time"}, {"name": "col2", "data_type": "date"}],
+    )
+    schema.update_table(table, normalize_identifiers=False)
+
+    schema.update_table(table, normalize_identifiers=False)
+    from dlt.destinations import athena, filesystem, databricks, redshift
+
+    new_jobs_parquet = [ParsedLoadJobFileName.parse("table.12345.1.parquet")]
+    new_jobs_jsonl = [ParsedLoadJobFileName.parse("table.12345.1.jsonl")]
+
+    # all data types supported (no mapper)
+    exceptions = verify_supported_data_types(
+        schema.tables.values(), new_jobs_parquet, filesystem().capabilities(), "filesystem"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 0
+    # time not supported via list
+    exceptions = verify_supported_data_types(
+        schema.tables.values(), new_jobs_parquet, athena().capabilities(), "athena"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], UnsupportedDataType)
+    assert exceptions[0].destination_type == "athena"
+    assert exceptions[0].table_name == "table"
+    assert exceptions[0].column == "col1"
+    assert exceptions[0].file_format == "parquet"
+    assert exceptions[0].available_in_formats == ["model"]
+
+    # time not supported on databricks
+    schema.tables["table"][INSERT_API_HINT] = "copy_into"  # type: ignore[typeddict-unknown-key]
+    exceptions = verify_supported_data_types(
+        schema.tables.values(), new_jobs_parquet, databricks().capabilities(), "databricks"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 1
+    # date not supported on jsonl
+    exceptions = verify_supported_data_types(
+        schema.tables.values(), new_jobs_jsonl, databricks().capabilities(), "databricks"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], UnsupportedDataType)
+    assert exceptions[0].column == "col2"
+    assert set(exceptions[0].available_in_formats) == {"parquet", "model"}
+
+    # decimal and wei not supported on databricks zerobus
+    schema_zerobus = Schema("schema_zerobus")
+    table = new_table(
+        "table",
+        write_disposition="append",
+        columns=[
+            # supported types
+            {"name": "date_col", "data_type": "date"},
+            {"name": "time_col", "data_type": "time"},
+            # unsupported types
+            {"name": "decimal_col", "data_type": "decimal"},
+            {"name": "wei_col", "data_type": "wei"},
+        ],
+    )
+    table[INSERT_API_HINT] = "zerobus"  # type: ignore[typeddict-unknown-key]
+    schema_zerobus.update_table(table, normalize_identifiers=False)
+    exceptions = verify_supported_data_types(
+        schema_zerobus.tables.values(),  # type: ignore[arg-type]
+        new_jobs_parquet,
+        databricks().capabilities(),
+        "databricks",
+    )
+    assert len(exceptions) == 2
+    assert all(isinstance(exception, UnsupportedDataType) for exception in exceptions)
+    unsupported_exceptions = cast(list[UnsupportedDataType], exceptions)
+    assert {exception.column for exception in unsupported_exceptions} == {
+        "decimal_col",
+        "wei_col",
+    }
+
+    # exclude binary type if precision is set on column
+    schema_bin = Schema("schema_bin")
+    table = new_table(
+        "table",
+        write_disposition="merge",
+        columns=[
+            {"name": "binary_1", "data_type": "binary"},
+            {"name": "binary_2", "data_type": "binary", "precision": 128},
+        ],
+    )
+    schema_bin.update_table(table, normalize_identifiers=False)
+    exceptions = verify_supported_data_types(
+        schema_bin.tables.values(),  # type: ignore[arg-type]
+        new_jobs_jsonl,
+        redshift().capabilities(),
+        "redshift",
+    )
+    # binary not supported on jsonl
+    assert len(exceptions) == 2
+    exceptions = verify_supported_data_types(
+        schema_bin.tables.values(), new_jobs_parquet, redshift().capabilities(), "redshift"  # type: ignore[arg-type]
+    )
+    # fixed length not supported on parquet
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], UnsupportedDataType)
+    assert exceptions[0].data_type == "binary(128)"
+    assert exceptions[0].column == "binary_2"
+    assert set(exceptions[0].available_in_formats) == {"insert_values", "model"}
+
+    # check nested type on bigquery
+    from dlt.destinations import bigquery
+
+    schema_nested = Schema("nested")
+    table = new_table(
+        "table",
+        write_disposition="merge",
+        columns=[
+            {"name": "nested_1", "data_type": "json"},
+        ],
+    )
+    schema_nested.update_table(table, normalize_identifiers=False)
+    exceptions = verify_supported_data_types(
+        schema_nested.tables.values(), new_jobs_parquet, bigquery().capabilities(), "bigquery"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], UnsupportedDataType)
+    assert exceptions[0].data_type == "json"
+
+    # enable schema autodetect
+    table[AUTODETECT_SCHEMA_HINT] = True  # type: ignore[typeddict-unknown-key]
+    exceptions = verify_supported_data_types(
+        schema_nested.tables.values(), new_jobs_parquet, bigquery().capabilities(), "bigquery"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 0
+
+    # lancedb uses arrow types in type mapper
+    from dlt.destinations import lancedb
+
+    exceptions = verify_supported_data_types(
+        schema_bin.tables.values(),  # type: ignore[arg-type]
+        new_jobs_jsonl,
+        lancedb().capabilities(),
+        "lancedb",
+    )
+    try:
+        import pyarrow
+
+        assert len(exceptions) == 0
+    except ImportError:
+        assert len(exceptions) > 0
+
+    # provoke mapping error, precision not supported on NTZ timestamp
+    schema_timezone = Schema("tx")
+    table = new_table(
+        "table",
+        write_disposition="merge",
+        columns=[
+            {"name": "ts_1", "data_type": "timestamp", "precision": 12, "timezone": False},
+        ],
+    )
+    schema_timezone.update_table(table, normalize_identifiers=False)
+    from dlt.destinations import motherduck
+
+    exceptions = verify_supported_data_types(
+        schema_timezone.tables.values(), new_jobs_parquet, motherduck().capabilities(), "motherduck"  # type: ignore[arg-type]
+    )
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], TerminalValueError)
+
+
+def test_prepare_load_table_drops_unsupported_precision_hints() -> None:
+    schema = Schema("foo")
+    table_name = "bar"
+    table = new_table(
+        table_name,
+        columns=[
+            {"name": "ts", "data_type": "timestamp", "precision": 3},
+            {"name": "bin", "data_type": "binary", "precision": 16},
+        ],
+    )
+    schema.update_table(table)
+
+    caps = DestinationCapabilitiesContext()
+    caps.supports_timestamp_precision_configuration = True
+    caps.supports_binary_precision_configuration = True
+
+    prepared_table = prepare_load_table(
+        schema.tables,
+        schema.tables[table_name],
+        destination_capabilities=caps,
+    )
+
+    assert "precision" in prepared_table["columns"]["ts"]
+    assert "precision" in prepared_table["columns"]["bin"]
+
+    caps.supports_timestamp_precision_configuration = False
+    caps.supports_binary_precision_configuration = False
+
+    prepared_table = prepare_load_table(
+        schema.tables,
+        schema.tables[table_name],
+        destination_capabilities=caps,
+    )
+
+    assert "precision" not in prepared_table["columns"]["ts"]
+    assert "precision" not in prepared_table["columns"]["bin"]
+    assert "precision" in schema.tables[table_name]["columns"]["ts"]
+    assert "precision" in schema.tables[table_name]["columns"]["bin"]

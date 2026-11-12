@@ -1,0 +1,115 @@
+name: hub
+
+#
+# dlthub smoke tests against the nightly build.
+#
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  RUNTIME__LOG_LEVEL: ERROR
+
+jobs:
+  run_hub_features:
+    name: ${{ matrix.display_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - display_name: linux-3.10
+            os: ubuntu-latest
+            python-version: "3.10"
+            dlthub_dep: ""
+          - display_name: linux-3.11
+            os: ubuntu-latest
+            python-version: "3.11"
+            dlthub_dep: ""
+          - display_name: linux-3.12
+            os: ubuntu-latest
+            python-version: "3.12"
+            dlthub_dep: ""
+          - display_name: linux-3.13
+            os: ubuntu-latest
+            python-version: "3.13"
+            dlthub_dep: ""
+          - display_name: macos-3.11
+            os: macos-latest
+            python-version: "3.11"
+            dlthub_dep: ""
+          - display_name: windows-3.11
+            os: windows-latest
+            python-version: "3.11"
+            dlthub_dep: ""
+
+    defaults:
+      run:
+        shell: bash
+    runs-on: ${{ matrix.os }}
+    env:
+      # Prevent implicit resyncs by `uv run`; this is ignored by explicit `uv sync` commands.
+      UV_NO_SYNC: "1"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install hub minimal dependencies
+        run: make install-hub-minimal
+
+      # NOTE: needed for mssql source tests in plus
+      - name: Install ODBC driver for SQL Server
+        run: |
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: Install dlthub
+        if: matrix.dlthub_dep != ''
+        run: uv run pip install --upgrade --force-reinstall --pre --no-cache-dir ${{ matrix.dlthub_dep }}
+
+      - name: Run hub minimal tests
+        run: make test-hub-minimal
+
+      - name: Install hub all dependencies
+        run: make dev-hub
+
+      - name: Install dlthub (after full install)
+        if: matrix.dlthub_dep != ''
+        run: uv run pip install --upgrade --force-reinstall --pre --no-cache-dir ${{ matrix.dlthub_dep }}
+
+      - name: Run all hub tests
+        run: make test-hub
+
+      - name: Test dlthub client
+        run: |
+          mkdir .dlt && touch .dlt/.workspace
+          uv run dlthub login --help
+
+      - name: Check hub extras version requirements
+        run: uv run python tools/check_hub_extras.py
+        if: ${{ matrix.python-version == '3.11' && matrix.os == 'ubuntu-latest' }}
+
+  matrix_job_required_check:
+    name: hub-check
+    needs: run_hub_features
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check matrix job results
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One or more matrix job tests failed or were cancelled. You may need to re-run them." && exit 1

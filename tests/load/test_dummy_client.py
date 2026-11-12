@@ -1,0 +1,2181 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+from time import sleep, monotonic
+from unittest import mock
+import pytest
+from unittest.mock import patch
+from typing import Any, List, Tuple, Type
+
+from dlt.common import pendulum
+from dlt.common.destination.exceptions import DestinationTerminalException
+from dlt.common.exceptions import TerminalException, TerminalValueError
+from dlt.common.storages import (
+    FileStorage,
+    NormalizeStorage,
+    PackageStorage,
+    ParsedLoadJobFileName,
+)
+from dlt.common.storages.configuration import FilesystemConfiguration
+from dlt.common.storages.load_package import LoadPackageStateInjectableContext, TPackageJobState
+from dlt.common.configuration.container import Container
+from dlt.common.storages.load_storage import JobFileFormatUnsupported
+from dlt.common.destination import AnyDestination
+from dlt.common.destination.client import JobClientBase, RunnableLoadJob
+from dlt.common.schema import Schema, TSchemaTables
+from dlt.common.schema.utils import (
+    fill_hints_from_parent_and_clone_table,
+    get_nested_tables,
+    get_root_table,
+)
+
+from dlt.destinations.impl.filesystem.configuration import FilesystemDestinationClientConfiguration
+from dlt.destinations import dummy, filesystem
+from dlt.destinations.impl.dummy import dummy as dummy_impl
+from dlt.destinations.impl.dummy.configuration import DummyClientConfiguration
+
+from dlt.load import Load
+from dlt.load.configuration import LoaderConfiguration
+from dlt.load.exceptions import (
+    LoadClientJobFailed,
+    LoadClientJobRetry,
+    LoadClientJobTerminalRetry,
+    LoadPackageAborted,
+    TableChainFollowupJobCreationFailedException,
+    FollowupJobCreationFailedException,
+)
+from dlt.load.utils import get_completed_table_chain, init_client, _extend_tables_with_table_chain
+from dlt.pipeline.abort import prepare_abort_packages
+
+from tests.utils import (
+    MockPipeline,
+    clean_test_storage,
+    init_test_logging,
+    TEST_DICT_CONFIG_PROVIDER,
+)
+from tests.load.utils import prepare_load_package
+from tests.utils import skip_if_not_active, get_test_storage_root
+
+skip_if_not_active("dummy")
+
+NORMALIZED_FILES = [
+    "event_user.839c6e6b514e427687586ccc65bf133f.0.jsonl",
+    "event_loop_interrupted.839c6e6b514e427687586ccc65bf133f.0.jsonl",
+]
+
+SMALL_FILES = ["event_user.1234.0.jsonl", "event_loop_interrupted.1234.0.jsonl"]
+
+REMOTE_FILESYSTEM = os.path.abspath(os.path.join(get_test_storage_root(), "_remote_filesystem"))
+
+
+@pytest.fixture(autouse=True)
+def storage() -> FileStorage:
+    return clean_test_storage(init_normalize=True, init_loader=True)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def logger_autouse() -> None:
+    init_test_logging()
+
+
+def test_spool_job_started() -> None:
+    # default config keeps the job always running
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    assert len(files) == 2
+    jobs: List[RunnableLoadJob] = []
+    for f in files:
+        job = load.submit_job(f, load_id, schema)
+        assert job.state() == "completed"
+        assert type(job) is dummy_impl.LoadDummyJob
+        # jobs runs, but is not moved yet (loader will do this)
+        assert load.load_storage.normalized_packages.storage.has_file(
+            load.load_storage.normalized_packages.get_job_file_path(
+                load_id, PackageStorage.STARTED_JOBS_FOLDER, job.file_name()
+            )
+        )
+        assert_job_metrics(job, "completed")
+        jobs.append(job)
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        remaining_jobs, finalized_jobs, _ = load.complete_jobs(load_id, jobs, schema)
+    assert len(remaining_jobs) == 0
+    assert len(finalized_jobs) == 2
+    assert len(load._job_metrics) == 2
+    for job in jobs:
+        assert load._job_metrics[job.job_id()] == job.metrics()
+
+
+def test_unsupported_writer_type() -> None:
+    load = setup_loader()
+    load_id, _ = prepare_load_package(
+        load.load_storage, ["event_bot.181291798a78198.0.unsupported_format"]
+    )
+    with pytest.raises(TerminalValueError):
+        load.load_storage.list_new_jobs(load_id)
+
+
+def test_unsupported_write_disposition() -> None:
+    # tests terminal error on retrieving job
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, [NORMALIZED_FILES[0]])
+    # mock unsupported disposition
+    schema.get_table("event_user")["write_disposition"] = "skip"
+    # write back schema
+    load.load_storage.normalized_packages.save_schema(load_id, schema)
+    # default does not auto-abort: the terminal job is queued for retry and the package stays pending
+    with pytest.raises(LoadClientJobTerminalRetry) as e:
+        with ThreadPoolExecutor() as pool:
+            load.run(pool)
+
+    assert "LoadClientUnsupportedWriteDisposition" in e.value.failed_message
+
+
+@pytest.mark.serial
+def test_big_load_packages() -> None:
+    """
+    This test guards against changes in the load that exponentially makes the loads slower
+    """
+
+    load = setup_loader()
+    # make the loop faster by basically not sleeping
+    load._run_loop_sleep_duration = 0.001
+    load_id, schema = prepare_load_package(load.load_storage, SMALL_FILES, jobs_per_case=500)
+    start_time = monotonic()
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        load.run(pool)
+    duration = float(monotonic() - start_time)
+
+    # sanity check
+    assert duration > 1.5
+    # we want 1000 empty processed jobs to need less than 15 seconds total (locally it runs in 5)
+    assert duration < 15
+
+    # we should have 1000 jobs processed
+    assert len(dummy_impl.JOBS) == 1000
+
+
+def test_get_new_jobs_info() -> None:
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    # no write disposition specified - get all new jobs
+    assert len(load.get_new_jobs_info(load_id)) == 2
+
+
+def test_get_completed_table_chain_single_job_per_table() -> None:
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    # update tables so we have all possible hints
+    for table_name, table in schema.tables.items():
+        schema.tables[table_name] = fill_hints_from_parent_and_clone_table(schema.tables, table)
+
+    top_job_table = get_root_table(schema.tables, "event_user")
+    all_jobs = load.load_storage.normalized_packages.list_all_jobs_with_states(load_id)
+    assert get_completed_table_chain(schema, all_jobs, top_job_table) is None
+    # fake being completed
+    assert (
+        len(
+            get_completed_table_chain(
+                schema,
+                all_jobs,
+                top_job_table,
+                "event_user.839c6e6b514e427687586ccc65bf133f.jsonl",
+            )
+        )
+        == 1
+    )
+    # actually complete
+    loop_top_job_table = get_root_table(schema.tables, "event_loop_interrupted")
+    load.load_storage.normalized_packages.start_job(
+        load_id, "event_loop_interrupted.839c6e6b514e427687586ccc65bf133f.0.jsonl"
+    )
+    all_jobs = load.load_storage.normalized_packages.list_all_jobs_with_states(load_id)
+    assert get_completed_table_chain(schema, all_jobs, loop_top_job_table) is None
+    load.load_storage.normalized_packages.complete_job(
+        load_id, "event_loop_interrupted.839c6e6b514e427687586ccc65bf133f.0.jsonl"
+    )
+    all_jobs = load.load_storage.normalized_packages.list_all_jobs_with_states(load_id)
+    assert get_completed_table_chain(schema, all_jobs, loop_top_job_table) == [
+        schema.get_table("event_loop_interrupted")
+    ]
+    assert get_completed_table_chain(
+        schema, all_jobs, loop_top_job_table, "event_user.839c6e6b514e427687586ccc65bf133f.0.jsonl"
+    ) == [schema.get_table("event_loop_interrupted")]
+
+
+@pytest.mark.parametrize("auto_abort", [True, False], ids=["auto_abort", "complete_as_loaded"])
+def test_spool_job_failed_and_package_completed(auto_abort: bool) -> None:
+    # with raise_on_failed_jobs disabled, failed jobs move to failed_jobs regardless of auto_abort
+    loader_config = LoaderConfiguration(
+        auto_abort_on_terminal_error=auto_abort,
+        raise_on_failed_jobs=False,
+        workers=1,
+        pool_type="none",
+    )
+    load = setup_loader(
+        client_config=DummyClientConfiguration(fail_prob=1.0), loader_config=loader_config
+    )
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    jobs: List[RunnableLoadJob] = []
+    for f in files:
+        job = load.submit_job(f, load_id, schema)
+        assert type(job) is dummy_impl.LoadDummyJob
+        assert job.state() == "failed"
+        assert load.load_storage.normalized_packages.storage.has_file(
+            load.load_storage.normalized_packages.get_job_file_path(
+                load_id, PackageStorage.STARTED_JOBS_FOLDER, job.file_name()
+            )
+        )
+        assert_job_metrics(job, "failed")
+        jobs.append(job)
+    assert len(jobs) == 2
+    # complete files
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        remaining_jobs, finalized_jobs, _ = load.complete_jobs(load_id, jobs, schema)
+    assert len(remaining_jobs) == 0
+    assert len(finalized_jobs) == 2
+    packages = load.load_storage.normalized_packages
+    if auto_abort:
+        # the abort intent is persisted and the jobs are queued as terminal retries
+        assert packages.has_abort_flag(load_id)
+        retried = packages.list_retried_new_jobs(load_id)
+        assert len(retried) == 2
+        for job_file, folder in retried:
+            assert folder == "new_jobs"
+            parsed = ParsedLoadJobFileName.parse(os.path.basename(job_file))
+            assert parsed.retry_count == 1
+            exc_type, _ = packages.get_last_job_exception(load_id, parsed)
+            assert exc_type == "terminal"
+    else:
+        for job in jobs:
+            assert packages.storage.has_file(
+                packages.get_job_file_path(
+                    load_id, PackageStorage.FAILED_JOBS_FOLDER, job.file_name()
+                )
+            )
+            assert packages.storage.has_file(
+                packages.get_job_file_path(
+                    load_id, PackageStorage.FAILED_JOBS_FOLDER, job.file_name() + ".exception"
+                )
+            )
+    for job in jobs:
+        # load should collect two jobs
+        assert load._job_metrics[job.job_id()] == job.metrics()
+    started_files = load.load_storage.normalized_packages.list_started_jobs(load_id)
+    assert len(started_files) == 0
+    # remove the still pending package so the flow below loads only its own
+    load.load_storage.normalized_packages.delete_package(load_id)
+
+    # run the whole flow: a single pool run must resolve the package - abort abandons jobs
+    # not yet spooled by the single worker, complete-as-loaded drains them all
+    load = setup_loader(
+        client_config=DummyClientConfiguration(fail_prob=1.0), loader_config=loader_config
+    )
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    if auto_abort:
+        with pytest.raises(LoadPackageAborted) as abort_ex:
+            load.run(None)
+        # raise_on_failed_jobs is unset so the pipeline swallows the abort
+        assert abort_ex.value.job_exception is None
+        assert abort_ex.value.load_id == load_id
+    else:
+        load.run(None)
+
+    # not loading
+    assert load.current_load_id is None
+    package_info = load.load_storage.get_load_package_info(load_id)
+    load_info = load.get_step_info(MockPipeline("pipe", True))  # type: ignore[abstract]
+    metrics = load_info.metrics[load_id][0]["job_metrics"]
+    if auto_abort:
+        assert package_info.state == "aborted"
+        assert len(package_info.jobs["failed_jobs"]) == 1
+        # the second job was never spooled and is abandoned in new_jobs
+        assert len(package_info.jobs["new_jobs"]) == 1
+        assert len(metrics) == 1
+    else:
+        assert package_info.state == "loaded"
+        assert len(package_info.jobs["failed_jobs"]) == 2
+        assert len(metrics) == 2
+    for job_info in package_info.jobs["failed_jobs"]:
+        assert metrics[job_info.job_file_info.job_id()].state == "failed"
+
+
+@pytest.mark.parametrize("auto_abort", [True, False], ids=["auto_abort", "retry_pending"])
+def test_spool_job_failed_terminally_exception_init(auto_abort: bool) -> None:
+    loader_config = LoaderConfiguration(auto_abort_on_terminal_error=auto_abort)
+    load = setup_loader(
+        client_config=DummyClientConfiguration(fail_terminally_in_init=True),
+        loader_config=loader_config,
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    with patch.object(dummy_impl.DummyClient, "complete_load") as complete_load:
+        if auto_abort:
+            # the abort carries the job failure to be re-raised by the pipeline after cleanup
+            with pytest.raises(LoadPackageAborted) as abort_ex:
+                run_all(load)
+            assert abort_ex.value.load_id == load_id
+            job_exception = abort_ex.value.job_exception
+            assert isinstance(job_exception, LoadClientJobFailed)
+            assert isinstance(job_exception.client_exception, DestinationTerminalException)
+            assert job_exception.load_id == load_id
+            package_info = load.load_storage.get_load_package_info(load_id)
+            # not loading - package aborted
+            assert load.current_load_id is None
+            assert package_info.state == "aborted"
+            # both failed - we wait till the current loop is completed and then abort
+            assert len(package_info.jobs["failed_jobs"]) == 2
+        else:
+            with pytest.raises(LoadClientJobTerminalRetry) as py_ex:
+                run_all(load)
+            assert isinstance(py_ex.value.client_exception, DestinationTerminalException)
+            assert py_ex.value.load_id == load_id
+            package_info = load.load_storage.get_load_package_info(load_id)
+            # package stays pending with both jobs queued for retry
+            assert load.current_load_id is not None
+            assert package_info.state == "normalized"
+            assert len(package_info.jobs["failed_jobs"]) == 0
+            assert len(package_info.jobs["new_jobs"]) == 2
+        assert len(package_info.jobs["started_jobs"]) == 0
+        # load id was never committed
+        complete_load.assert_not_called()
+        # metrics can be gathered
+        assert len(load._job_metrics) == 2
+        load_info = load.get_step_info(MockPipeline("pipe", True))  # type: ignore[abstract]
+        metrics = load_info.metrics[load_id][0]["job_metrics"]
+        assert len(metrics) == 2
+
+
+def test_spool_job_failed_transiently_exception_init() -> None:
+    load = setup_loader(client_config=DummyClientConfiguration(fail_transiently_in_init=True))
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    with patch.object(dummy_impl.DummyClient, "complete_load") as complete_load:
+        with pytest.raises(LoadClientJobRetry) as py_ex:
+            run_all(load)
+        assert py_ex.value.load_id == load_id
+        # loading - can be retried
+        assert load.current_load_id is not None
+        package_info = load.load_storage.get_load_package_info(load_id)
+        assert package_info.state == "normalized"
+        # both failed - we wait till the current loop is completed and then raise
+        assert len(package_info.jobs["failed_jobs"]) == 0
+        assert len(package_info.jobs["started_jobs"]) == 0
+        assert len(package_info.jobs["new_jobs"]) == 2
+
+        # load id was never committed
+        complete_load.assert_not_called()
+        # metrics collected from all jobs that were started
+        assert len(load._job_metrics) == 2
+        # metrics were gathered but not finished at on the package
+        load_info = load.get_step_info(MockPipeline("pipe", True))  # type: ignore[abstract]
+        metrics = load_info.metrics[load_id][0]["job_metrics"]
+        assert len(metrics) == 2
+        for metric in metrics.values():
+            # 4 retries and current retry (5 together)
+            assert metric.state == "retry"
+            assert metric.retry_count == 4
+            assert metric.started_at is not None
+            assert metric.finished_at is None
+
+        # verify load package
+        load_package = load_info.load_packages[0]
+        assert load_info.finished_at is None
+        assert load_info.started_at is not None
+        assert load_package.completed_at is None
+        assert load_package.state == "normalized"
+
+
+def test_spool_job_failed_exception_complete() -> None:
+    # default does not auto-abort: jobs failing in run are queued for retry and the package stays pending
+    load = setup_loader(client_config=DummyClientConfiguration(fail_prob=1.0))
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    with pytest.raises(LoadClientJobTerminalRetry) as py_ex:
+        run_all(load)
+    assert load.current_load_id is not None
+    assert py_ex.value.load_id == load_id
+    package_info = load.load_storage.get_load_package_info(load_id)
+    assert package_info.state == "normalized"
+    # both failed and were queued for retry - we wait till the current loop is completed and then raise
+    assert len(package_info.jobs["failed_jobs"]) == 0
+    assert len(package_info.jobs["new_jobs"]) == 2
+    assert len(package_info.jobs["started_jobs"]) == 0
+    # metrics can be gathered
+    assert len(load._job_metrics) == 2
+    load_info = load.get_step_info(MockPipeline("pipe", True))  # type: ignore[abstract]
+    metrics = load_info.metrics[load_id][0]["job_metrics"]
+    assert len(metrics) == 2
+
+
+def test_spool_job_retry_new() -> None:
+    # this config retries job on start (transient fail)
+    load = setup_loader(client_config=DummyClientConfiguration(retry_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    for f in files:
+        job = load.submit_job(f, load_id, schema)
+        assert job.state() == "retry"
+        metrics = job.metrics()
+        assert metrics.started_at is not None
+        assert metrics.finished_at is None
+
+
+def test_spool_job_retry_spool_new() -> None:
+    # this config retries job on start (transient fail)
+    load = setup_loader(client_config=DummyClientConfiguration(retry_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    # call higher level function that returns jobs and counts
+    with ThreadPoolExecutor() as pool:
+        load.pool = pool
+        jobs = load.start_new_jobs(load_id, schema, [])
+        assert len(jobs) == 2
+
+
+def test_spool_job_retry_started() -> None:
+    # this config keeps the job always running
+    load = setup_loader()
+    # dummy_impl.CLIENT_CONFIG = DummyClientConfiguration
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    jobs: List[RunnableLoadJob] = []
+    for f in files:
+        job = load.submit_job(f, load_id, schema)
+        assert type(job) is dummy_impl.LoadDummyJob
+        assert job.state() == "completed"
+        # mock job state to make it retry
+        job.config.retry_prob = 1.0
+        job._state = "retry"
+        assert load.load_storage.normalized_packages.storage.has_file(
+            load.load_storage.normalized_packages.get_job_file_path(
+                load_id, PackageStorage.STARTED_JOBS_FOLDER, job.file_name()
+            )
+        )
+        jobs.append(job)
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    assert len(files) == 0
+    # should retry, that moves jobs into new folder, jobs are not counted as finalized
+    remaining_jobs, finalized_jobs, _ = load.complete_jobs(load_id, jobs, schema)
+    assert len(remaining_jobs) == 0
+    assert len(finalized_jobs) == 0
+    # ready and running jobs are in metrics
+    assert len(load._job_metrics) == 2
+
+    # clear retry flag
+    dummy_impl.JOBS = {}
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    assert len(files) == 2
+    # parse the new job names
+    for fn in load.load_storage.normalized_packages.list_new_jobs(load_id):
+        # we failed when already running the job so retry count will increase
+        assert ParsedLoadJobFileName.parse(fn).retry_count == 1
+
+    # this time it will pass
+    for f in files:
+        job = load.submit_job(f, load_id, schema)
+        assert job.state() == "completed"
+
+
+def test_try_retrieve_job() -> None:
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    # manually move jobs to started
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    for f in files:
+        load.load_storage.normalized_packages.start_job(
+            load_id, FileStorage.get_file_name_from_file_path(f)
+        )
+    # dummy client may retrieve jobs that it created itself, jobs in started folder are unknown
+    # and returned as terminal
+    jobs = load.resume_started_jobs(load_id, schema)
+    assert len(jobs) == 2
+    for j in jobs:
+        assert j.state() == "failed"
+    # new load package
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    load.pool = ThreadPoolExecutor()
+    jobs = load.start_new_jobs(load_id, schema, [])  # type: ignore
+    assert len(jobs) == 2
+    # wait for jobs submitted to the thread pool to complete before resuming
+    for j in jobs:
+        while j.state() not in ("completed", "failed", "retry"):
+            sleep(0.01)
+    # now jobs are known and have pending transitions from completion
+    jobs = load.resume_started_jobs(load_id, schema)
+    assert len(jobs) == 2
+    for j in jobs:
+        assert j.state() == "completed"
+    # _create_job(restore=True) goes through DummyClient.create_load_job which
+    # registers existing jobs as retried
+    assert len(dummy_impl.RETRIED_JOBS) == 2
+
+
+def test_resume_with_pending_completed_transition() -> None:
+    """Jobs with a pending completed transition are restored as surrogates
+    and processed by complete_jobs without re-execution."""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        # move jobs to started and write pending completed transitions
+        # (simulates: worker committed data + wrote marker, then process crashed
+        #  before main thread could call complete_jobs)
+        files = packages.list_new_jobs(load_id)
+        assert len(files) == 2
+        for f in files:
+            fn = FileStorage.get_file_name_from_file_path(f)
+            packages.start_job(load_id, fn)
+            packages.save_pending_transition(load_id, fn, "completed")
+
+        assert len(packages.list_started_jobs(load_id)) == 2
+        assert len(packages.list_pending_transitions(load_id)) == 2
+
+        # resume: should find pending transitions and create surrogates
+        resumed_jobs = load.resume_started_jobs(load_id, schema)
+        assert len(resumed_jobs) == 2
+        for j in resumed_jobs:
+            assert j.state() == "completed"
+
+        # process surrogates through complete_jobs
+        remaining, finalized, exc = load.complete_jobs(load_id, resumed_jobs, schema)
+        assert len(remaining) == 0
+        assert len(finalized) == 2
+        assert exc is None
+
+        # files moved to completed_jobs, pending transitions consumed
+        all_jobs = packages.get_load_package_jobs(load_id)
+        assert len(all_jobs["completed_jobs"]) == 2
+        assert len(all_jobs["started_jobs"]) == 0
+        assert len(packages.list_pending_transitions(load_id)) == 0
+
+
+def test_resume_with_pending_failed_transition() -> None:
+    """One job completed, one failed. Tests both raise_on_failed_jobs modes
+    to verify pending transitions produce correct exception chain."""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        # move jobs to started: first completes, second fails
+        files = packages.list_new_jobs(load_id)
+        assert len(files) == 2
+        file_names = [FileStorage.get_file_name_from_file_path(f) for f in files]
+        for fn in file_names:
+            packages.start_job(load_id, fn)
+        packages.save_pending_transition(load_id, file_names[0], "completed")
+        packages.save_pending_transition(load_id, file_names[1], "failed", "a random fail occurred")
+
+        # resume: one completed surrogate, one failed surrogate
+        resumed_jobs = load.resume_started_jobs(load_id, schema)
+        assert len(resumed_jobs) == 2
+        states = {j.state() for j in resumed_jobs}
+        assert states == {"completed", "failed"}
+
+        # --- mode 1: raise_on_failed_jobs=True, auto_abort=False (default) ---
+        # complete_jobs returns a pending_exception with correct exception chain
+        remaining, finalized, pending_exc = load.complete_jobs(load_id, resumed_jobs, schema)
+        assert len(remaining) == 0
+        assert len(finalized) == 2
+        assert pending_exc is not None
+        assert isinstance(pending_exc, LoadClientJobTerminalRetry)
+        # the chained client_exception must be a DestinationTerminalException
+        assert isinstance(pending_exc.client_exception, DestinationTerminalException)
+        assert "a random fail occurred" in pending_exc.failed_message
+
+        # the failed job is queued for retry, not moved to failed_jobs
+        all_jobs = packages.get_load_package_jobs(load_id)
+        assert len(all_jobs["completed_jobs"]) == 1
+        assert len(all_jobs["failed_jobs"]) == 0
+        assert len(all_jobs["new_jobs"]) == 1
+        assert len(all_jobs["started_jobs"]) == 0
+        assert len(packages.list_pending_transitions(load_id)) == 0
+
+    # --- mode 2: raise_on_failed_jobs=False, auto_abort=False (silent completion) ---
+    loader_config = LoaderConfiguration(
+        auto_abort_on_terminal_error=False,
+        raise_on_failed_jobs=False,
+        workers=1,
+        pool_type="none",
+    )
+    load = setup_loader(
+        client_config=DummyClientConfiguration(completed_prob=1.0),
+        loader_config=loader_config,
+    )
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        files = packages.list_new_jobs(load_id)
+        file_names = [FileStorage.get_file_name_from_file_path(f) for f in files]
+        for fn in file_names:
+            packages.start_job(load_id, fn)
+        packages.save_pending_transition(load_id, file_names[0], "completed")
+        packages.save_pending_transition(load_id, file_names[1], "failed", "a random fail occurred")
+
+        resumed_jobs = load.resume_started_jobs(load_id, schema)
+        remaining, finalized, pending_exc = load.complete_jobs(load_id, resumed_jobs, schema)
+        assert len(finalized) == 2
+        # no pending exception with raise_on_failed_jobs off: the package completes as loaded
+        assert pending_exc is None
+
+
+def test_resume_without_pending_transition() -> None:
+    """Without pending transitions, jobs are re-submitted normally (existing behavior)."""
+    load = setup_loader()
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    # manually move jobs to started
+    files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+    for f in files:
+        load.load_storage.normalized_packages.start_job(
+            load_id, FileStorage.get_file_name_from_file_path(f)
+        )
+
+    # no pending transitions exist — jobs should be re-submitted via submit_job(restore=True)
+    jobs = load.resume_started_jobs(load_id, schema)
+    assert len(jobs) == 2
+    # dummy client returns failed for unknown jobs (not in JOBS dict)
+    for j in jobs:
+        assert j.state() == "failed"
+
+
+def test_abort_package_replays_started_jobs() -> None:
+    """Abort moves started jobs with a pending transition to their recorded terminal
+    state (the destination already committed them) and fails jobs without a marker."""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    files = packages.list_new_jobs(load_id)
+    assert len(files) == 2
+    file_names = sorted(FileStorage.get_file_name_from_file_path(f) for f in files)
+    for fn in file_names:
+        packages.start_job(load_id, fn)
+    # first job committed to the destination before the crash, second did not
+    packages.save_pending_transition(load_id, file_names[0], "completed")
+
+    # dry run tells the truth about started jobs without resolving them
+    plan = prepare_abort_packages(load.load_storage, NormalizeStorage(True))
+    assert plan is not None
+    job_info = plan["package_to_abort"]
+    assert job_info is not None
+    assert job_info["load_id"] == load_id
+    assert [os.path.basename(f) for f in job_info["committed_jobs"]] == [file_names[0]]
+    assert [os.path.basename(f) for f in job_info["interrupted_jobs"]] == [file_names[1]]
+    assert job_info["terminal_jobs"] == []
+    assert job_info["transient_jobs"] == []
+    assert len(packages.list_started_jobs(load_id)) == 2
+
+    packages.set_abort_flag(load_id)
+    with pytest.raises(LoadPackageAborted) as abort_ex:
+        load.run(None)
+    assert abort_ex.value.job_exception is None
+
+    package_info = load.load_storage.get_load_package_info(load_id)
+    assert package_info.state == "aborted"
+    jobs_by_state = {
+        state: [job.job_file_info for job in jobs] for state, jobs in package_info.jobs.items()
+    }
+    # committed job replayed to completed_jobs without re-execution
+    assert [j.file_name() for j in jobs_by_state["completed_jobs"]] == [file_names[0]]
+    # interrupted job failed with retry count increased
+    assert len(jobs_by_state["failed_jobs"]) == 1
+    failed_job = jobs_by_state["failed_jobs"][0]
+    assert (
+        failed_job.file_name()
+        == ParsedLoadJobFileName.parse(file_names[1]).with_retry().file_name()
+    )
+    failed_message = load.load_storage.loaded_packages.get_job_failed_message(load_id, failed_job)
+    assert "job interrupted by package abort" in failed_message
+    assert len(jobs_by_state["started_jobs"]) == 0
+    assert len(jobs_by_state["new_jobs"]) == 0
+
+
+def test_outputs_skip_failed_jobs_of_a_completed_package() -> None:
+    """Outputs describe data that landed, so a table whose job failed is not among them"""
+    load = setup_loader(
+        # fail_table_names completes every table it does not list
+        client_config=DummyClientConfiguration(fail_table_names=["event_loop_interrupted"]),
+        loader_config=LoaderConfiguration(
+            auto_abort_on_terminal_error=False, raise_on_failed_jobs=False
+        ),
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    run_all(load)
+
+    assert load.load_storage.get_load_package_info(load_id).state == "loaded"
+    metrics = load.get_step_info(MockPipeline("pipe", True)).metrics[load_id][0]  # type: ignore[abstract]
+    # both jobs ran and are in the metrics, only the one that completed is an output
+    assert {job.table_name: job.state for job in metrics["job_metrics"].values()} == {
+        "event_user": "completed",
+        "event_loop_interrupted": "failed",
+    }
+    assert [location["tables"] for location in metrics["outputs"]] == [["event_user"]]
+
+
+@pytest.mark.parametrize(
+    "auto_abort,package_state,expected_exception",
+    [
+        (True, "aborted", LoadPackageAborted),
+        (False, "normalized", LoadClientJobTerminalRetry),
+    ],
+    ids=["aborted", "pending_retry"],
+)
+def test_outputs_not_recorded_until_package_is_loaded(
+    auto_abort: bool, package_state: str, expected_exception: Type[Exception]
+) -> None:
+    """Only a loaded package has outputs, whatever its jobs managed to complete first"""
+    load = setup_loader(
+        # fail_table_names completes every table it does not list
+        client_config=DummyClientConfiguration(fail_table_names=["event_loop_interrupted"]),
+        loader_config=LoaderConfiguration(
+            auto_abort_on_terminal_error=auto_abort, raise_on_failed_jobs=True
+        ),
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    with pytest.raises(expected_exception):
+        run_all(load)
+
+    assert load.load_storage.get_load_package_info(load_id).state == package_state
+    metrics = load._step_info_metrics(load_id)[0]
+    # a job did complete first, so an unguarded output would have been recorded
+    assert "completed" in {job.state for job in metrics["job_metrics"].values()}
+    assert metrics["outputs"] == []
+
+
+def test_outputs_survive_a_restart_like_job_metrics() -> None:
+    """Outputs are derived from job metrics, so they cover jobs completed by an earlier process"""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    # the jobs complete and persist their metrics, the package does not complete
+    with patch.object(load, "complete_package", side_effect=RuntimeError("crash")):
+        with pytest.raises(RuntimeError):
+            load.run(None)
+    assert load.load_storage.get_load_package_info(load_id).state == "normalized"
+
+    resumed = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    assert resumed._job_metrics == {}
+    run_all(resumed)
+
+    assert resumed.load_storage.get_load_package_info(load_id).state == "loaded"
+    metrics = resumed.get_step_info(MockPipeline("pipe", True)).metrics[load_id][0]  # type: ignore[abstract]
+    assert sorted(table for location in metrics["outputs"] for table in location["tables"]) == [
+        "event_loop_interrupted",
+        "event_user",
+    ]
+
+
+def test_auto_abort_crash_resumes_via_flag() -> None:
+    """The abort intent is persisted when the terminal failure is seen, so a crash mid-abort
+    is finished by the next pool run."""
+    loader_config = LoaderConfiguration(
+        auto_abort_on_terminal_error=True, workers=1, pool_type="none"
+    )
+    load = setup_loader(
+        client_config=DummyClientConfiguration(fail_prob=1.0), loader_config=loader_config
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    with patch.object(load, "complete_package", side_effect=RuntimeError("crash")):
+        with pytest.raises(RuntimeError):
+            load.run(None)
+    # the abort intent survived the crash and the package is still pending
+    assert packages.has_abort_flag(load_id)
+    assert load.load_storage.get_load_package_info(load_id).state == "normalized"
+
+    # the next run finishes the abort via the flag, without the original job failure
+    with pytest.raises(LoadPackageAborted) as abort_ex:
+        load.run(None)
+    assert abort_ex.value.job_exception is None
+    package_info = load.load_storage.get_load_package_info(load_id)
+    assert package_info.state == "aborted"
+    assert len(package_info.jobs["failed_jobs"]) == 1
+    # the job that never ran is abandoned in new_jobs
+    assert len(package_info.jobs["new_jobs"]) == 1
+
+
+def test_prepare_abort_packages_keeps_older_than_target() -> None:
+    """The planner deletes only the target and newer packages, keeping older ones - also when
+    the target is already aborted (moved to loaded storage), which drives the abort cleanup."""
+    load = setup_loader()
+    older, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    target, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    newer, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    assert [older, target, newer] == sorted([older, target, newer])
+
+    # target not being loaded: delete target and newer, keep older, no record
+    plan = prepare_abort_packages(load.load_storage, NormalizeStorage(True), target)
+    assert plan is not None
+    assert plan["package_to_abort"] is None
+    assert plan["packages_to_delete"] == [target, newer]
+    assert plan["restore_from_load_id"] == target
+
+    # target already aborted (in loaded storage): delete only newer, keep older
+    load.load_storage.complete_load_package(target, aborted=True)
+    assert target in load.load_storage.list_loaded_packages()
+    plan = prepare_abort_packages(load.load_storage, NormalizeStorage(True), target)
+    assert plan is not None
+    assert plan["package_to_abort"] is None
+    assert plan["packages_to_delete"] == [newer]
+    assert plan["restore_from_load_id"] == target
+    assert older in load.load_storage.list_normalized_packages()
+
+
+def test_pending_transition_with_followup_jobs() -> None:
+    """Restored jobs produce their followup jobs via create_followup_jobs.
+
+    The DummyClient requires jobs to exist in its in-memory JOBS dict for
+    create_load_job(restore=True) to succeed, so we first run jobs through the
+    pool (which populates JOBS), then simulate a crash by writing pending
+    transitions and calling resume directly.
+    """
+    load = setup_loader(
+        client_config=DummyClientConfiguration(completed_prob=1.0, create_followup_jobs=True)
+    )
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(
+            storage=load.load_storage.normalized_packages, load_id=load_id
+        )
+    ):
+        # submit jobs so DummyClient registers them in JOBS
+        load.pool = ThreadPoolExecutor()
+        new_jobs = load.start_new_jobs(load_id, schema, [])
+        for j in new_jobs:
+            while j.state() not in ("completed", "failed", "retry"):
+                sleep(0.01)
+
+        # write pending transitions (simulating crash after worker committed)
+        for j in new_jobs:
+            packages.save_pending_transition(load_id, j.file_name(), "completed")
+
+        # reset followup tracking
+        dummy_impl.CREATED_FOLLOWUP_JOBS = {}
+
+        # resume surrogates — _create_job_for_pending_transition calls
+        # DummyClient.create_load_job(restore=True) which returns the real
+        # LoadDummyJob from JOBS with its create_followup_jobs implementation
+        resumed_jobs = load.resume_started_jobs(load_id, schema)
+        assert len(resumed_jobs) == 2
+
+        # process through complete_jobs — should trigger create_followup_jobs
+        remaining, finalized, exc = load.complete_jobs(load_id, resumed_jobs, schema)
+        assert len(finalized) == 2
+
+        # followup jobs created by the real LoadDummyJob instances
+        assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 2
+
+
+def test_pending_transition_without_started_job() -> None:
+    """An orphaned pending transition (no matching started job) is tolerated."""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    # move only one job to started, but write a pending transition for a
+    # file name that was never started
+    files = packages.list_new_jobs(load_id)
+    fn = FileStorage.get_file_name_from_file_path(files[0])
+    packages.start_job(load_id, fn)
+    packages.save_pending_transition(load_id, fn, "completed")
+    # orphan: pending transition for a job that is NOT in started_jobs
+    packages.save_pending_transition(load_id, "ghost_table.abc123.0.jsonl", "completed")
+
+    # orphan is logged as error but does not prevent resume
+    jobs = load.resume_started_jobs(load_id, schema)
+    # the valid started job is still resumed as a surrogate
+    assert len(jobs) == 1
+    assert jobs[0].state() == "completed"
+
+
+def test_pending_transition_corrupt_format() -> None:
+    """A corrupt pending transition file raises on load."""
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    packages = load.load_storage.normalized_packages
+
+    files = packages.list_new_jobs(load_id)
+    fn = FileStorage.get_file_name_from_file_path(files[0])
+    packages.start_job(load_id, fn)
+
+    # write garbage directly to the pending transitions file
+    rel_path = packages._pending_transition_path(load_id, fn)
+    packages.storage.save(rel_path, "not valid json {{{")
+
+    with pytest.raises(Exception):
+        load.resume_started_jobs(load_id, schema)
+
+
+def test_completed_loop() -> None:
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    assert_complete_job(load)
+    assert len(dummy_impl.JOBS) == 2
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+
+
+def test_completed_loop_followup_jobs() -> None:
+    # TODO: until we fix how we create capabilities we must set env
+    load = setup_loader(
+        client_config=DummyClientConfiguration(completed_prob=1.0, create_followup_jobs=True)
+    )
+    assert_complete_job(load)
+    # for each JOB there's REFERENCE JOB
+    assert len(dummy_impl.JOBS) == 2 * 2
+    assert len(dummy_impl.JOBS) == len(dummy_impl.CREATED_FOLLOWUP_JOBS) * 2
+
+
+def test_failing_followup_jobs() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            completed_prob=1.0, create_followup_jobs=True, fail_followup_job_creation=True
+        )
+    )
+    with pytest.raises(FollowupJobCreationFailedException) as exc:
+        assert_complete_job(load)
+        # follow up job errors on main thread
+    assert "Failed to create followup job" in str(exc)
+
+    # followup job fails, we have both jobs in started folder
+    load_id = list(dummy_impl.JOBS.values())[1]._load_id
+    started_files = load.load_storage.normalized_packages.list_started_jobs(load_id)
+    assert len(started_files) == 2
+    assert len(dummy_impl.JOBS) == 2
+    assert len(dummy_impl.RETRIED_JOBS) == 0
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+    # metrics in running state could be collected
+    assert len(load._job_metrics) <= 2
+    for m in load._job_metrics.values():
+        assert m.state in ("running", "ready")
+
+    # now we can retry the same load, it will restart the two jobs and successfully
+    # create the followup jobs. pending transitions cause fresh job creation via the
+    # client which picks up the updated config
+    load.initial_client_config.fail_followup_job_creation = False  # type: ignore
+    assert_complete_job(load, load_id=load_id)
+    assert len(dummy_impl.JOBS) == 2 * 2
+    assert len(dummy_impl.JOBS) == len(dummy_impl.CREATED_FOLLOWUP_JOBS) * 2
+    assert len(dummy_impl.RETRIED_JOBS) == 2
+
+
+def test_failing_table_chain_followup_jobs() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            completed_prob=1.0,
+            create_followup_table_chain_reference_jobs=True,
+            fail_table_chain_followup_job_creation=True,
+        )
+    )
+    with pytest.raises(TableChainFollowupJobCreationFailedException) as exc:
+        assert_complete_job(load)
+        # follow up job errors on main thread
+    assert "Failed creating table chain followup jobs for table chain with root table" in str(exc)
+
+    # table chain followup job fails, we have both jobs in started folder
+    load_id = list(dummy_impl.JOBS.values())[1]._load_id
+    started_files = load.load_storage.normalized_packages.list_started_jobs(load_id)
+    assert len(started_files) == 2
+    assert len(dummy_impl.JOBS) == 2
+    assert len(dummy_impl.RETRIED_JOBS) == 0
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+    # metrics in running state could be collected
+    assert len(load._job_metrics) <= 2
+    for m in load._job_metrics.values():
+        assert m.state in ("running", "ready")
+
+    # now we can retry the same load, pending transitions cause fresh job creation
+    # via the client which picks up the updated config
+    load.initial_client_config.fail_table_chain_followup_job_creation = False  # type: ignore
+    assert_complete_job(load, load_id=load_id)
+    assert len(dummy_impl.JOBS) == 2 * 2
+    assert len(dummy_impl.JOBS) == len(dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS) * 2
+    assert len(dummy_impl.RETRIED_JOBS) == 2
+
+
+def test_failing_sql_table_chain_job() -> None:
+    """
+    Make sure we get a useful exception from a failing sql job
+    """
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            completed_prob=1.0, create_followup_table_chain_sql_jobs=True
+        ),
+    )
+    with pytest.raises(Exception) as exc:
+        assert_complete_job(load)
+
+    # sql jobs always fail because this is not an sql client, we just make sure the exception is there
+    assert "Failed creating table chain followup jobs for table chain with root table" in str(
+        exc.value
+    )
+
+
+def test_successful_table_chain_jobs() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            completed_prob=1.0, create_followup_table_chain_reference_jobs=True
+        ),
+    )
+    # we create 10 jobs per case (for two cases)
+    # and expect two table chain jobs at the end
+    assert_complete_job(load, jobs_per_case=10)
+    assert len(dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS) == 2
+    assert len(dummy_impl.JOBS) == 22
+
+    # check that we have 10 references per followup job
+    for _, job in dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS.items():
+        assert len(job._remote_paths) == 10  # type: ignore
+
+
+def test_failed_loop() -> None:
+    # ask to delete completed
+    load = setup_loader(
+        delete_completed_jobs=True, client_config=DummyClientConfiguration(fail_prob=1.0)
+    )
+    # actually not deleted because one of the jobs failed
+    with pytest.raises(LoadClientJobTerminalRetry) as e:
+        assert_complete_job(load, should_delete_completed=False)
+
+    assert "a random fail occurred" in e.value.failed_message
+    # two failed jobs
+    assert len(dummy_impl.JOBS) == 2
+    assert list(dummy_impl.JOBS.values())[0].state() == "failed"
+    assert list(dummy_impl.JOBS.values())[1].state() == "failed"
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+
+
+def test_failed_loop_followup_jobs() -> None:
+    # ask to delete completed
+    load = setup_loader(
+        delete_completed_jobs=True,
+        client_config=DummyClientConfiguration(fail_prob=1.0, create_followup_jobs=True),
+    )
+    # actually not deleted because one of the jobs failed
+    with pytest.raises(LoadClientJobTerminalRetry) as e:
+        assert_complete_job(load, should_delete_completed=False)
+
+    assert "a random fail occurred" in e.value.failed_message
+    # followup jobs were not started
+    assert len(dummy_impl.JOBS) == 2
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+
+
+def test_completed_loop_with_delete_completed() -> None:
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load.load_storage = load.create_storage(is_storage_owner=False)
+    load.load_storage.config.delete_completed_jobs = True
+    assert_complete_job(load, should_delete_completed=True)
+
+
+@pytest.mark.parametrize("to_truncate", [True, False])
+def test_truncate_table_before_load_on_staging(to_truncate) -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            truncate_tables_on_staging_destination_before_load=to_truncate
+        )
+    )
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    destination_client = load.get_destination_client(schema)
+    assert (
+        destination_client.should_truncate_table_before_load_on_staging_destination(  # type: ignore
+            schema.tables["_dlt_version"]["name"]
+        )
+        == to_truncate
+    )
+
+
+def test_retry_on_new_loop() -> None:
+    # test job that retries sitting in new jobs
+    load = setup_loader(client_config=DummyClientConfiguration(retry_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    def _assert_metrics(retry_count: int) -> None:
+        load_info = load.get_step_info(MockPipeline("pipeline", False))  # type: ignore
+        # verify package
+        assert load_info.started_at is not None
+        # assert load_info.finished_at is None
+        # assert load_info.dataset_name is None
+        load_package = load_info.load_packages[0]
+        assert load_package.load_id == load_id
+        assert load_package.state == "normalized"
+        metrics = load_info.metrics[load_id][0]["job_metrics"]
+        assert len(metrics) == 2
+        for metric in metrics.values():
+            assert metric.state == "retry"
+            assert metric.retry_count == retry_count
+            assert metric.table_name in ("event_loop_interrupted", "event_user")
+            assert metric.started_at is not None
+            assert metric.finished_at is None
+        files = load.load_storage.normalized_packages.list_new_jobs(load_id)
+        assert len(files) == 2
+
+    with ThreadPoolExecutor() as pool:
+        # 1st retry
+        with pytest.raises(LoadClientJobRetry):
+            load.run(pool)
+
+        # NOTE: loader does not guarantee that all jobs will retry 5 times before exception is called
+        # in principle that may happen after one job reaches 5 and all other jobs wait for a retry
+        # as a new job so the pool is drained and loader exits
+
+        _assert_metrics(4)
+
+        # 2nd retry
+        with pytest.raises(LoadClientJobRetry):
+            load.run(pool)
+
+        _assert_metrics(9)
+
+        # package will be completed
+        load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+        load.run(pool)
+        assert not load.load_storage.normalized_packages.storage.has_folder(
+            load.load_storage.get_normalized_package_path(load_id)
+        )
+        sleep(1)
+        # parse the completed job names
+        completed_path = load.load_storage.loaded_packages.get_package_path(load_id)
+        for fn in load.load_storage.loaded_packages.storage.list_folder_files(
+            os.path.join(completed_path, PackageStorage.COMPLETED_JOBS_FOLDER)
+        ):
+            # we update a retry count in each case (5 times for each loop run)
+            assert ParsedLoadJobFileName.parse(fn).retry_count == 10
+
+
+def test_retry_exceptions() -> None:
+    load = setup_loader(client_config=DummyClientConfiguration(retry_prob=1.0))
+    prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    with ThreadPoolExecutor() as pool:
+        # 1st retry
+        with pytest.raises(LoadClientJobRetry) as py_ex:
+            while True:
+                load.run(pool)
+        # configured to retry 5 times before exception
+        assert py_ex.value.max_retry_count == py_ex.value.retry_count == 5
+        # we can do it again
+        # NOTE: that we count to 10 here is lucky coincidence see test_retry_on_new_loop
+        with pytest.raises(LoadClientJobRetry) as py_ex:
+            while True:
+                load.run(pool)
+        # this continues retry
+        assert py_ex.value.max_retry_count * 2 == py_ex.value.retry_count == 10
+
+
+def test_load_single_thread() -> None:
+    os.environ["LOAD__WORKERS"] = "1"
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    assert load.config.pool_type == "none"
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    # we do not need pool to complete
+    metrics = load.run(None)
+    while metrics.pending_items > 0:
+        metrics = load.run(None)
+    assert not load.load_storage.storage.has_folder(
+        load.load_storage.get_normalized_package_path(load_id)
+    )
+
+
+def test_wrong_writer_type() -> None:
+    load = setup_loader()
+    load_id, _ = prepare_load_package(
+        load.load_storage,
+        [
+            "event_bot.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values",
+            "event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values",
+        ],
+    )
+    with ThreadPoolExecutor() as pool:
+        with pytest.raises(JobFileFormatUnsupported) as exv:
+            load.run(pool)
+    assert exv.value.load_id == load_id
+
+
+def test_extend_table_chain() -> None:
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    # only event user table (no other jobs)
+    tables = _extend_tables_with_table_chain(schema, ["event_user"], ["event_user"])
+    assert tables == {"event_user"}
+    # add child jobs
+    tables = _extend_tables_with_table_chain(
+        schema, ["event_user"], ["event_user", "event_user__parse_data__entities"]
+    )
+    assert tables == {"event_user", "event_user__parse_data__entities"}
+    user_chain = {name for name in schema.data_table_names() if name.startswith("event_user__")} | {
+        "event_user"
+    }
+    # change event user to merge/replace to get full table chain
+    for w_d in ["merge", "replace"]:
+        schema.tables["event_user"]["write_disposition"] = w_d  # type:ignore[typeddict-item]
+        tables = _extend_tables_with_table_chain(schema, ["event_user"], ["event_user"])
+        assert tables == user_chain
+    # no jobs for bot
+    assert _extend_tables_with_table_chain(schema, ["event_bot"], ["event_user"]) == set()
+    # skip unseen tables
+    del schema.tables["event_user__parse_data__entities"]["x-normalizer"]
+    entities_chain = {
+        name
+        for name in schema.data_table_names()
+        if name.startswith("event_user__parse_data__entities")
+    }
+    tables = _extend_tables_with_table_chain(schema, ["event_user"], ["event_user"])
+    assert tables == user_chain - {"event_user__parse_data__entities"}
+    # exclude the whole chain
+    tables = _extend_tables_with_table_chain(
+        schema, ["event_user"], ["event_user"], lambda table_name: table_name not in entities_chain
+    )
+    assert tables == user_chain - entities_chain
+    # ask for tables that are not top
+    tables = _extend_tables_with_table_chain(schema, ["event_user__parse_data__entities"], [])
+    # user chain but without entities (not seen data)
+    assert tables == user_chain - {"event_user__parse_data__entities"}
+    # go to append and ask only for entities chain
+    schema.tables["event_user"]["write_disposition"] = "append"
+    tables = _extend_tables_with_table_chain(
+        schema, ["event_user__parse_data__entities"], entities_chain
+    )
+    # without entities (not seen data)
+    assert tables == entities_chain - {"event_user__parse_data__entities"}
+
+    # add multiple chains
+    bot_jobs = {"event_bot", "event_bot__data__buttons"}
+    tables = _extend_tables_with_table_chain(
+        schema, ["event_user__parse_data__entities", "event_bot"], entities_chain | bot_jobs
+    )
+    assert tables == (entities_chain | bot_jobs) - {"event_user__parse_data__entities"}
+
+
+def test_get_completed_table_chain_cases() -> None:
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+
+    # update tables so we have all possible hints
+    for table_name, table in schema.tables.items():
+        schema.tables[table_name] = fill_hints_from_parent_and_clone_table(schema.tables, table)
+
+    # child completed, parent not
+    event_user = schema.get_table("event_user")
+    event_user_entities = schema.get_table("event_user__parse_data__entities")
+    event_user_job: Tuple[TPackageJobState, ParsedLoadJobFileName] = (
+        "started_jobs",
+        ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl"),
+    )
+    event_user_entities_job: Tuple[TPackageJobState, ParsedLoadJobFileName] = (
+        "completed_jobs",
+        ParsedLoadJobFileName(
+            "event_user__parse_data__entities", "event_user__parse_data__entities_id", 0, "jsonl"
+        ),
+    )
+    chain = get_completed_table_chain(schema, [event_user_job, event_user_entities_job], event_user)
+    assert chain is None
+
+    # parent just got completed
+    chain = get_completed_table_chain(
+        schema,
+        [event_user_job, event_user_entities_job],
+        event_user,
+        event_user_job[1].job_id(),
+    )
+    # full chain
+    assert chain == [event_user, event_user_entities]
+
+    # parent failed, child completed
+    chain = get_completed_table_chain(
+        schema, [("failed_jobs", event_user_job[1]), event_user_entities_job], event_user
+    )
+    assert chain == [event_user, event_user_entities]
+
+    # both failed
+    chain = get_completed_table_chain(
+        schema,
+        [("failed_jobs", event_user_job[1]), ("failed_jobs", event_user_entities_job[1])],
+        event_user,
+    )
+    assert chain == [event_user, event_user_entities]
+
+    # merge and replace do not require whole chain to be in jobs
+    user_chain = get_nested_tables(schema.tables, "event_user")
+    for w_d in ["merge", "replace"]:
+        event_user["write_disposition"] = w_d  # type:ignore[typeddict-item]
+
+        chain = get_completed_table_chain(
+            schema, [event_user_job], event_user, event_user_job[1].job_id()
+        )
+        assert chain == user_chain
+
+        # but if child is present and incomplete...
+        chain = get_completed_table_chain(
+            schema,
+            [event_user_job, ("new_jobs", event_user_entities_job[1])],
+            event_user,
+            event_user_job[1].job_id(),
+        )
+        # noting is returned
+        assert chain is None
+
+    # skip unseen
+    deep_child = schema.tables[
+        "event_user__parse_data__response_selector__default__response__response_templates"
+    ]
+    del deep_child["x-normalizer"]
+    chain = get_completed_table_chain(
+        schema, [event_user_job], event_user, event_user_job[1].job_id()
+    )
+    user_chain.remove(deep_child)
+    assert chain == user_chain
+
+
+def test_extend_tables_with_table_chain_selective_filter() -> None:
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    bot_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_bot")}
+    all_data = set(schema.data_table_names())
+    bot_only = lambda table_name: table_name in bot_chain
+
+    # append + selective filter: only tables with jobs AND passing filter
+    tables = set(
+        _extend_tables_with_table_chain(
+            schema, ["event_user", "event_bot"], ["event_user", "event_bot"], bot_only
+        )
+    )
+    assert tables == {"event_bot"}
+
+    # merge on bot chain: jobless nested tables now included
+    for bot in get_nested_tables(schema.tables, "event_bot"):
+        bot["write_disposition"] = "merge"
+    tables = set(_extend_tables_with_table_chain(schema, ["event_bot"], ["event_bot"], bot_only))
+    assert tables == bot_chain
+
+    # all data tables as both params (mirrors staging_data_tables computation in init_client)
+    tables = set(_extend_tables_with_table_chain(schema, all_data, all_data, bot_only))
+    assert tables == bot_chain
+
+
+def test_init_client_truncate_tables() -> None:
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+
+    nothing_ = lambda _: False
+    all_ = lambda _: True
+
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+    event_bot = ParsedLoadJobFileName("event_bot", "event_bot_id", 0, "jsonl")
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_stored_schema,
+        patch.object(dummy_impl.DummyClient, "drop_tables") as drop_tables,
+    ):
+        with load.get_destination_client(schema) as client:
+            init_client(
+                client,
+                schema,
+                [],
+                {},
+                nothing_,
+                nothing_,
+                nothing_,  # do not drop tables
+                drop_tables=[schema.get_table("event_user")],
+            )
+        # we do not allow for any staging dataset tables
+        assert update_stored_schema.call_count == 1
+        assert update_stored_schema.call_args[1]["only_tables"] == {
+            "_dlt_loads",
+            "_dlt_version",
+        }
+        assert update_stored_schema.call_args[1]["include_existing_tables"] is True
+        # nothing to truncate: only the bare init call is made (no truncate init call)
+        assert initialize_storage.call_count == 1
+        assert initialize_storage.call_args_list[0].args == ()
+        assert initialize_storage.call_args_list[0].kwargs == {}
+        # tables not dropped
+        drop_tables.assert_not_called()
+
+        initialize_storage.reset_mock()
+        update_stored_schema.reset_mock()
+        drop_tables.reset_mock()
+
+        # now we want all tables to be truncated but not on staging
+        with load.get_destination_client(schema) as client:
+            init_client(
+                client,
+                schema,
+                [event_user],
+                {},
+                all_,
+                nothing_,
+                all_,  # drop tables
+                drop_tables=[schema.get_table("event_user")],
+            )
+        # drop tables trigger staging dataset schema change on top of final dataset schema change
+        assert update_stored_schema.call_count == 2
+        assert update_stored_schema.call_args_list[0].kwargs["force"] is True
+        assert "event_user" in update_stored_schema.call_args_list[0].kwargs["only_tables"]
+        # no staging-eligible tables so only the version table is migrated on staging
+        assert update_stored_schema.call_args_list[1].kwargs["only_tables"] == {"_dlt_version"}
+        assert initialize_storage.call_count == 3
+        assert initialize_storage.call_args_list[0].args == ()
+        assert initialize_storage.call_args_list[1].kwargs["truncate_tables"] == {"event_user"}
+        # dropped on staging dataset and final
+        assert drop_tables.call_count == 2
+
+        initialize_storage.reset_mock()
+        update_stored_schema.reset_mock()
+        drop_tables.reset_mock()
+
+        replace_ = (
+            lambda table_name: client.prepare_load_table(table_name)["write_disposition"]
+            == "replace"
+        )
+        merge_ = (
+            lambda table_name: client.prepare_load_table(table_name)["write_disposition"] == "merge"
+        )
+
+        # set event_bot chain to merge
+        bot_chain = get_nested_tables(schema.tables, "event_bot")
+        for w_d in ["merge", "replace"]:
+            initialize_storage.reset_mock()
+            update_stored_schema.reset_mock()
+            for bot in bot_chain:
+                bot["write_disposition"] = w_d  # type:ignore[typeddict-item]
+            # merge goes to staging, replace goes to truncate
+            with load.get_destination_client(schema) as client:
+                init_client(client, schema, [event_user, event_bot], {}, replace_, merge_, all_)
+
+            if w_d == "merge":
+                # we use staging dataset
+                assert update_stored_schema.call_count == 2
+                # 4 tables to update in main dataset
+                assert len(update_stored_schema.call_args_list[0].kwargs["only_tables"]) == 4
+                assert "event_user" in update_stored_schema.call_args_list[0].kwargs["only_tables"]
+                # full bot table chain + dlt version but no user
+                assert len(update_stored_schema.call_args_list[1].kwargs["only_tables"]) == 1 + len(
+                    bot_chain
+                )
+                assert (
+                    "event_user" not in update_stored_schema.call_args_list[1].kwargs["only_tables"]
+                )
+
+                assert initialize_storage.call_count == 3
+                assert initialize_storage.call_args_list[0].kwargs == {}
+                assert initialize_storage.call_args_list[2].kwargs[
+                    "truncate_tables"
+                ] == update_stored_schema.call_args_list[1].kwargs["only_tables"] - {"_dlt_version"}
+
+            if w_d == "replace":
+                assert update_stored_schema.call_count == 1
+                assert initialize_storage.call_count == 2
+                # we truncate the whole bot chain but not user (which is append)
+                assert len(initialize_storage.call_args_list[1].kwargs["truncate_tables"]) == len(
+                    bot_chain
+                )
+                # migrate only tables for which we have jobs
+                assert len(update_stored_schema.call_args_list[0].kwargs["only_tables"]) == 4
+                # print(initialize_storage.call_args_list)
+                # print(update_stored_schema.call_args_list)
+
+
+def test_init_client_initial_truncate_tables_from_package_state() -> None:
+    """truncated_tables stored in the load package state (refresh drop_data) reach init_client and
+    force a schema migration even when the schema hash is unchanged and the table has no jobs."""
+    load = setup_loader()
+    load_id, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    # a refresh requested truncation of event_bot which has no data jobs in this package
+    packages = load.load_storage.normalized_packages
+    state = packages.get_load_package_state(load_id)
+    state["truncated_tables"] = [schema.get_table("event_bot")]
+    packages.save_load_package_state(load_id, state)
+
+    # synthetic jsonl job (the on-disk case file is insert_values which the dummy client rejects)
+    new_jobs = [ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")]
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(
+            dummy_impl.DummyClient, "update_stored_schema", return_value={}
+        ) as update_stored_schema,
+    ):
+        with Container().injectable_context(
+            LoadPackageStateInjectableContext(
+                storage=load.load_storage.normalized_packages, load_id=load_id
+            )
+        ):
+            load.initialize_package(load_id, schema, new_jobs)
+
+    # schema migration is forced because there are tables to truncate via refresh
+    assert update_stored_schema.call_args_list[0].kwargs["force"] is True
+    # event_user is append (not truncated); only the initial truncate table reaches the truncate
+    # init call, even though it has no jobs in this package
+    truncate_calls = [
+        c.kwargs["truncate_tables"]
+        for c in initialize_storage.call_args_list
+        if "truncate_tables" in c.kwargs
+    ]
+    assert truncate_calls == [{"event_bot"}]
+    # the actually truncated tables are recorded in the package state
+    state = packages.get_load_package_state(load_id)
+    assert state["applied_truncated_tables"] == ["event_bot"]
+    assert "applied_dropped_tables" not in state
+
+
+def test_init_client_replace_job_no_forced_migration() -> None:
+    """A job for a replace table (ie. the 0-row job of an empty replace resource) truncates the
+    table chain via the regular truncate filter and does not force a schema migration."""
+    load = setup_loader()
+    load_id, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    schema.tables["event_user"]["write_disposition"] = "replace"
+
+    new_jobs = [ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")]
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(
+            dummy_impl.DummyClient, "update_stored_schema", return_value={}
+        ) as update_stored_schema,
+    ):
+        with Container().injectable_context(
+            LoadPackageStateInjectableContext(
+                storage=load.load_storage.normalized_packages, load_id=load_id
+            )
+        ):
+            load.initialize_package(load_id, schema, new_jobs)
+
+    assert update_stored_schema.call_args_list[0].kwargs["force"] is False
+    truncate_calls = [
+        c.kwargs["truncate_tables"]
+        for c in initialize_storage.call_args_list
+        if "truncate_tables" in c.kwargs
+    ]
+    # nested user tables carry an explicit append disposition so only the root is truncated
+    assert truncate_calls == [{"event_user"}]
+    # nothing was applied via the package state
+    state = load.load_storage.normalized_packages.get_load_package_state(load_id)
+    assert "applied_truncated_tables" not in state
+    assert "applied_dropped_tables" not in state
+
+
+def test_init_client_staging_ddl_includes_jobless_tables() -> None:
+    """Issue #2862: a staging-eligible (merge) table chain without any jobs in the package still
+    gets staging DDL so its staging tables exist when followup jobs reference them ie. after the
+    staging dataset got dropped by the user."""
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    nothing_ = lambda _: False
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+
+    # the bot chain is merge (staging-eligible) and gets no jobs in this package
+    bot_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_bot")}
+    for table in get_nested_tables(schema.tables, "event_bot"):
+        table["write_disposition"] = "merge"
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_stored_schema,
+        patch.object(dummy_impl.DummyClient, "drop_tables"),
+    ):
+        with load.get_destination_client(schema) as client:
+            merge_ = (
+                lambda table_name: client.prepare_load_table(table_name)["write_disposition"]
+                == "merge"
+            )
+            init_client(client, schema, [event_user], {}, nothing_, merge_, nothing_)
+
+        # main + staging
+        assert update_stored_schema.call_count == 2
+        # main dataset: tables with jobs + dlt tables (always included)
+        assert update_stored_schema.call_args_list[0].kwargs["only_tables"] == {
+            "event_user",
+            "_dlt_loads",
+            "_dlt_version",
+        }
+        # staging DDL: the whole jobless merge chain; the append table with a job is not eligible
+        staging_ddl = update_stored_schema.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl == bot_chain | {"_dlt_version"}
+        # no staging-eligible table has jobs so nothing is truncated: both init calls are bare
+        assert initialize_storage.call_count == 2
+        assert all("truncate_tables" not in c.kwargs for c in initialize_storage.call_args_list)
+
+
+def test_init_client_staging_selective_filter() -> None:
+    """Athena-like iceberg filter: only certain tables are staging-eligible.
+
+    NOTE: the test uses append disposition with a staging filter that accepts bot chain tables.
+    In production, append tables only reach staging when a destination explicitly opts them in
+    (e.g. Athena returns True for iceberg tables regardless of disposition). The synthetic filter
+    here tests the filter mechanics in init_client, not a real destination scenario.
+    """
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    nothing_ = lambda _: False
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+    event_bot = ParsedLoadJobFileName("event_bot", "event_bot_id", 0, "jsonl")
+    bot_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_bot")}
+    selective_filter = lambda table_name: table_name in bot_chain
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_stored_schema,
+        patch.object(dummy_impl.DummyClient, "drop_tables"),
+    ):
+        with load.get_destination_client(schema) as client:
+            init_client(
+                client, schema, [event_user, event_bot], {}, nothing_, selective_filter, nothing_
+            )
+
+        assert update_stored_schema.call_count == 2
+        # staging DDL: full bot chain (from staging_data_tables) + _dlt_version
+        staging_ddl = update_stored_schema.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl == bot_chain | {"_dlt_version"}
+        assert "event_user" not in staging_ddl
+        # staging truncation: only event_bot (has job + passes filter, append skips children)
+        # main has no truncation (bare init at index 0); staging bare init (1) + truncate (2)
+        staging_truncate = initialize_storage.call_args_list[2].kwargs["truncate_tables"]
+        assert staging_truncate == {"event_bot"}
+
+
+def test_init_client_staging_trimmed_schema() -> None:
+    """Checks if staging dataset holds schemas trimmed to only the tables that
+    are actually materialized in it.
+    """
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    nothing_ = lambda _: False
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+    event_bot = ParsedLoadJobFileName("event_bot", "event_bot_id", 0, "jsonl")
+    bot_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_bot")}
+    bot_only = lambda table_name: table_name in bot_chain
+
+    # capture the client schema at the time of each update_stored_schema call
+    seen_schemas: List[Schema] = []
+    clients: List[JobClientBase] = []
+
+    def capture_schema(*args: Any, **kwargs: Any) -> TSchemaTables:
+        seen_schemas.append(clients[0].schema)
+        return {}
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage"),
+        patch.object(dummy_impl.DummyClient, "update_stored_schema", side_effect=capture_schema),
+    ):
+        with load.get_destination_client(schema) as client:
+            clients.append(client)
+            init_client(client, schema, [event_user, event_bot], {}, nothing_, bot_only, nothing_)
+        # full schema restored on the client after staging init
+        assert client.schema is schema
+
+    main_schema, staging_schema = seen_schemas
+    # main dataset update uses the full package schema
+    assert main_schema is schema
+    # staging schema holds only the staging-eligible chain and dlt tables
+    assert set(staging_schema.tables.keys()) == bot_chain | set(schema.dlt_table_names())
+    # trimmed schema has consistent version and hash of its own content
+    assert not staging_schema.is_modified
+    assert staging_schema.stored_version_hash != schema.stored_version_hash
+
+    # a nested table may be staging-eligible while its ancestors are not (ie. own merge
+    # disposition under a replace root). the trimmed schema keeps such nested table without
+    # its parents, mirroring what is actually materialized in the staging dataset
+    nested_bot = next(
+        t["name"] for t in get_nested_tables(schema.tables, "event_bot") if t.get("parent")
+    )
+    nested_only = lambda table_name: table_name == nested_bot
+
+    seen_schemas.clear()
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage"),
+        patch.object(
+            dummy_impl.DummyClient, "update_stored_schema", side_effect=capture_schema
+        ) as update_stored_schema,
+    ):
+        with load.get_destination_client(schema) as client:
+            clients[0] = client
+            init_client(
+                client, schema, [event_user, event_bot], {}, nothing_, nested_only, nothing_
+            )
+
+    _, staging_schema = seen_schemas
+    assert set(staging_schema.tables.keys()) == {nested_bot} | set(schema.dlt_table_names())
+    assert not staging_schema.is_modified
+    # only the nested table is created in the staging dataset
+    staging_ddl = update_stored_schema.call_args_list[1].kwargs["only_tables"]
+    assert staging_ddl == {nested_bot, "_dlt_version"}
+
+
+def test_init_client_staging_dlt_tables_with_jobs() -> None:
+    """Athena regression fix: dlt tables with seen-data and jobs appear in staging DDL."""
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    nothing_ = lambda _: False
+    all_ = lambda _: True
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+    dlt_loads_job = ParsedLoadJobFileName("_dlt_loads", "dlt_loads_id", 0, "jsonl")
+    all_data = set(schema.data_table_names())
+
+    # simulate a dlt table that has seen data (like _dlt_pipeline_state on Athena with force_iceberg)
+    schema.tables["_dlt_loads"].setdefault("x-normalizer", {})["seen-data"] = True
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_stored_schema,
+        patch.object(dummy_impl.DummyClient, "drop_tables"),
+    ):
+        with load.get_destination_client(schema) as client:
+            init_client(client, schema, [event_user, dlt_loads_job], {}, nothing_, all_, all_)
+
+        assert update_stored_schema.call_count == 2
+        # staging DDL: all data tables + _dlt_version + _dlt_loads (dlt table enters via
+        # staging_tables_with_jobs, not staging_data_tables which excludes dlt tables)
+        staging_ddl = update_stored_schema.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl == all_data | {"_dlt_version", "_dlt_loads"}
+        # staging truncation includes both tables with jobs
+        staging_truncate = initialize_storage.call_args_list[2].kwargs["truncate_tables"]
+        assert staging_truncate == {"event_user", "_dlt_loads"}
+
+
+def test_init_client_staging_destination_vs_final_destination() -> None:
+    """Different staging filters for final vs staging destination produce different DDL sets."""
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage,
+        ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"],
+        write_disposition="merge",
+    )
+    nothing_ = lambda _: False
+    event_user = ParsedLoadJobFileName("event_user", "event_user_id", 0, "jsonl")
+    event_bot = ParsedLoadJobFileName("event_bot", "event_bot_id", 0, "jsonl")
+    bot_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_bot")}
+    user_chain = {t["name"] for t in get_nested_tables(schema.tables, "event_user")}
+    jobs = [event_user, event_bot]
+
+    # final destination filter: only bot chain needs staging dataset (simulates iceberg tables)
+    final_dest_filter = lambda table_name: table_name in bot_chain
+    # staging destination filter: only user chain needs staging dataset
+    staging_dest_filter = lambda table_name: table_name in user_chain
+
+    # call 1: final destination with final_dest_filter
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as init_storage_1,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_schema_1,
+        patch.object(dummy_impl.DummyClient, "drop_tables"),
+    ):
+        with load.get_destination_client(schema) as client:
+            init_client(client, schema, jobs, {}, nothing_, final_dest_filter, nothing_)
+
+        assert update_schema_1.call_count == 2
+        staging_ddl_1 = update_schema_1.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl_1 == bot_chain | {"_dlt_version"}
+        assert not (user_chain & staging_ddl_1)
+        # main has no truncation (bare init at index 0); staging bare init (1) + truncate (2)
+        staging_trunc_1 = init_storage_1.call_args_list[2].kwargs["truncate_tables"]
+        assert staging_trunc_1 == bot_chain  # merge expands full chain
+
+    # call 2: staging destination with staging_dest_filter
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as init_storage_2,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_schema_2,
+        patch.object(dummy_impl.DummyClient, "drop_tables"),
+    ):
+        with load.get_destination_client(schema) as client:
+            init_client(client, schema, jobs, {}, nothing_, staging_dest_filter, nothing_)
+
+        assert update_schema_2.call_count == 2
+        staging_ddl_2 = update_schema_2.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl_2 == user_chain | {"_dlt_version"}
+        assert not (bot_chain & staging_ddl_2)
+        staging_trunc_2 = init_storage_2.call_args_list[2].kwargs["truncate_tables"]
+        assert staging_trunc_2 == user_chain  # merge expands full chain
+
+
+def test_init_client_staging_drop_tables_without_staging_eligible() -> None:
+    """Drop tables triggers staging dataset init even when no tables are staging-eligible."""
+    load = setup_loader()
+    _, schema = prepare_load_package(
+        load.load_storage, ["event_user.b1d32c6660b242aaabbf3fc27245b7e6.0.insert_values"]
+    )
+    nothing_ = lambda _: False
+    all_ = lambda _: True
+    # no jobs at all — staging would normally be skipped
+    # but we have tables to drop (simulating dlt.pipeline.drop() request)
+    dropped_table = schema.get_table("event_bot")
+
+    with (
+        patch.object(dummy_impl.DummyClient, "initialize_storage") as initialize_storage,
+        patch.object(dummy_impl.DummyClient, "update_stored_schema") as update_stored_schema,
+        patch.object(dummy_impl.DummyClient, "drop_tables") as drop_tables,
+        patch.object(dummy_impl.DummyClient, "is_storage_initialized", return_value=True),
+    ):
+        with load.get_destination_client(schema) as client:
+            # nothing_ staging filter: no tables are staging-eligible
+            # but drop_tables has a table and drop_staging_filter=all_ lets it through
+            init_client(
+                client,
+                schema,
+                [],
+                {},
+                nothing_,
+                nothing_,
+                all_,
+                drop_tables=[dropped_table],
+            )
+
+        # staging dataset init is entered because of drop_table_names
+        assert update_stored_schema.call_count == 2
+        # staging DDL: only _dlt_version (no staging-eligible data tables)
+        staging_ddl = update_stored_schema.call_args_list[1].kwargs["only_tables"]
+        assert staging_ddl == {"_dlt_version"}
+        assert initialize_storage.call_count == 2
+        assert initialize_storage.call_args_list[0].kwargs == {}
+        assert initialize_storage.call_args_list[1].kwargs == {}
+        # drop_tables called on both main and staging datasets
+        assert drop_tables.call_count == 2
+        assert drop_tables.call_args_list[0].args == ("event_bot",)
+        assert drop_tables.call_args_list[1].args == ("event_bot",)
+
+        initialize_storage.reset_mock()
+        update_stored_schema.reset_mock()
+        drop_tables.reset_mock()
+
+        # selective drop_staging_filter: block the drop on staging
+        with load.get_destination_client(schema) as client:
+            init_client(
+                client,
+                schema,
+                [],
+                {},
+                nothing_,
+                nothing_,
+                nothing_,
+                drop_tables=[dropped_table],
+            )
+
+        # nothing dropped anywhere: drop_staging_filter rejected the dropped table so
+        # drop_table_names is empty for both the main and the staging dataset
+        assert update_stored_schema.call_count == 1
+        drop_tables.assert_not_called()
+
+
+def test_dummy_staging_filesystem() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(completed_prob=1.0), filesystem_staging=True
+    )
+    assert_complete_job(load)
+    # two reference jobs
+    assert len(dummy_impl.JOBS) == 2
+    assert len(dummy_impl.CREATED_FOLLOWUP_JOBS) == 0
+
+
+def test_load_multiple_packages() -> None:
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load.config.pool_type = "none"
+    load_id_1, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    sleep(0.1)
+    load_id_2, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    run_metrics = load.run(None)
+    assert run_metrics.pending_items == 1
+    # assert load._current_load_id is None
+    metrics_id_1 = load._job_metrics
+    assert len(metrics_id_1) == 2
+    assert load._step_info_metrics(load_id_1)[0]["job_metrics"] == metrics_id_1
+    run_metrics = load.run(None)
+    assert run_metrics.pending_items == 0
+    metrics_id_2 = load._job_metrics
+    assert len(metrics_id_2) == 2
+    assert load._step_info_metrics(load_id_2)[0]["job_metrics"] == metrics_id_2
+    load_info = load.get_step_info(MockPipeline("pipe", True))  # type: ignore[abstract]
+    assert load_id_1 in load_info.metrics
+    assert load_id_2 in load_info.metrics
+    assert load_info.metrics[load_id_1][0]["job_metrics"] == metrics_id_1
+    assert load_info.metrics[load_id_2][0]["job_metrics"] == metrics_id_2
+    # execute empty run
+    load.run(None)
+    assert len(load_info.metrics) == 2
+
+
+def test_followup_job_ids_in_metrics() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(completed_prob=1.0, create_followup_jobs=True)
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+    with ThreadPoolExecutor() as pool:
+        load.run(pool)
+
+    # original jobs should have followup_jobs set (reference job IDs)
+    # followup (reference) jobs should have empty followup_jobs
+    for job_id, m in load._job_metrics.items():
+        if job_id in dummy_impl.CREATED_FOLLOWUP_JOBS:
+            # this is a followup job
+            assert not m.followup_jobs
+        else:
+            # this is an original job - should reference its followup
+            assert m.followup_jobs
+            assert len(m.followup_jobs) == 1
+            assert m.followup_jobs[0] in dummy_impl.CREATED_FOLLOWUP_JOBS
+
+
+def test_table_chain_followup_ids_in_metrics() -> None:
+    load = setup_loader(
+        client_config=DummyClientConfiguration(
+            completed_prob=1.0, create_followup_table_chain_reference_jobs=True
+        ),
+    )
+    load_id, _ = prepare_load_package(load.load_storage, NORMALIZED_FILES, jobs_per_case=10)
+    with ThreadPoolExecutor() as pool:
+        load.run(pool)
+
+    # 2 chain followup jobs (one per root table)
+    chain_followup_ids = set(dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS.keys())
+    assert len(chain_followup_ids) == 2
+
+    # all original jobs are predecessors of the chain followup (fan-in)
+    for job_id, m in load._job_metrics.items():
+        if job_id in chain_followup_ids:
+            # chain followup jobs are terminal
+            assert not m.followup_jobs
+        else:
+            # every original job should reference its chain followup
+            assert m.followup_jobs
+            assert len(m.followup_jobs) == 1
+            assert m.followup_jobs[0] in chain_followup_ids
+
+
+def test_job_metrics_persisted_and_restored() -> None:
+    from dlt.common.metrics import LoadJobMetrics
+
+    load = setup_loader(client_config=DummyClientConfiguration(completed_prob=1.0))
+    load_id, schema = prepare_load_package(load.load_storage, NORMALIZED_FILES)
+
+    # write a fake metric into the load package state before running
+    fake_metric = LoadJobMetrics(
+        job_id="fake_table.fake_id.jsonl",
+        file_path="/fake/path",
+        table_name="fake_table",
+        started_at=pendulum.now(),
+        finished_at=pendulum.now(),
+        state="completed",
+        remote_url=None,
+        retry_count=0,
+        followup_jobs=["fake_followup.abc.reference"],
+    )
+    state = load.load_storage.normalized_packages.get_load_package_state(load_id)
+    state["load_metrics"] = {fake_metric.job_id: fake_metric._asdict()}
+    load.load_storage.normalized_packages.save_load_package_state(load_id, state)
+
+    with ThreadPoolExecutor() as pool:
+        load.run(pool)
+
+    # should contain both the fake metric and the real job metrics
+    assert "fake_table.fake_id.jsonl" in load._job_metrics
+    restored_fake = load._job_metrics["fake_table.fake_id.jsonl"]
+    assert restored_fake.state == "completed"
+    assert restored_fake.followup_jobs == ["fake_followup.abc.reference"]
+
+    # real jobs should also be present
+    real_job_ids = {jid for jid in load._job_metrics if jid != "fake_table.fake_id.jsonl"}
+    assert len(real_job_ids) == 2
+
+    # verify the loaded package state has load_metrics persisted
+    loaded_state = load.load_storage.loaded_packages.get_load_package_state(load_id)
+    assert "load_metrics" in loaded_state
+    assert "fake_table.fake_id.jsonl" in loaded_state["load_metrics"]
+    assert len(loaded_state["load_metrics"]) == 3  # fake + 2 real
+
+
+def test_terminal_exceptions() -> None:
+    try:
+        raise TerminalValueError("a")
+    except TerminalException:
+        assert True
+    else:
+        raise AssertionError()
+
+
+def assert_job_metrics(job: RunnableLoadJob, expected_state: str) -> None:
+    metrics = job.metrics()
+    assert metrics.state == expected_state
+    assert metrics.started_at <= metrics.finished_at
+    assert metrics.job_id == job.job_id()
+    assert metrics.table_name == job._parsed_file_name.table_name
+    assert metrics.file_path == job._file_path
+
+
+def assert_complete_job(
+    load: Load, should_delete_completed: bool = False, load_id: str = None, jobs_per_case: int = 1
+) -> None:
+    if not load_id:
+        load_id, _ = prepare_load_package(
+            load.load_storage, NORMALIZED_FILES, jobs_per_case=jobs_per_case
+        )
+    # will complete all jobs
+    timestamp = "2024-04-05T09:16:59.942779Z"
+    mocked_timestamp = {"state": {"created_at": timestamp}}
+    with (
+        mock.patch(
+            "dlt.current.load_package_state",
+            return_value=mocked_timestamp,
+        ),
+        patch.object(
+            dummy_impl.DummyClient,
+            "complete_load",
+        ) as complete_load,
+    ):
+        with ThreadPoolExecutor() as pool:
+            load.run(pool)
+
+            # moved to loaded
+            assert not load.load_storage.storage.has_folder(
+                load.load_storage.get_normalized_package_path(load_id)
+            )
+            completed_path = load.load_storage.loaded_packages.get_job_state_folder_path(
+                load_id, "completed_jobs"
+            )
+
+            # should have migrated the schema
+            assert load.load_storage.storage.has_file(
+                os.path.join(
+                    load.load_storage.get_loaded_package_path(load_id),
+                    PackageStorage.APPLIED_SCHEMA_UPDATES_FILE_NAME,
+                )
+            )
+
+            if should_delete_completed:
+                # package was deleted
+                assert not load.load_storage.loaded_packages.storage.has_folder(completed_path)
+            else:
+                # package not deleted
+                assert load.load_storage.loaded_packages.storage.has_folder(completed_path)
+            # complete load on client was called
+            complete_load.assert_called_once_with(load_id)
+            # assert if all jobs in final state have metrics
+            metrics = load.get_step_info(MockPipeline("pipe", True)).metrics[load_id][0]  # type: ignore[abstract]
+            package_info = load.load_storage.loaded_packages.get_load_package_jobs(load_id)
+            for state, jobs in package_info.items():
+                for job in jobs:
+                    job_metrics = metrics["job_metrics"].get(job.job_id())
+                    if state in ("failed_jobs", "completed_jobs"):
+                        assert job_metrics is not None
+                        assert (
+                            metrics["job_metrics"][job.job_id()].state == "failed"
+                            if state == "failed_jobs"
+                            else "completed"
+                        )
+                        remote_url = job_metrics.remote_url
+                        if load.initial_client_config.create_followup_jobs:  # type: ignore
+                            assert remote_url.endswith(job.file_name())
+                        elif load.is_staging_destination_job(job.file_name()):
+                            # staging destination should contain reference to remote filesystem
+                            assert (
+                                FilesystemConfiguration.make_file_url(REMOTE_FILESYSTEM)
+                                in remote_url
+                            )
+                        else:
+                            assert remote_url is None
+                        # followup_jobs: jobs that are themselves followups should
+                        # not have followup_jobs set; if followup_jobs is set,
+                        # each referenced id must exist as a completed job
+                        followup_jobs = job_metrics.followup_jobs
+                        is_followup = (
+                            job.job_id() in dummy_impl.CREATED_FOLLOWUP_JOBS
+                            or job.job_id() in dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS
+                        )
+                        if is_followup:
+                            assert not followup_jobs
+                        elif followup_jobs:
+                            all_completed_ids = {j.job_id() for j in package_info["completed_jobs"]}
+                            for fup_id in followup_jobs:
+                                assert fup_id in all_completed_ids
+                    else:
+                        assert job_metrics is None
+
+
+def run_all(load: Load) -> None:
+    pool = ThreadPoolExecutor()
+    while True:
+        metrics = load.run(pool)
+        if metrics.pending_items == 0:
+            return
+        sleep(0.1)
+
+
+def setup_loader(
+    delete_completed_jobs: bool = False,
+    client_config: DummyClientConfiguration = None,
+    loader_config: LoaderConfiguration = None,
+    filesystem_staging: bool = False,
+) -> Load:
+    # reset jobs for a test
+    dummy_impl.JOBS = {}
+    dummy_impl.CREATED_FOLLOWUP_JOBS = {}
+    dummy_impl.RETRIED_JOBS = {}
+    dummy_impl.CREATED_TABLE_CHAIN_FOLLOWUP_JOBS = {}
+
+    client_config = client_config or DummyClientConfiguration(
+        loader_file_format="jsonl", completed_prob=1
+    )
+    destination: AnyDestination = dummy(**client_config)  # type: ignore[assignment]
+    # setup
+    staging_system_config = None
+    staging = None
+    if filesystem_staging:
+        # do not accept jsonl to not conflict with filesystem destination
+        # client_config = client_config or DummyClientConfiguration(
+        #     loader_file_format="reference", completed_prob=1
+        # )
+        staging_system_config = FilesystemDestinationClientConfiguration()._bind_dataset_name(
+            dataset_name="dummy"
+        )
+        staging_system_config.as_staging_destination = True
+        os.makedirs(REMOTE_FILESYSTEM)
+        staging = filesystem(bucket_url=REMOTE_FILESYSTEM)
+    # patch destination to provide client_config
+    # destination.client = lambda schema: dummy_impl.DummyClient(schema, client_config)
+    # setup loader
+    with TEST_DICT_CONFIG_PROVIDER().values({"delete_completed_jobs": delete_completed_jobs}):
+        return Load(
+            destination,
+            initial_client_config=client_config,
+            config=loader_config,
+            staging_destination=staging,  # type: ignore[arg-type]
+            initial_staging_client_config=staging_system_config,
+        )

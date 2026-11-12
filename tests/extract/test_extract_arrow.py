@@ -1,0 +1,359 @@
+"""Tests for arrow data extraction with column name normalization.
+
+Verifies that ArrowExtractor properly normalizes column names during extraction
+and does not produce mixed normalized/non-normalized identifiers in the schema.
+"""
+
+import os
+from typing import Any, List
+
+import pyarrow as pa
+import pytest
+from pytest_mock import MockerFixture
+
+import dlt
+from dlt.common import Decimal
+from dlt.common.storages import (
+    SchemaStorage,
+    SchemaStorageConfiguration,
+    NormalizeStorageConfiguration,
+)
+from dlt.common.libs.pandas import pandas
+from dlt.common.libs.pydantic import ValidationError, BaseModel
+
+from dlt.dataset.relation import Relation
+from dlt.extract.validation import PydanticValidator
+from dlt.extract import DltSource
+from dlt.extract.extract import Extract
+from dlt.extract.extractors import ArrowExtractor
+from dlt.extract.hints import make_hints
+
+from tests.utils import clean_test_storage, get_test_storage_root
+from tests.extract.utils import assert_written_tables_are_computed
+
+
+@pytest.fixture
+def extract_step() -> Extract:
+    clean_test_storage(init_normalize=True)
+    schema_storage = SchemaStorage(
+        SchemaStorageConfiguration(
+            schema_volume_path=os.path.join(get_test_storage_root(), "schemas")
+        ),
+        makedirs=True,
+    )
+    return Extract(schema_storage, NormalizeStorageConfiguration())
+
+
+def test_arrow_mixed_case_columns_normalized(extract_step: Extract) -> None:
+    """Arrow table with PascalCase columns must produce only snake_case columns in schema.
+
+    Reproduces the bug where aliasing between `computed` and `arrow_table` in
+    ArrowExtractor._compute_tables caused non-normalized column names to be merged
+    into the schema alongside normalized ones, leading to NameNormalizationCollision
+    in the normalizer.
+    """
+    table = pa.table({"Numbers": [1, 2, 3], "Strings": ["a", "b", "c"]})
+
+    @dlt.resource(name="mixed_case")
+    def mixed_case_resource():
+        yield table
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [mixed_case_resource])
+    extract_step.extract(source, 20, 1)
+
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    assert arrow_extractor.computed_tables == {"mixed_case"}
+    assert arrow_extractor.tables_with_items == {"mixed_case"}
+    assert arrow_extractor.tables_with_empty == set()
+    assert_written_tables_are_computed(arrow_extractor)
+
+    schema_table = source.schema.tables["mixed_case"]
+    col_names = list(schema_table["columns"].keys())
+    # only normalized (lowercase) names should be present
+    assert "numbers" in col_names
+    assert "strings" in col_names
+    # non-normalized names must not appear
+    assert "Numbers" not in col_names
+    assert "Strings" not in col_names
+    assert len(col_names) == 2
+
+
+def test_arrow_columns_merge_with_resource_hints(extract_step: Extract) -> None:
+    """Resource column hints must merge correctly with arrow-inferred columns after normalization.
+
+    When a resource defines column hints with non-normalized names and yields arrow data
+    with matching columns, the resulting schema should have only normalized column names
+    and preserve the hint properties (like data_type).
+    """
+    table = pa.table(
+        {
+            "Numbers": [1, 2, 3],
+            "Strings": ["a", "b", "c"],
+            "Amount": pa.array([Decimal("1.25")] * 3, type=pa.decimal128(10, 2)),
+        }
+    )
+
+    @dlt.resource(
+        name="with_hints",
+        columns={
+            "Numbers": {"data_type": "bigint"},
+            "Strings": {"data_type": "text"},
+            # hint changes the arrow data type so arrow precision and scale must not survive
+            "Amount": {"data_type": "text", "precision": 50},
+            # nullable hint-only column not present in arrow data
+            "ExtraCol": {"data_type": "double", "nullable": True},
+        },
+    )
+    def hinted_resource():
+        yield table
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [hinted_resource])
+    extract_step.extract(source, 20, 1)
+
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    assert arrow_extractor.computed_tables == {"with_hints"}
+    assert arrow_extractor.tables_with_items == {"with_hints"}
+    assert_written_tables_are_computed(arrow_extractor)
+
+    schema_table = source.schema.tables["with_hints"]
+    col_names = list(schema_table["columns"].keys())
+    # only normalized names
+    assert "numbers" in col_names
+    assert "strings" in col_names
+    assert "Numbers" not in col_names
+    assert "Strings" not in col_names
+    assert "ExtraCol" not in col_names
+    # hint properties preserved through normalization
+    assert schema_table["columns"]["numbers"]["data_type"] == "bigint"
+    assert schema_table["columns"]["strings"]["data_type"] == "text"
+    assert schema_table["columns"]["amount"] == {
+        "name": "amount",
+        "nullable": True,
+        "data_type": "text",
+        "precision": 50,
+    }
+    # hint-only column not in arrow data is still in the schema with normalized name
+    assert "extra_col" in col_names
+    assert schema_table["columns"]["extra_col"]["data_type"] == "double"
+    assert schema_table["columns"]["extra_col"]["nullable"] is True
+
+
+def test_arrow_multiple_items_mixed_case(extract_step: Extract) -> None:
+    """Multiple arrow items in a batch must produce only normalized columns.
+
+    Tests the accumulation path in ArrowExtractor._compute_tables where
+    arrow_tables.get(table_name) returns a previously processed result
+    and merges with the next item's schema. The third table has an already-normalized
+    column name ("strings") mixed with a non-normalized one ("Numbers").
+    """
+    table1 = pa.table({"Numbers": [1, 2], "Strings": ["a", "b"]})
+    table2 = pa.table({"Numbers": [3, 4], "Strings": ["c", "d"]})
+    # third table: "strings" is already normalized, "Numbers" is not
+    table3 = pa.table({"Numbers": [5, 6], "strings": ["e", "f"]})
+
+    @dlt.resource(
+        name="multi_items",
+        columns={
+            "Numbers": {"data_type": "bigint"},
+            # hint-only column not present in any arrow table
+            "ExtraHint": {"data_type": "text", "nullable": True},
+        },
+    )
+    def multi_item_resource():
+        yield [table1, table2, table3]
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [multi_item_resource])
+    extract_step.extract(source, 20, 1)
+
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    assert arrow_extractor.computed_tables == {"multi_items"}
+    assert arrow_extractor.tables_with_items == {"multi_items"}
+    assert_written_tables_are_computed(arrow_extractor)
+
+    schema_table = source.schema.tables["multi_items"]
+    col_names = list(schema_table["columns"].keys())
+    assert "numbers" in col_names
+    assert "strings" in col_names
+    assert "Numbers" not in col_names
+    assert "Strings" not in col_names
+    # hint-only column persisted with normalized name
+    assert "extra_hint" in col_names
+    assert "ExtraHint" not in col_names
+    assert schema_table["columns"]["extra_hint"]["data_type"] == "text"
+    assert schema_table["columns"]["extra_hint"]["nullable"] is True
+    # hint data_type preserved on arrow-inferred column
+    assert schema_table["columns"]["numbers"]["data_type"] == "bigint"
+    assert len(col_names) == 3
+
+
+def test_arrow_columns_with_special_chars_normalized(extract_step: Extract) -> None:
+    """Arrow columns with special characters are properly normalized in the schema.
+
+    Characters like ^ are replaced with _ during normalization. Verifies the full
+    normalization pipeline works without mixing normalized and non-normalized identifiers.
+    """
+    table = pa.table({"col^New": [1, 2, 3], "col2": [4, 5, 6]})
+
+    @dlt.resource(name="special_chars")
+    def special_chars_resource():
+        yield table
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [special_chars_resource])
+    extract_step.extract(source, 20, 1)
+
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    assert arrow_extractor.computed_tables == {"special_chars"}
+    assert arrow_extractor.tables_with_items == {"special_chars"}
+    assert_written_tables_are_computed(arrow_extractor)
+
+    schema_table = source.schema.tables["special_chars"]
+    col_names = list(schema_table["columns"].keys())
+    # col^New should be normalized to col_new
+    assert "col_new" in col_names
+    assert "col2" in col_names
+    assert "col^New" not in col_names
+    assert len(col_names) == 2
+
+
+def test_arrow_empty_table_tracked_as_with_items(extract_step: Extract) -> None:
+    """An arrow table with no rows is still written (to define the schema)"""
+    empty = pa.table({"id": pa.array([], type=pa.int64()), "name": pa.array([], type=pa.string())})
+
+    @dlt.resource(name="empty_arrow")
+    def empty_arrow_resource():
+        yield empty
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [empty_arrow_resource])
+    extract_step.extract(source, 20, 1)
+
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    # the empty arrow table is computed and counts as "with items" (the ArrowExtractor branch),
+    # not as an empty materialized list
+    assert arrow_extractor.computed_tables == {"empty_arrow"}
+    assert arrow_extractor.tables_with_items == {"empty_arrow"}
+    assert arrow_extractor.tables_with_empty == set()
+    assert_written_tables_are_computed(arrow_extractor)
+
+
+def _computed_table_names(spy: Any) -> List[str]:
+    return [call.args[2] for call in spy.call_args_list]
+
+
+def test_arrow_table_computed_for_new_arrow_fields(
+    extract_step: Extract, mocker: MockerFixture
+) -> None:
+    # a changed arrow type is written to a new file
+    os.environ["DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS"] = "default"
+    spy = mocker.spy(ArrowExtractor, "_compute_and_update_tables")
+    narrow = pa.table({"Id": [1], "Value": ["a"]})
+    wide = pa.table({"Id": [2], "Value": ["b"], "Extra": [1.5]})
+
+    @dlt.resource(name="items")
+    def arrow_items():
+        yield narrow
+        # same fields in a new object, with other metadata or in a batch use the cached table
+        yield narrow.slice(0)
+        yield narrow.replace_schema_metadata({"source": "page 2"})
+        yield narrow.to_batches()[0]
+        # a new field computes the table again
+        yield wide
+        yield [wide, narrow]
+        # a subset of the last computed fields and null fields use the cached table
+        yield narrow
+        yield pa.table({"Extra": [2.5]})
+        yield pa.table({"Id": [3], "Value": pa.nulls(1)})
+        # a changed field type computes the table again
+        yield pa.table({"Id": [4], "Value": pa.array(["c"], pa.large_string())})
+        yield narrow
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [arrow_items])
+    extract_step.extract(source, 20, 1)
+
+    assert _computed_table_names(spy) == ["items"] * 4
+    assert list(source.schema.tables["items"]["columns"]) == ["id", "value", "extra"]
+    arrow_extractor = extract_step._last_extractors["arrow"]
+    assert arrow_extractor.tables_with_items == {"items"}
+    assert_written_tables_are_computed(arrow_extractor)
+
+
+def test_arrow_cached_table_applies_new_hints(extract_step: Extract, mocker: MockerFixture) -> None:
+    spy = mocker.spy(ArrowExtractor, "_compute_and_update_tables")
+    table = pa.table({"id": [1], "value": ["a"]})
+
+    # hints that depend on data compute the table for each item
+    @dlt.resource(
+        name="dynamic_hints",
+        table_name=lambda t: "dynamic_hints",
+        columns=lambda t: {"value": {"description": t["value"][0].as_py()}},
+    )
+    def dynamic_hints():
+        yield table
+        yield pa.table({"id": [2], "value": ["b"]})
+
+    # hints set while yielding compute the table again
+    @dlt.resource(name="marked_hints")
+    def marked_hints():
+        yield table
+        yield dlt.mark.with_hints(
+            table, make_hints(columns=[{"name": "value", "description": "marked"}])
+        )
+
+    # resources writing to the same table merge their hints
+    @dlt.resource(name="first", table_name="shared", columns={"id": {"description": "first"}})
+    def first():
+        yield table
+        yield table
+
+    @dlt.resource(name="second", table_name="shared", columns={"value": {"unique": True}})
+    def second():
+        yield table
+        yield table
+
+    source = DltSource(
+        dlt.Schema("arrow_test"), "module", [dynamic_hints, marked_hints, first, second]
+    )
+    extract_step.extract(source, 20, 1)
+
+    computed = _computed_table_names(spy)
+    assert computed.count("dynamic_hints") == 2
+    assert computed.count("marked_hints") == 2
+    tables = source.schema.tables
+    assert tables["dynamic_hints"]["columns"]["value"]["description"] == "b"
+    assert tables["marked_hints"]["columns"]["value"]["description"] == "marked"
+    assert tables["shared"]["columns"]["id"]["description"] == "first"
+    assert tables["shared"]["columns"]["value"]["unique"] is True
+
+
+def test_pydantic_validator_passes_through_non_object_items() -> None:
+    """Arrow tables, pandas DataFrames, and Relations skip pydantic validation."""
+
+    class SimpleModel(BaseModel):
+        a: int
+        b: str
+
+    validator = PydanticValidator(SimpleModel, column_mode="freeze", data_mode="freeze")
+    validator.table_name = "test_table"
+
+    # arrow table passes through
+    arrow_table = pa.table({"a": [1, 2], "b": ["x", "y"]})
+    assert validator(arrow_table) is arrow_table
+
+    # arrow record batch passes through
+    batch = arrow_table.to_batches()[0]
+    assert validator(batch) is batch
+
+    # pandas dataframe passes through
+    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+    assert validator(df) is df
+
+    # Relation passes through
+    class FakeRelation(Relation):
+        def __init__(self) -> None:
+            pass
+
+    rel = FakeRelation()
+    assert validator(rel) is rel
+
+    # unknown non-dict object raises the original pydantic ValidationError
+    with pytest.raises(ValidationError, match="model_type"):
+        validator(42)

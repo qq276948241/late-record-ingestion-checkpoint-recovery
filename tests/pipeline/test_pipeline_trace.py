@@ -1,0 +1,1250 @@
+from copy import deepcopy
+import io
+import os
+import asyncio
+import datetime  # noqa: 251
+from typing import Any, List, Set, cast
+from unittest.mock import patch
+import pytest
+import requests_mock
+import yaml
+
+import dlt
+
+from dlt.common import json, pendulum
+from dlt.common.configuration.specs import CredentialsConfiguration, RuntimeConfiguration
+from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContainer
+from dlt.common.configuration.utils import get_resolved_traces
+from dlt.common.exceptions import MissingDependencyException
+from dlt.common.metrics import TDataLocation, TDatasetDataLocation
+from dlt.common.pipeline import ExtractInfo, NormalizeInfo, LoadInfo
+from dlt.common.schema import Schema
+from dlt.common.runtime.exec_info import get_execution_context
+from dlt.common.runtime.telemetry import stop_telemetry
+from dlt.common.typing import DictStrAny, DictStrStr, TRefreshMode, TSecretValue
+from dlt.common.utils import digest128, uniq_id
+
+from dlt.destinations import dummy, filesystem
+
+from dlt.pipeline.exceptions import PipelineStepFailed
+from dlt.pipeline.pipeline import Pipeline
+from dlt.pipeline.trace import (
+    TRACE_ENGINE_VERSION,
+    PipelineTrace,
+    SerializableResolvedValueTrace,
+    load_trace,
+    save_trace,
+)
+from dlt.pipeline.track import slack_notify_load_success
+from dlt.extract import DltResource, DltSource
+from dlt.extract.extract import describe_extract_data
+from dlt.extract.pipe import Pipe
+from dlt.extract.items_transform import ItemTransform
+
+from tests.pipeline.utils import PIPELINE_TEST_CASES_PATH
+from tests.utils import get_test_storage_root, temporary_telemetry
+
+
+def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any) -> None:
+    dlt.secrets["load.delete_completed_jobs"] = True
+    # delete all traces collected before test run
+    get_resolved_traces().clear()
+
+    @dlt.source
+    def inject_tomls(
+        api_type=dlt.config.value,
+        credentials: CredentialsConfiguration = dlt.secrets.value,
+        secret_value: TSecretValue = TSecretValue("123"),  # noqa: B008
+    ):
+        @dlt.resource(write_disposition="replace", primary_key="id")
+        def data():
+            yield [{"id": 1}, {"id": 2}, {"id": 3}]
+
+        return data()
+
+    pipeline = dlt.pipeline(destination="dummy")
+
+    # read from secrets and configs directly
+    databricks_creds = "databricks+connector://token:<databricks_token>@<databricks_host>:443/<database_or_schema_name>?conn_timeout=15&search_path=a,b,c"
+    s = dlt.secrets["databricks.credentials"]
+    assert s == databricks_creds
+
+    extract_info = pipeline.extract(inject_tomls())
+    trace = pipeline.last_trace
+    assert trace is not None
+    assert trace.engine_version == TRACE_ENGINE_VERSION == 2
+    # assert p._trace is None
+    assert len(trace.steps) == 1
+    step = trace.steps[0]
+    assert step.step == "extract"
+    assert isinstance(step.started_at, datetime.datetime)
+    assert isinstance(step.finished_at, datetime.datetime)
+    assert isinstance(step.step_info, ExtractInfo)
+    assert step.step_info.extract_data_info == [{"name": "inject_tomls", "data_type": "source"}]
+    # check infos
+    extract_info = pipeline.last_trace.last_extract_info
+    assert isinstance(extract_info, ExtractInfo)
+    # should have single job and single load id
+    assert len(extract_info.loads_ids) == 1
+    load_id = extract_info.loads_ids[0]
+    assert len(extract_info.metrics) == 1
+
+    # extract of data in the first one
+    metrics = extract_info.metrics[load_id][0]
+    # inject tomls and dlt state
+    assert len(metrics["job_metrics"]) == 1
+    assert "data" in metrics["table_metrics"]
+    assert set(metrics["resource_metrics"].keys()) == {"data"}
+    assert metrics["schema_name"] == "inject_tomls"
+    # check dag and hints
+    assert metrics["dag"] == [("data", "data")]
+    assert metrics["hints"]["data"] == {"write_disposition": "replace", "primary_key": "id"}
+
+    metrics = extract_info.metrics[load_id][1]
+    # inject tomls and dlt state
+    assert len(metrics["job_metrics"]) == 1
+    assert "_dlt_pipeline_state" in metrics["table_metrics"]
+    assert set(metrics["resource_metrics"].keys()) == {"_dlt_pipeline_state"}
+    assert metrics["schema_name"] == "inject_tomls"
+    # check dag and hints
+    assert metrics["dag"] == [("_dlt_pipeline_state", "_dlt_pipeline_state")]
+    # state has explicit columns set
+    assert metrics["hints"]["_dlt_pipeline_state"]["original_columns"] == "dict"
+
+    # check packages
+    assert len(extract_info.load_packages) == 1
+    # two jobs
+    print(extract_info.load_packages[0])
+    assert len(extract_info.load_packages[0].jobs["new_jobs"]) == 2
+    assert extract_info.load_packages[0].state == "extracted"
+
+    # check config trace
+    resolved = _find_resolved_value(trace.resolved_config_values, "api_type", [])
+    assert resolved.config_type_name == "TestCreateTraceInjectTomlsConfiguration"
+    assert resolved.value == "REST"
+    assert resolved.is_secret_hint is False
+    assert resolved.default_value is None
+    assert resolved.provider_name == "config.toml"
+    # dictionaries are not returned anymore, secrets are masked
+    resolved = _find_resolved_value(trace.resolved_config_values, "credentials", [])
+    assert resolved is None or isinstance(resolved.value, str)
+    resolved = _find_resolved_value(trace.resolved_config_values, "secret_value", [])
+    assert resolved.is_secret_hint is True
+    assert resolved.value is None, "Credential is not masked"
+    assert resolved.default_value is None, "Credential is not masked"
+    resolved = _find_resolved_value(trace.resolved_config_values, "credentials", ["databricks"])
+    assert resolved.is_secret_hint is True
+    assert resolved.value is None, "Credential is not masked"
+    assert_trace_serializable(trace)
+
+    # activate pipeline because other was running in assert trace
+    pipeline.activate()
+
+    # extract with exception
+    @dlt.source
+    def async_exception(max_range=1):
+        async def get_val(v):
+            await asyncio.sleep(0.1)
+            if v % 3 == 0:
+                raise ValueError(v)
+            return v
+
+        @dlt.resource
+        def data():
+            yield from [get_val(v) for v in range(1, max_range)]
+
+        return data()
+
+    with pytest.raises(PipelineStepFailed):
+        pipeline.extract(async_exception())
+
+    trace = pipeline.last_trace
+    assert pipeline._trace is None
+    assert len(trace.steps) == 2
+    step = trace.steps[1]
+    assert step.step == "extract"
+    assert isinstance(step.step_exception, str)
+    assert isinstance(step.step_info, ExtractInfo)
+    assert len(step.exception_traces) > 0
+    assert step.step_info.extract_data_info == [{"name": "async_exception", "data_type": "source"}]
+    assert_trace_serializable(trace)
+
+    extract_info = step.step_info
+    # only new (unprocessed) package is present, all other metrics are empty, state won't be extracted
+    assert len(extract_info.loads_ids) == 1
+    load_id = extract_info.loads_ids[0]
+    package = extract_info.load_packages[0]
+    assert package.state == "new"
+    # no jobs - exceptions happened before save
+    assert len(package.jobs["new_jobs"]) == 0
+    # metrics should be collected
+    assert len(extract_info.metrics[load_id]) == 1
+
+    # normalize
+    norm_info = pipeline.normalize()
+    trace = pipeline.last_trace
+    assert pipeline._trace is None
+    assert len(trace.steps) == 3
+    step = trace.steps[2]
+    assert step.step == "normalize"
+    assert step.step_info is norm_info
+    assert_trace_serializable(trace)
+    assert isinstance(pipeline.last_trace.last_normalize_info, NormalizeInfo)
+    assert pipeline.last_trace.last_normalize_info.row_counts == {
+        "_dlt_pipeline_state": 1,
+        "data": 3,
+    }
+
+    assert len(norm_info.loads_ids) == 1
+    load_id = norm_info.loads_ids[0]
+    assert len(norm_info.metrics) == 1
+
+    # just one load package with single metrics
+    assert len(norm_info.metrics[load_id]) == 1
+    norm_metrics = norm_info.metrics[load_id][0]
+    # inject tomls and dlt state
+    assert len(norm_metrics["job_metrics"]) == 2
+    assert "data" in norm_metrics["table_metrics"]
+
+    # check packages
+    assert len(norm_info.load_packages) == 1
+    # two jobs
+    assert len(norm_info.load_packages[0].jobs["new_jobs"]) == 2
+    assert norm_info.load_packages[0].state == "normalized"
+
+    # load
+    os.environ["COMPLETED_PROB"] = "1.0"  # make it complete immediately
+    load_info = pipeline.load()
+    trace = pipeline.last_trace
+    assert pipeline._trace is None
+    assert len(trace.steps) == 4
+    step = trace.steps[3]
+    assert step.step == "load"
+    assert step.step_info is load_info
+    load_info = step.step_info  # type: ignore[assignment]
+
+    # check packages
+    assert len(load_info.load_packages) == 1
+    # two jobs
+    assert load_info.load_packages[0].state == "loaded"
+    assert len(load_info.load_packages[0].jobs["completed_jobs"]) == 2
+
+    resolved = _find_resolved_value(trace.resolved_config_values, "completed_prob", [])
+    assert resolved.is_secret_hint is False
+    assert resolved.value == "1.0"
+    assert resolved.config_type_name == "DummyClientConfiguration"
+    assert_trace_serializable(trace)
+    assert isinstance(pipeline.last_trace.last_load_info, LoadInfo)
+    pipeline.activate()
+
+    # copy trace to well known location so it can be used as fixture
+    # NOTE: uncomment block below to generate fixture for test_trace_backward_compat
+    # trace_dir = os.path.join(get_test_storage_root(), f"dlt.{dlt.__version__}")
+    # os.makedirs(trace_dir)
+    # save_trace(trace_dir, pipeline._last_trace)
+
+    # run resets the trace
+    load_info = inject_tomls().run()
+    trace = pipeline.last_trace
+    assert pipeline._trace is None
+    assert len(trace.steps) == 4  # extract, normalize, load, run
+    step = trace.steps[-1]  # the last one should be run
+    assert step.step == "run"
+    assert step.step_info is load_info
+    assert trace.steps[0].step_info is not extract_info
+
+    step = trace.steps[-2]  # the previous one should be load
+    assert step.step == "load"
+    assert step.step_info is load_info  # same load info
+    assert trace.steps[0].step_info is not extract_info
+    assert_trace_serializable(trace)
+    assert isinstance(pipeline.last_trace.last_load_info, LoadInfo)
+    assert isinstance(pipeline.last_trace.last_normalize_info, NormalizeInfo)
+    assert isinstance(pipeline.last_trace.last_extract_info, ExtractInfo)
+
+
+def test_trace_schema() -> None:
+    os.environ["DATA_WRITER__DISABLE_COMPRESSION"] = "True"
+    os.environ["RESTORE_FROM_DESTINATION"] = "False"
+
+    # mock runtime env
+    os.environ["CIRCLECI"] = "1"
+    os.environ["AWS_LAMBDA_FUNCTION_NAME"] = "lambda"
+
+    @dlt.source(section="many_hints")
+    def many_hints(
+        api_type=dlt.config.value,
+        credentials: str = dlt.secrets.value,
+        secret_value: TSecretValue = TSecretValue("123"),  # noqa: B008
+    ):
+        # TODO: create table / column schema from typed dicts, not explicitly
+        @dlt.resource(
+            write_disposition="replace",
+            primary_key="id",
+            table_format="delta",
+            file_format="jsonl",
+            schema_contract="evolve",
+            columns=[
+                {
+                    "name": "multi",
+                    "data_type": "decimal",
+                    "nullable": True,
+                    "cluster": True,
+                    "description": "unknown",
+                    "merge_key": True,
+                    "precision": 9,
+                    "scale": 3,
+                    "sort": True,
+                    "variant": True,
+                    "partition": True,
+                }
+            ],
+        )
+        def data(id_=dlt.sources.incremental("id")):
+            # a dataset read location, so the contract covers every field of the location type
+            # and its nested schemas / tables tables
+            dlt.current.resource().add_input(
+                TDatasetDataLocation(
+                    kind="dataset",
+                    resource_name="data",
+                    location="duckdb:///upstream.duckdb",
+                    version="Nz1p6EJnRUFLKgVMPBTDgw",
+                    schemas=[{"name": "upstream", "version_hash": "e8Yg4KzYbG1eYQzT5xkFAA"}],
+                    tables=["orders", "customers"],
+                    dataset_name="Upstream_DataSet",
+                    physical_dataset_name="upstream_data_set",
+                    destination_type="dlt.destinations.duckdb",
+                    destination_name="duckdb",
+                    destination_fingerprint="0Xtq0OYSuqDcRTxWTLZY",
+                    casefold="lower",
+                    case_sensitive=False,
+                )
+            )
+            yield [{"id": 1, "multi": "1.2"}, {"id": 2}, {"id": 3}]
+
+        # dict-shaped write_disposition (merge) and schema_contract, so the trace contract
+        # captures the nested hint columns
+        @dlt.resource(
+            write_disposition={"disposition": "merge", "strategy": "delete-insert"},
+            primary_key="id",
+            schema_contract={"tables": "evolve", "columns": "evolve", "data_type": "evolve"},
+        )
+        def merge_data():
+            yield [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]
+
+        # dict-shaped replace write_disposition
+        @dlt.resource(write_disposition={"disposition": "replace"})
+        def replace_data():
+            yield [{"id": 1}, {"id": 2}]
+
+        # scd2 merge strategy as a dict
+        @dlt.resource(write_disposition={"disposition": "merge", "strategy": "scd2"})
+        def scd2_data():
+            yield [{"id": 1, "val": "x"}, {"id": 2, "val": "y"}]
+
+        # merge conditions with a placeholder function and nested hints with a tuple path
+        day_scope: Any = {
+            "disposition": "merge",
+            "strategy": "delete-insert",
+            "source_filter": "id > 0",
+            "destination_scope": "day = {day}",
+        }
+        root_disposition: Any = {
+            **day_scope,
+            "extra_placeholders": {"day": lambda resource, table_name: "2026-10-01"},
+        }
+        parts_disposition: Any = {**day_scope, "extra_placeholders": {"day": "2026-10-01"}}
+
+        @dlt.resource(
+            write_disposition=root_disposition,
+            nested_hints={
+                "lines": dlt.mark.make_nested_hints(
+                    columns=[{"name": "day", "data_type": "date"}],
+                    parent_table_name="partition_data",
+                    schema_contract={
+                        "tables": "evolve",
+                        "columns": "evolve",
+                        "data_type": "evolve",
+                    },
+                    file_format="jsonl",
+                ),
+                ("lines", "parts"): dlt.mark.make_nested_hints(write_disposition=parts_disposition),
+                # a nested table with its own keys merges on its own
+                "items": dlt.mark.make_nested_hints(
+                    primary_key="id", merge_key="id", write_disposition="merge"
+                ),
+            },
+        )
+        def partition_data():
+            yield [
+                {
+                    "id": 1,
+                    "day": "2026-10-01",
+                    "lines": [{"day": "2026-10-01", "parts": []}],
+                    "items": [{"id": 1}],
+                }
+            ]
+
+        return data(), merge_data(), replace_data(), scd2_data(), partition_data()
+
+    @dlt.source
+    def github():
+        @dlt.resource
+        def get_shuffled_events():
+            # Add a custom metric
+            custom_metrics = dlt.current.resource_metrics()
+            custom_metrics["good_old_github"] = True
+            # record a read location so the contract covers inputs and their nested tables
+            dlt.current.resource().add_input(
+                cast(
+                    TDataLocation,
+                    {
+                        "kind": "rest_api",
+                        "location": "https://api.github.com",
+                        "version": "2022-11-28",
+                        "endpoints": ["/events"],
+                    },
+                )
+            )
+            for _ in range(1):
+                with open(
+                    "tests/normalize/cases/github.events.load_page_1_duck.json",
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    issues = json.load(f)
+                    yield issues
+
+        return get_shuffled_events()
+
+    @dlt.source
+    def async_exception(max_range=1):
+        async def get_val(v):
+            await asyncio.sleep(0.1)
+            if v % 3 == 0:
+                raise ValueError(v)
+            return v
+
+        @dlt.resource
+        def data():
+            yield from [get_val(v) for v in range(1, max_range)]
+
+        return data()
+
+    # create pipeline with staging to get remote_url in load step job_metrics
+    dummy_dest = dummy(
+        completed_prob=1.0, supported_merge_strategies=["delete-insert", "upsert", "scd2"]
+    )
+    pipeline = dlt.pipeline(
+        pipeline_name="test_trace_schema",
+        destination=dummy_dest,
+        staging=filesystem(
+            os.path.abspath(os.path.join(get_test_storage_root(), "_remote_filesystem"))
+        ),
+        dataset_name="various",
+    )
+
+    # mock config
+    os.environ["API_TYPE"] = "REST"
+    os.environ["SOURCES__MANY_HINTS__CREDENTIALS"] = "CREDS"
+
+    pipeline.run([many_hints(), github()])
+    # run again with refresh so the traces carry refresh mode and dropped/truncated tables
+    pipeline.run([many_hints(), github()], refresh="drop_sources")
+    trace_drop_sources = pipeline.last_trace
+    pipeline.run([many_hints(), github()], refresh="drop_data")
+
+    trace = pipeline.last_trace
+    pipeline._schema_storage.storage.save("trace.json", json.dumps(trace, pretty=True))
+
+    # load existing contract as schema and let it evolve with new columns/tables
+    with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
+        imported_schema = yaml.safe_load(f)
+    evolving_schema = Schema.from_dict(imported_schema, remove_processing_hints=True)
+
+    trace_pipeline = dlt.pipeline(
+        pipeline_name="test_trace_schema_traces", destination=dummy(completed_prob=1.0)
+    )
+    trace_pipeline.run([trace, trace_drop_sources], table_name="trace", schema=evolving_schema)
+
+    # add exception trace
+    with pytest.raises(PipelineStepFailed):
+        pipeline.extract(async_exception(max_range=4))
+
+    trace_exception = pipeline.last_trace
+    pipeline._schema_storage.storage.save(
+        "trace_exception.json", json.dumps(trace_exception, pretty=True)
+    )
+
+    trace_pipeline.run([trace_exception], table_name="trace")
+    inferred_trace_contract = trace_pipeline.schemas["trace"]
+    inferred_contract_str = inferred_trace_contract.to_pretty_yaml(remove_processing_hints=True)
+
+    # NOTE: this saves actual inferred contract (schema) to schema storage, move it to test cases if you update
+    # trace shapes
+    # TODO: create a proper schema for dlt trace and tables/columns
+    pipeline._schema_storage.storage.save("trace.schema.yaml", inferred_contract_str)
+    # a diagram of the trace tables next to the contract. pydbml is an optional dependency
+    try:
+        inferred_dbml = inferred_trace_contract.to_dbml(remove_processing_hints=True)
+        pipeline._schema_storage.storage.save("trace.schema.dbml", inferred_dbml)
+    except MissingDependencyException:
+        pass
+    # print(pipeline._schema_storage.storage.storage_path)
+
+    # reload the original contract and use it with freeze to verify no breaking changes
+    with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
+        contract_schema = yaml.safe_load(f)
+    trace_contract = Schema.from_dict(contract_schema, remove_processing_hints=True)
+    # compare pretty forms of the schemas, they must be identical
+    # NOTE: if this fails you can comment this out and use contract run below to find first offending difference
+    # assert trace_contract.to_pretty_yaml() == inferred_contract_str
+
+    # use trace contract to load data again
+    contract_trace_pipeline = dlt.pipeline(
+        pipeline_name="test_trace_schema_traces_contract", destination=dummy(completed_prob=1.0)
+    )
+    contract_trace_pipeline.run(
+        [trace_exception, trace, trace_drop_sources],
+        table_name="trace",
+        schema=trace_contract,
+        schema_contract="freeze",
+    )
+
+    # assert inferred_trace_contract.version_hash == trace_contract.version_hash
+
+    # print(trace_pipeline.schemas["trace"].to_pretty_yaml())
+    # print(pipeline._schema_storage.storage.storage_path)
+
+
+# def test_trace_schema_contract() -> None:
+
+
+@pytest.mark.parametrize(
+    "refresh,expected_dropped,expected_truncated",
+    [
+        ("drop_sources", {"items", "other"}, set()),
+        ("drop_data", set(), {"items", "other"}),
+    ],
+    ids=["drop-sources", "drop-data"],
+)
+def test_trace_refresh_and_table_drops(
+    refresh: TRefreshMode, expected_dropped: Set[str], expected_truncated: Set[str]
+) -> None:
+    """Refresh mode and dropped/truncated tables are exposed on step infos and in printouts."""
+    pipeline = dlt.pipeline(
+        pipeline_name="test_trace_refresh_" + uniq_id(),
+        destination="duckdb",
+        dev_mode=True,
+    )
+
+    @dlt.resource(write_disposition="replace")
+    def items():
+        yield [{"id": 1}, {"id": 2}]
+
+    @dlt.resource(write_disposition="append")
+    def other():
+        yield [{"x": "a"}]
+
+    info = pipeline.run([items(), other()])
+    # no refresh: the regular truncation of the replace table is not recorded
+    package = info.load_packages[0]
+    assert package.refresh is None
+    assert not package.dropped_tables
+    assert not package.truncated_tables
+    assert "with refresh" not in str(info)
+
+    info = pipeline.run([items(), other()], refresh=refresh)
+    package = info.load_packages[0]
+    assert package.refresh == refresh
+    assert set(package.dropped_tables or []) == expected_dropped
+    assert set(package.truncated_tables or []) == expected_truncated
+    assert f"with refresh '{refresh}'" in str(info)
+    # extract package exposes the tables requested to be dropped/truncated
+    extract_package = pipeline.last_trace.last_extract_info.load_packages[0]
+    assert extract_package.refresh == refresh
+    assert set(extract_package.dropped_tables or []) == expected_dropped
+    assert set(extract_package.truncated_tables or []) == expected_truncated
+
+    # a table dropped or truncated by refresh is written again, so it is still an output
+    outputs = {
+        location["resource_name"]: location
+        for metrics in info.metrics.values()
+        for location in metrics[0]["outputs"]
+    }
+    assert outputs["items"]["tables"] == ["items"]
+    assert outputs["other"]["tables"] == ["other"]
+    assert outputs["items"]["physical_dataset_name"] == info.dataset_name
+
+    assert_trace_serializable(pipeline.last_trace)
+
+
+def test_save_load_trace() -> None:
+    os.environ["COMPLETED_PROB"] = "1.0"
+    # delete all traces collected before test run
+    get_resolved_traces().clear()
+
+    info = dlt.pipeline().run([1, 2, 3], table_name="data", destination="dummy")
+    pipeline = dlt.pipeline()
+    # will get trace from working dir
+    trace = pipeline.last_trace
+    assert trace is not None
+    assert pipeline._trace is None
+    assert len(trace.steps) == 4 == len(info.pipeline.last_trace.steps)  # type: ignore[attr-defined]
+    step = trace.steps[-2]  # the previous to last one should be load
+    assert step.step == "load"
+    resolved = _find_resolved_value(trace.resolved_config_values, "completed_prob", [])
+    assert resolved.is_secret_hint is False
+    assert resolved.value == "1.0"
+    assert resolved.config_type_name == "DummyClientConfiguration"
+    assert_trace_serializable(trace)
+    # check row counts
+    assert pipeline.last_trace.last_normalize_info.row_counts == {
+        "_dlt_pipeline_state": 1,
+        "data": 3,
+    }
+    # reactivate the pipeline
+    pipeline.activate()
+
+    # load trace and check if all elements are present
+    loaded_trace = load_trace(pipeline.working_dir)
+    print(loaded_trace.asstr(2))
+    assert len(trace.steps) == 4
+    loaded_trace_dict = deepcopy(loaded_trace.asdict())
+    trace_dict = deepcopy(trace.asdict())
+    assert loaded_trace_dict == trace_dict
+    # do it again to check if we are not popping
+    assert loaded_trace_dict == loaded_trace.asdict()
+    assert trace_dict == trace.asdict()
+
+    # exception also saves trace
+    @dlt.resource
+    def data():
+        raise NotImplementedError()
+        yield
+
+    with pytest.raises(PipelineStepFailed) as py_ex:
+        dlt.run(data(), destination="dummy")
+    # there's the same pipeline in exception as in previous run
+    assert py_ex.value.pipeline is info.pipeline
+    trace = load_trace(py_ex.value.pipeline.working_dir)
+    assert trace is not None
+    assert pipeline._trace is None
+    assert len(trace.steps) == 2  # extract with exception, also has run with exception
+    step = trace.steps[-2]
+    assert step.step == "extract"
+    assert step.step_exception is not None
+    run_step = trace.steps[-1]
+    assert run_step.step == "run"
+    assert run_step.step_exception is not None
+    assert step.step_exception == run_step.step_exception
+    assert_trace_serializable(trace)
+    assert pipeline.last_trace.last_normalize_info is None
+
+
+def test_last_trace_none_when_no_run() -> None:
+    """`last_trace` returns None (not raises) when the pipeline has never produced a trace."""
+    pipeline = dlt.pipeline(pipeline_name="never_run_" + uniq_id(), destination="dummy")
+    assert pipeline._last_trace is None
+    assert pipeline.last_trace is None
+    assert load_trace(pipeline.working_dir) is None
+
+
+def test_run_step_with_exception_not_filtered_in_asdict() -> None:
+    """Run step carrying an exception from sync_destination must survive asdict()."""
+    pipeline = dlt.pipeline(destination="dummy")
+
+    def _failing_sync(self, *args, **kwargs):
+        raise PipelineStepFailed(pipeline, "sync", None, RuntimeError("sync failed"))
+
+    with patch.object(Pipeline, "_sync_destination", _failing_sync):
+        with pytest.raises(PipelineStepFailed):
+            pipeline.run([1, 2, 3], table_name="items")
+
+    trace = pipeline.last_trace
+    assert trace is not None
+
+    # only the "run" step should exist because extract/normalize/load never started
+    run_steps = [s for s in trace.steps if s.step == "run"]
+    assert len(run_steps) == 1
+    assert run_steps[0].step_exception is not None
+    assert "sync failed" in run_steps[0].step_exception
+
+    # asdict() must include the run step with the exception
+    trace_dict = trace.asdict()
+    dict_steps = trace_dict["steps"]
+    run_dict_steps = [s for s in dict_steps if s["step"] == "run"]
+    assert len(run_dict_steps) == 1
+    assert run_dict_steps[0]["step_exception"] is not None
+    assert "sync failed" in run_dict_steps[0]["step_exception"]
+
+    assert_trace_serializable(trace)
+
+
+def test_save_load_empty_trace() -> None:
+    os.environ["COMPLETED_PROB"] = "1.0"
+    os.environ["RESTORE_FROM_DESTINATION"] = "false"
+    pipeline = dlt.pipeline()
+    pipeline.run([], table_name="data", destination="dummy")
+    trace = pipeline.last_trace
+    assert_trace_serializable(trace)
+    assert len(trace.steps) == 4
+
+    pipeline.activate()
+
+    # load trace and check if all elements are present
+    loaded_trace = load_trace(pipeline.working_dir)
+    print(loaded_trace.asstr(2))
+    assert len(trace.steps) == 4
+    loaded_trace_dict = deepcopy(loaded_trace.asdict())
+    trace_dict = deepcopy(trace.asdict())
+    assert loaded_trace_dict == trace_dict
+    # do it again to check if we are not popping
+    assert loaded_trace_dict == loaded_trace.asdict()
+    assert trace_dict == trace.asdict()
+
+
+def test_disable_trace(environment: DictStrStr) -> None:
+    environment["ENABLE_RUNTIME_TRACE"] = "false"
+    environment["COMPLETED_PROB"] = "1.0"
+    dlt.pipeline().run([1, 2, 3], table_name="data", destination="dummy")
+    assert dlt.pipeline().last_trace is None
+
+
+def test_trace_on_restore_state(environment: DictStrStr) -> None:
+    environment["COMPLETED_PROB"] = "1.0"
+
+    def _sync_destination_patch(
+        self: Pipeline, destination: str = None, staging: str = None, dataset_name: str = None
+    ):
+        # just wipe the pipeline simulating deleted dataset
+        self._wipe_working_folder()
+        self._configure(
+            self._schema_storage_config.export_schema_path,
+            self._schema_storage_config.import_schema_path,
+            False,
+        )
+
+    with patch.object(Pipeline, "sync_destination", _sync_destination_patch):
+        dlt.pipeline().run([1, 2, 3], table_name="data", destination="dummy")
+        assert len(dlt.pipeline().last_trace.steps) == 4
+        assert dlt.pipeline().last_trace.last_normalize_info.row_counts == {
+            "_dlt_pipeline_state": 1,
+            "data": 3,
+        }
+
+
+def test_load_none_trace() -> None:
+    p = dlt.pipeline()
+    assert load_trace(p.working_dir) is None
+
+
+def test_trace_telemetry(temporary_telemetry: RuntimeConfiguration) -> None:
+    with (
+        patch("dlt.common.runtime.sentry.before_send", _mock_sentry_before_send),
+        patch("dlt.common.runtime.anon_tracker.before_send", _mock_anon_tracker_before_send),
+    ):
+        ANON_TRACKER_SENT_ITEMS.clear()
+        SENTRY_SENT_ITEMS.clear()
+        # make dummy fail all files
+        os.environ["FAIL_PROB"] = "1.0"
+        # but do not raise exceptions
+        os.environ["RAISE_ON_FAILED_JOBS"] = "false"
+        load_info = dlt.pipeline().run(
+            [1, 2, 3], table_name="data", destination="dummy", dataset_name="data_data"
+        )
+        # we should have 4 tracker items
+        assert len(ANON_TRACKER_SENT_ITEMS) == 4
+        expected_steps = ["extract", "normalize", "load", "run"]
+        for event, step in zip(ANON_TRACKER_SENT_ITEMS, expected_steps):
+            assert event["event"] == f"pipeline_{step}"
+            assert event["properties"]["success"] is True
+            assert event["properties"]["destination_name"] == "dummy"
+            assert event["properties"]["destination_type"] == "dlt.destinations.dummy"
+            assert event["properties"]["pipeline_name_hash"] == digest128(
+                load_info.pipeline.pipeline_name
+            )
+            assert event["properties"]["dataset_name_hash"] == digest128(
+                load_info.pipeline.dataset_name
+            )
+            assert event["properties"]["default_schema_name_hash"] == digest128(
+                load_info.pipeline.default_schema_name
+            )
+            assert isinstance(event["properties"]["elapsed"], float)
+            assert isinstance(event["properties"]["transaction_id"], str)
+            # check extract info
+            if step == "extract":
+                assert event["properties"]["extract_data"] == [{"name": "", "data_type": "int"}]
+            if step == "load":
+                # dummy has empty fingerprint
+                assert event["properties"]["destination_fingerprint"] == ""
+        #
+        # we have two failed files (state and data) that should be logged by sentry
+        # print(SENTRY_SENT_ITEMS)
+        # for item in SENTRY_SENT_ITEMS:
+        #     # print(item)
+        #     print(item["logentry"]["message"])
+        # assert len(SENTRY_SENT_ITEMS) == 4
+
+        # trace with exception
+        @dlt.resource
+        def data():
+            raise NotImplementedError()
+            yield
+
+        ANON_TRACKER_SENT_ITEMS.clear()
+        SENTRY_SENT_ITEMS.clear()
+        with pytest.raises(PipelineStepFailed):
+            dlt.pipeline().run(data, destination="dummy")
+        assert len(ANON_TRACKER_SENT_ITEMS) == 2
+        event = ANON_TRACKER_SENT_ITEMS[0]
+        assert event["event"] == "pipeline_extract"
+        assert event["properties"]["success"] is False
+        assert event["properties"]["destination_name"] == "dummy"
+        assert event["properties"]["destination_type"] == "dlt.destinations.dummy"
+        assert isinstance(event["properties"]["elapsed"], float)
+        # check extract info
+        if step == "extract":
+            assert event["properties"]["extract_data"] == [
+                {"name": "data", "data_type": "resource"}
+            ]
+        # we didn't log any errors
+        assert len(SENTRY_SENT_ITEMS) == 0
+
+        # trace without destination and dataset
+        p = dlt.pipeline(pipeline_name="fresh").drop()
+        ANON_TRACKER_SENT_ITEMS.clear()
+        SENTRY_SENT_ITEMS.clear()
+        p.extract([1, 2, 3], table_name="data")
+        event = ANON_TRACKER_SENT_ITEMS[0]
+        assert event["event"] == "pipeline_extract"
+        assert event["properties"]["success"] is True
+        assert event["properties"]["destination_name"] is None
+        assert event["properties"]["destination_type"] is None
+        assert event["properties"]["pipeline_name_hash"] == digest128("fresh")
+        assert event["properties"]["dataset_name_hash"] is None
+        assert event["properties"]["default_schema_name_hash"] == digest128(p.default_schema_name)
+
+        # trace with dataset name
+        p = dlt.pipeline(pipeline_name="fresh", dataset_name="fresh_dataset").drop()
+        ANON_TRACKER_SENT_ITEMS.clear()
+        SENTRY_SENT_ITEMS.clear()
+        p.extract([1, 2, 3], table_name="data")
+        event = ANON_TRACKER_SENT_ITEMS[0]
+        assert event["properties"]["dataset_name_hash"] == digest128(p.dataset_name)
+
+
+def test_extract_data_describe() -> None:
+    schema = Schema("test")
+    assert describe_extract_data(DltSource(schema, "sect")) == [
+        {"name": "test", "data_type": "source"}
+    ]
+    assert describe_extract_data(DltResource(Pipe("rrr_extract"), None, False)) == [
+        {"name": "rrr_extract", "data_type": "resource"}
+    ]
+    assert describe_extract_data([DltSource(schema, "sect")]) == [
+        {"name": "test", "data_type": "source"}
+    ]
+    assert describe_extract_data([DltResource(Pipe("rrr_extract"), None, False)]) == [
+        {"name": "rrr_extract", "data_type": "resource"}
+    ]
+    assert describe_extract_data(
+        [DltResource(Pipe("rrr_extract"), None, False), DltSource(schema, "sect")]
+    ) == [{"name": "rrr_extract", "data_type": "resource"}, {"name": "test", "data_type": "source"}]
+    assert describe_extract_data([{"a": "b"}]) == [{"name": "", "data_type": "dict"}]
+    from pandas import DataFrame
+
+    # we assume that List content has same type
+    assert describe_extract_data([DataFrame(), {"a": "b"}]) == [
+        {"name": "", "data_type": "DataFrame"}
+    ]
+    # first unnamed element in the list breaks checking info
+    assert describe_extract_data(
+        [DltResource(Pipe("rrr_extract"), None, False), DataFrame(), DltSource(schema, "sect")]
+    ) == [{"name": "rrr_extract", "data_type": "resource"}, {"name": "", "data_type": "DataFrame"}]
+
+
+def test_slack_hook(environment: DictStrStr) -> None:
+    stop_telemetry()
+    hook_url = "https://hooks.slack.com/services/T04DHMAF13Q/B04E7B1MQ1H/TDHEI123WUEE"
+    environment["COMPLETED_PROB"] = "1.0"
+    environment["GITHUB_USER"] = "rudolfix"
+    environment["RUNTIME__DLTHUB_TELEMETRY"] = "False"
+    environment["RUNTIME__SLACK_INCOMING_HOOK"] = hook_url
+    with requests_mock.mock() as m:
+        m.post(hook_url, json={})
+        load_info = dlt.pipeline().run([1, 2, 3], table_name="data", destination="dummy")
+        assert slack_notify_load_success(load_info.pipeline.config.runtime.slack_incoming_hook, load_info, load_info.pipeline.last_trace) == 200  # type: ignore[attr-defined]
+    assert m.called
+    message = m.last_request.json()
+    assert "rudolfix" in message["text"]
+    assert "dummy" in message["text"]
+
+
+def test_broken_slack_hook(environment: DictStrStr) -> None:
+    environment["COMPLETED_PROB"] = "1.0"
+    environment["RUNTIME__SLACK_INCOMING_HOOK"] = "http://localhost:22"
+    load_info = dlt.pipeline().run([1, 2, 3], table_name="data", destination="dummy")
+    # connection error
+    assert slack_notify_load_success(load_info.pipeline.config.runtime.slack_incoming_hook, load_info, load_info.pipeline.last_trace) == -1  # type: ignore[attr-defined]
+    # pipeline = dlt.pipeline()
+    # assert pipeline.last_trace is not None
+    # assert pipeline._trace is None
+    # trace = load_trace(info.pipeline.working_dir)
+    # assert len(trace.steps) == 4
+    # run_step = trace.steps[-1]
+    # assert run_step.step == "run"
+    # assert run_step.step_exception is None
+
+
+def test_last_pipeline_step_trace_returns_latest() -> None:
+    """Test that last_pipeline_step_trace returns the step with the latest started_at when multiple steps exist."""
+    os.environ["COMPLETED_PROB"] = "1.0"
+
+    # Create a pipeline
+    p = dlt.pipeline(destination="dummy")
+
+    # First extract - this will create the first extract step
+    first_load_info = p.run([1, 2, 3], table_name="first_data")
+    first_trace = p.last_trace
+
+    # Verify we have one extract step and it mentions the first load
+    first_extract_step = first_trace.last_extract_info
+    assert first_extract_step is not None
+    assert first_extract_step.loads_ids == first_load_info.loads_ids
+
+    # Second extract - this will create a second extract step
+    second_load_info = p.extract([4, 5, 6], table_name="second_data")
+    second_trace = p.last_trace
+
+    # Verify we now have two extract steps
+    assert len(p.last_trace.steps) == 5
+    extract_steps = [step for step in second_trace.steps if step.step == "extract"]
+    assert len(extract_steps) == 2
+
+    # Verify that last_pipeline_step_trace returns the most recent extract step
+    latest_extract_step = p.last_trace.last_extract_info
+    assert latest_extract_step.loads_ids == second_load_info.loads_ids
+
+    # # Verify that the latest step has a later started_at than the first step
+    assert latest_extract_step.started_at > first_extract_step.started_at
+
+    # same for normalize
+    p.normalize()
+    assert len(p.last_trace.steps) == 6
+    assert p.last_trace.last_normalize_info.loads_ids == second_load_info.loads_ids
+
+    # and load
+    p.load()
+    assert len(p.last_trace.steps) == 7
+    assert p.last_trace.last_load_info.loads_ids == second_load_info.loads_ids
+
+    # check if still 7 steps after pickle
+    unpickled_trace = load_trace(p.working_dir)
+    assert len(unpickled_trace.steps) == 7
+
+    # next run should reset everything
+    third_load_info = p.run([7, 8, 9], table_name="third_data")
+    assert len(p.last_trace.steps) == 4
+    assert p.last_trace.last_extract_info.loads_ids == third_load_info.loads_ids
+    # all last_x properties should reference new load
+    assert p.last_trace.last_extract_info.loads_ids == third_load_info.loads_ids
+    assert p.last_trace.last_normalize_info.loads_ids == third_load_info.loads_ids
+    assert p.last_trace.last_load_info.loads_ids == third_load_info.loads_ids
+
+
+def test_trace_accessors_return_none_for_missing_steps() -> None:
+    """Last step accessors return None (not raise) when a step never ran, per their Optional type hints."""
+    trace = PipelineTrace(
+        uniq_id(),
+        "test",
+        get_execution_context(),
+        pendulum.now(),
+        steps=[],
+        resolved_config_values=[],
+    )
+
+    assert trace.last_pipeline_step_trace("extract") is None
+    assert trace.last_extract_info is None
+    assert trace.last_normalize_info is None
+    assert trace.last_load_info is None
+
+
+def test_trace_custom_metrics_schema() -> None:
+    """Test that custom metrics are properly included in trace data"""
+
+    @dlt.resource
+    def resource_with_metrics():
+        custom_metrics = dlt.current.resource_metrics()
+        custom_metrics["custom_count"] = 42
+        custom_metrics["random_constant"] = 1.5
+        custom_metrics["random_nested"] = {"value": 100, "unit": "items"}
+        custom_metrics["list_metric"] = [1, 2, 3]
+        yield [{"id": 1}, {"id": 2}]
+
+    resource_with_metrics.add_limit(10)
+    resource_with_metrics.add_map(lambda x: x)
+    resource_with_metrics.add_yield_map(lambda x: (yield from x))
+
+    # force metrics in transform steps
+    for step in resource_with_metrics._pipe.steps:
+        if isinstance(step, ItemTransform):
+            step.custom_metrics["transformation_type"] = "anything"
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_custom_metrics_trace", destination=dummy(completed_prob=1.0)
+    )
+
+    pipeline.run(resource_with_metrics())
+    trace = pipeline.last_trace
+
+    trace_pipeline = dlt.pipeline(
+        pipeline_name="test_custom_metrics_trace_schema", destination=dummy(completed_prob=1.0)
+    )
+    trace_pipeline.run([trace], table_name="trace")
+    inferred_schema = trace_pipeline.default_schema
+    resource_metrics_table_cols = inferred_schema.get_table(
+        "trace__steps__extract_info__resource_metrics"
+    )["columns"]
+
+    assert "custom_metrics__custom_count" in resource_metrics_table_cols
+    assert "custom_metrics__random_constant" in resource_metrics_table_cols
+    assert "custom_metrics__random_nested__value" in resource_metrics_table_cols
+    assert "custom_metrics__random_nested__unit" in resource_metrics_table_cols
+    assert "trace__steps__extract_info__resource_metrics__list_metric" in inferred_schema.tables
+
+
+def _tenant_of(resource: DltResource, table_name: str) -> str:
+    return "acme"
+
+
+def _region_of(resource: DltResource, table_name: str) -> str:
+    return "eu"
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["extracted", "extract-fails"])
+def test_trace_replaces_callables_in_hints(fail: bool) -> None:
+    """Callables in hint dicts, ie. `extra_placeholders` of root and nested write dispositions,
+    are replaced by their names in the trace, also when they never ran. So the trace is saved
+    and can be serialized."""
+
+    root_disposition: Any = {
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "destination_scope": "day = {day} AND tenant = {tenant}",
+        "extra_placeholders": {
+            "day": lambda resource, table_name: datetime.date(2026, 10, 1),
+            "tenant": _tenant_of,
+        },
+    }
+    children_disposition: Any = {"disposition": "merge", "destination_scope": "day = {day}"}
+    subs_disposition: Any = {
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "destination_scope": "part = {part} AND region = {region}",
+        "extra_placeholders": {"part": lambda resource, table_name: "a", "region": _region_of},
+    }
+
+    @dlt.source
+    def merge_source():
+        @dlt.resource(
+            write_disposition=root_disposition,
+            nested_hints={
+                # a nested table uses the placeholders of the root table
+                "children": dlt.mark.make_nested_hints(write_disposition=children_disposition),
+                # a pseudo-root merges with its own placeholders
+                "subs": dlt.mark.make_nested_hints(
+                    primary_key="id", write_disposition=subs_disposition
+                ),
+                # a path of a deeper nested table is a tuple
+                ("children", "toys"): dlt.mark.make_nested_hints(
+                    write_disposition=children_disposition
+                ),
+            },
+        )
+        def items():
+            if fail:
+                raise NotImplementedError()
+            yield {
+                "day": datetime.date(2026, 10, 1),
+                "tenant": "acme",
+                "children": [{"v": 1, "toys": [{"t": 1}]}],
+                "subs": [{"id": 1, "part": "a", "region": "eu"}],
+            }
+
+        return items
+
+    source = merge_source()
+    pipeline = dlt.pipeline(
+        pipeline_name="trace_callables_" + uniq_id(),
+        destination=dummy(completed_prob=1.0, supported_merge_strategies=["delete-insert"]),
+    )
+    if fail:
+        with pytest.raises(PipelineStepFailed):
+            pipeline.run(source)
+    else:
+        pipeline.run(source)
+
+    # the trace was pickled
+    trace = load_trace(pipeline.working_dir)
+    assert trace is not None
+    assert (trace.steps[0].step_exception is not None) is fail
+    extract_info = trace.last_extract_info
+    hints = extract_info.metrics[extract_info.loads_ids[0]][0]["hints"]["items"]
+    assert hints["write_disposition"] == {
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "destination_scope": "day = {day} AND tenant = {tenant}",
+        # placeholders are listed, so their names do not become columns of the trace
+        "extra_placeholders": [
+            {"name": "day", "value": "<lambda>"},
+            {"name": "tenant", "value": "_tenant_of"},
+        ],
+    }
+    # JSON keys are strings, so the trace lists the nested hints with their paths
+    children_disposition_hint = {"disposition": "merge", "destination_scope": "day = {day}"}
+    assert hints["nested_hints"] == [
+        {"path": ["children"], "write_disposition": children_disposition_hint},
+        {
+            "path": ["subs"],
+            "primary_key": "id",
+            "write_disposition": {
+                "disposition": "merge",
+                "strategy": "delete-insert",
+                "destination_scope": "part = {part} AND region = {region}",
+                "extra_placeholders": [
+                    {"name": "part", "value": "<lambda>"},
+                    {"name": "region", "value": "_region_of"},
+                ],
+            },
+        },
+        {"path": ["children", "toys"], "write_disposition": children_disposition_hint},
+    ]
+    _assert_no_callables(hints)
+
+    # the resource keeps its callables
+    resource_hints: Any = source.resources["items"]._hints
+    assert callable(resource_hints["write_disposition"]["extra_placeholders"]["day"])
+    nested_hints = resource_hints["nested_hints"]
+    assert callable(nested_hints["subs"]["write_disposition"]["extra_placeholders"]["part"])
+
+    assert_trace_serializable(trace)
+
+
+@pytest.mark.skipif(
+    int(pendulum.__version__.split(".")[0]) < 3,
+    reason="Skipping backward compatibility test for pendulum version < 3",
+)
+def test_trace_backward_compat() -> None:
+    # this test checks if past traces can be unpickled. if this test fails - backward incompatible
+    # changes were introduced. there's no guarantee from our side that traces are backward compat
+    # but if we can easily prevent this form happening - we should.
+    # NOTE: if this test failed and you make it work again, add new trace fixture to tests/pipeline/cases/traces
+    # `test_create_trace` will create fixture for you in `_storage` folder after it is run. see end of the test code
+    # copy that fixture to cases folder above
+
+    traces_dir = os.path.join(PIPELINE_TEST_CASES_PATH, "traces")
+    traces = os.listdir(traces_dir)
+    assert len(traces) > 0  # sanity check
+    for folder in traces:
+        # skip botched traces in this test
+        if "botched" in folder:
+            continue
+        trace_dir = os.path.join(traces_dir, folder)
+        if os.path.isdir(trace_dir):
+            # use standard pickle
+            trace = load_trace(trace_dir, ignore_errors=False)
+            # trace must be found
+            assert trace is not None
+            # use trace loading which ignores all errors
+            trace = load_trace(trace_dir)
+            assert_trace_serializable(trace)
+            # traces older than 1.32 store neither the files count nor the size of load jobs
+            stores_file_metrics = folder not in ("dlt.1.15", "dlt.1.18.2")
+            for step in trace.steps:
+                if isinstance(step.step_info, (ExtractInfo, NormalizeInfo)):
+                    for metrics_list in step.step_info.metrics.values():
+                        for metrics in metrics_list:
+                            # fixtures write one file per table
+                            for writer_metrics in metrics["table_metrics"].values():
+                                assert writer_metrics.files_count == (
+                                    1 if stores_file_metrics else None
+                                )
+                if isinstance(step.step_info, LoadInfo):
+                    for load_metrics in step.step_info.metrics.values():
+                        for job_metrics in load_metrics[0]["job_metrics"].values():
+                            if stores_file_metrics:
+                                assert job_metrics.file_size > 0
+                            else:
+                                assert job_metrics.file_size is None
+
+
+def test_ignore_load_broken_trace() -> None:
+    traces_dir = os.path.join(PIPELINE_TEST_CASES_PATH, "traces")
+    traces = os.listdir(traces_dir)
+    assert len(traces) > 0  # sanity check
+    for folder in traces:
+        # skip botched traces in this test
+        if "botched" not in folder:
+            continue
+        trace_dir = os.path.join(traces_dir, folder)
+        # must fail
+        with pytest.raises(Exception):
+            load_trace(trace_dir, ignore_errors=False)
+
+        # can't fail but must be None
+        assert load_trace(trace_dir) is None
+
+
+def _assert_no_callables(value: Any) -> None:
+    if isinstance(value, dict):
+        for v in value.values():
+            _assert_no_callables(v)
+    elif isinstance(value, list):
+        for v in value:
+            _assert_no_callables(v)
+    else:
+        assert not callable(value)
+
+
+def _find_resolved_value(
+    resolved: List[SerializableResolvedValueTrace], key: str, sections: List[str]
+) -> SerializableResolvedValueTrace:
+    return next((v for v in resolved if v.key == key and v.sections == sections), None)
+
+
+ANON_TRACKER_SENT_ITEMS = []
+
+
+def _mock_anon_tracker_before_send(event: DictStrAny) -> DictStrAny:
+    ANON_TRACKER_SENT_ITEMS.append(event)
+    return event
+
+
+SENTRY_SENT_ITEMS = []
+
+
+def _mock_sentry_before_send(event: DictStrAny, _unused_hint: Any = None) -> DictStrAny:
+    SENTRY_SENT_ITEMS.append(event)
+    return event
+
+
+def assert_trace_serializable(trace: PipelineTrace) -> None:
+    str(trace)
+    trace.asstr(0)
+    trace.asstr(1)
+    trace_dict = deepcopy(trace.asdict())
+    # check if we do not pop
+    assert trace_dict == trace.asdict()
+    with io.BytesIO() as b:
+        json.typed_dump(trace, b, pretty=True)
+        b.getvalue()
+    json.dumps(trace)
+
+    # load trace to duckdb
+    from dlt.destinations import duckdb
+
+    trace_pipeline = dlt.pipeline("trace", destination=duckdb(":pipeline:")).drop()
+    trace_pipeline.run([trace], table_name="trace_data")
+
+    # print(trace_pipeline.default_schema.to_pretty_yaml())

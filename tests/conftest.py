@@ -1,0 +1,260 @@
+import os
+import dataclasses
+import logging
+from typing import Dict, Iterator, List, Any
+from pathlib import Path
+
+import pytest
+
+# patch which providers to enable
+from dlt.common.time import get_context_timezone, set_context_timezone
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs.timezone_context import TimezoneContext
+from dlt.common.configuration.providers import (
+    ConfigProvider,
+    EnvironProvider,
+    SecretsTomlProvider,
+    ConfigTomlProvider,
+    GoogleSecretsProvider,
+)
+from dlt.common.configuration.specs.config_providers_context import (
+    ConfigProvidersConfiguration,
+)
+from dlt.common.runtime.run_context import RunContext
+
+
+def initial_providers(self) -> List[ConfigProvider]:
+    # do not read the global config
+    return [
+        EnvironProvider(),
+        SecretsTomlProvider(settings_dir="tests/.dlt"),
+        ConfigTomlProvider(settings_dir="tests/.dlt"),
+    ]
+
+
+RunContext.initial_providers = initial_providers  # type: ignore[method-assign]
+# also disable extras
+ConfigProvidersConfiguration.enable_airflow_secrets = False
+ConfigProvidersConfiguration.enable_google_secrets = False
+
+CACHED_GOOGLE_SECRETS: Dict[str, Any] = {}
+
+
+class CachedGoogleSecretsProvider(GoogleSecretsProvider):
+    def _look_vault(self, full_key, hint):
+        if full_key not in CACHED_GOOGLE_SECRETS:
+            CACHED_GOOGLE_SECRETS[full_key] = super()._look_vault(full_key, hint)
+        return CACHED_GOOGLE_SECRETS[full_key]
+
+    def _list_vault(self):
+        key_ = "__list_vault"
+        if key_ not in CACHED_GOOGLE_SECRETS:
+            CACHED_GOOGLE_SECRETS[key_] = super()._list_vault()
+        return CACHED_GOOGLE_SECRETS[key_]
+
+
+from dlt.common.configuration.providers import google_secrets
+
+google_secrets.GoogleSecretsProvider = CachedGoogleSecretsProvider  # type: ignore[misc]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_setupnodes(config, specs):
+    """Called on master before workers start. Pre-install DuckDB extensions to avoid
+    race conditions during concurrent auto-install by workers.
+    """
+    try:
+        import duckdb
+    except ImportError:
+        return
+
+    extensions = [
+        "avro",
+        "aws",
+        "azure",
+        "delta",
+        "ducklake",
+        "httpfs",
+        "iceberg",
+        "motherduck",
+        "parquet",
+        "postgres_scanner",
+        "spatial",
+        "sqlite_scanner",
+    ]
+
+    community_extensions = [
+        "lance",
+    ]
+
+    with duckdb.connect() as conn:
+        for ext in extensions:
+            try:
+                conn.execute(f"INSTALL {ext}")
+            except Exception:
+                pass  # extension might not be available
+        for ext in community_extensions:
+            try:
+                conn.execute(f"INSTALL {ext} FROM community")
+            except Exception:
+                pass  # extension might not be available
+
+
+def pytest_configure(config):
+    # patch the configurations to use test storage by default, we modify the types (classes) fields
+    # the dataclass implementation will use those patched values when creating instances (the values present
+    # in the declaration are not frozen allowing patching). this is needed by common storage tests
+    from tests.utils import set_environment_test_storage_root, compute_test_storage_root
+
+    test_storage_root = compute_test_storage_root()
+    Path(test_storage_root).mkdir(exist_ok=True)
+    set_environment_test_storage_root(test_storage_root)
+
+    from dlt.common.configuration.specs import runtime_configuration
+    from dlt.common.storages import configuration as storage_configuration
+
+    runtime_configuration.RuntimeConfiguration.config_files_storage_path = os.path.join(
+        test_storage_root, "config/"
+    )
+    # always use CI track endpoint when running tests
+    runtime_configuration.RuntimeConfiguration.dlthub_telemetry_endpoint = (
+        "https://telemetry-tracker.services4758.workers.dev"
+    )
+
+    del runtime_configuration.RuntimeConfiguration.__init__
+    runtime_configuration.RuntimeConfiguration = dataclasses.dataclass(  # type: ignore[misc]
+        runtime_configuration.RuntimeConfiguration, init=True, repr=False
+    )
+
+    storage_configuration.LoadStorageConfiguration.load_volume_path = os.path.join(
+        test_storage_root, "load"
+    )
+    del storage_configuration.LoadStorageConfiguration.__init__
+    storage_configuration.LoadStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
+        storage_configuration.LoadStorageConfiguration, init=True, repr=False
+    )
+
+    storage_configuration.NormalizeStorageConfiguration.normalize_volume_path = os.path.join(
+        test_storage_root, "normalize"
+    )
+    # delete __init__, otherwise it will not be recreated by dataclass
+    del storage_configuration.NormalizeStorageConfiguration.__init__
+    storage_configuration.NormalizeStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
+        storage_configuration.NormalizeStorageConfiguration, init=True, repr=False
+    )
+
+    storage_configuration.SchemaStorageConfiguration.schema_volume_path = os.path.join(
+        test_storage_root, "schemas"
+    )
+    del storage_configuration.SchemaStorageConfiguration.__init__
+    storage_configuration.SchemaStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
+        storage_configuration.SchemaStorageConfiguration, init=True, repr=False
+    )
+
+    assert runtime_configuration.RuntimeConfiguration.config_files_storage_path == os.path.join(
+        test_storage_root, "config/"
+    )
+    assert runtime_configuration.RuntimeConfiguration().config_files_storage_path == os.path.join(
+        test_storage_root, "config/"
+    )
+
+    # path pipeline instance id up to millisecond
+    from dlt.common import pendulum
+    from dlt.pipeline.pipeline import Pipeline
+
+    def _create_pipeline_instance_id(self) -> str:
+        return pendulum.now().format("_YYYYMMDDhhmmssSSSS")
+
+    Pipeline._create_pipeline_instance_id = _create_pipeline_instance_id  # type: ignore[method-assign]
+
+    # disable sqlfluff logging
+    for log in ["sqlfluff.parser", "sqlfluff.linter", "sqlfluff.templater", "sqlfluff.lexer"]:
+        logging.getLogger(log).setLevel("ERROR")
+
+    # disable snowflake logging
+    for log in ["snowflake.connector.cursor", "snowflake.connector.connection"]:
+        logging.getLogger(log).setLevel("ERROR")
+
+    # disable azure logging
+    for log in ["azure.core.pipeline.policies.http_logging_policy"]:
+        logging.getLogger(log).setLevel("ERROR")
+
+    # disable databricks logging
+    for log in ["databricks.sql.client", "databricks.sql.auth"]:
+        logging.getLogger(log).setLevel("WARNING")
+
+    # disable httpx request logging (too verbose when testing qdrant)
+    logging.getLogger("httpx").setLevel("WARNING")
+
+    # disable googleapiclient logging
+    logging.getLogger("googleapiclient.discovery_cache").setLevel("WARNING")
+
+    # disable pyiceberg logging
+    logging.getLogger("pyiceberg").setLevel("WARNING")
+
+    # silence airflow loggers if airflow is installed
+    for log_name in [
+        "airflow.models.crypto",
+        "airflow.models.variable",
+        "airflow",
+        "alembic",
+        "alembic.runtime.migration",
+    ]:
+        logging.getLogger(log_name).setLevel("ERROR")
+
+
+# import faulthandler, atexit, sys
+
+# faulthandler.enable()  # makes sure the module is initialised
+
+
+@pytest.fixture(autouse=True)
+def _reset_cli_global_state() -> None:
+    """Resets the CLI debug flag and active host name before each test."""
+    # both are module-level globals on dlt._workspace.cli; in-process tests
+    # (script_runner inprocess, direct command calls) leak them across tests
+    try:
+        from dlt._workspace.cli import _debug as _cli_debug, echo as _cli_echo
+    except ImportError:
+        return
+    _cli_debug.disable_debug()
+    _cli_echo.set_cli_host_name("dlt")
+
+
+def pytest_sessionfinish(session: "pytest.Session", exitstatus: int) -> None:
+    # A module-level skip (e.g. `skip_if_not_active`) raised while pytest imports a conftest/package
+    # `__init__` aborts collection of the whole tree (pytest-dev/pytest#7085) and exits with
+    # NO_TESTS_COLLECTED (5), which CI masks (`make ... || [ $? -eq 5 ]`) - so the run goes green
+    # having executed nothing.
+    if exitstatus != pytest.ExitCode.NO_TESTS_COLLECTED:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped_reports = [report for report in reporter.stats.get("skipped", [])]
+    if any(not getattr(report, "nodeid", "") for report in skipped_reports):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter.write_line(
+            "ERROR: test collection was aborted by a module-level skip during conftest/package"
+            " import and produced zero tests. A test module with `skip_if_not_active` in"
+            " __init__.py and conftest.py must be present.",
+            red=True,
+        )
+
+
+@pytest.fixture(autouse=True)
+def preserve_context_timezone() -> Iterator[None]:
+    """Restores the context timezone and drops a `TimezoneContext` a test left in the container."""
+    container = Container()
+    had_context = TimezoneContext in container
+    previous = get_context_timezone()
+    try:
+        yield
+    finally:
+        # `del` runs the context's own restore, the explicit set below is what wins
+        if not had_context and TimezoneContext in container:
+            del container[TimezoneContext]
+        set_context_timezone(previous)
+
+
+# atexit.register(lambda: faulthandler.dump_traceback(file=sys.stderr, all_threads=True))

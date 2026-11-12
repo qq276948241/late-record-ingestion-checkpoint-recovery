@@ -1,0 +1,476 @@
+import os
+from typing import Any, List, cast
+
+import humanize
+import pytest
+
+import dlt
+from dlt.sources import DltResource
+from dlt.sources.credentials import ConnectionStringCredentials
+from dlt.common.exceptions import MissingDependencyException
+
+from tests.load.utils import (
+    DestinationTestConfiguration,
+    destinations_configs,
+)
+from tests.pipeline.utils import (
+    assert_load_info,
+    load_table_counts,
+)
+
+try:
+    from dlt.sources.sql_database import TableBackend, sql_database, sql_table
+    from dlt.sources.sql_database.helpers import TSqlDatabaseDataLocation
+    from tests.load.sources.sql_database.test_helpers import mock_json_column, mock_array_column
+    from tests.load.sources.sql_database.test_sql_database_source import (
+        assert_row_counts,
+        convert_time_to_us,
+        default_test_callback,
+    )
+    from tests.load.sources.sql_database.postgres_source import PostgresSourceDB
+    from dlt.common.libs.sql_alchemy import IS_SQL_ALCHEMY_20
+except MissingDependencyException:
+    pytest.skip("Tests require sql alchemy", allow_module_level=True)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True, local_filesystem_configs=True, table_format_local_configs=True
+    ),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+def test_load_sql_schema_loads_all_tables(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_schema_loads_all_tables", dev_mode=True
+    )
+
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION__EXCLUDED_COLUMNS"] = '["time_col"]'
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION_NULLABLE__EXCLUDED_COLUMNS"] = '["time_col"]'
+
+    source = sql_database(
+        credentials=postgres_db.credentials,
+        schema=postgres_db.schema,
+        backend=backend,
+        reflection_level="minimal",
+        type_adapter_callback=default_test_callback(destination_config.destination_type, backend),
+    )
+
+    if destination_config.destination_type == "bigquery" and backend == "connectorx":
+        # connectorx generates nanoseconds time which bigquery cannot load
+        source.has_precision.add_map(convert_time_to_us)
+        source.has_precision_nullable.add_map(convert_time_to_us)
+
+    if backend != "sqlalchemy":
+        # always use mock json
+        source.has_precision.add_map(mock_json_column("json_col"))
+        source.has_precision_nullable.add_map(mock_json_column("json_col"))
+        # always use mock array
+        source.has_precision.add_map(mock_array_column("array_col"))
+        source.has_precision_nullable.add_map(mock_array_column("array_col"))
+
+    assert "chat_message_view" not in source.resources  # Views are not reflected by default
+
+    load_info = pipeline.run(source)
+    print(humanize.precisedelta(pipeline.last_trace.finished_at - pipeline.last_trace.started_at))
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db)
+
+    # every table of the source schema is read by its own resource, which records that one table.
+    # `camelCaseTable` is reflected but kept out of `table_infos`, its name is not queryable
+    # in destinations that normalize identifiers
+    expected_tables = {
+        name for name, info in postgres_db.table_infos.items() if not info["is_view"]
+    } | {"camelCaseTable"}
+    extract_info = pipeline.last_trace.last_extract_info
+    inputs = extract_info.metrics[extract_info.loads_ids[0]][0]["inputs"]
+    assert {location["resource_name"] for location in inputs} == expected_tables
+    assert len(inputs) == len(expected_tables)
+    for location in inputs:
+        assert location["kind"] == "sql_database"
+        sql_location = cast(TSqlDatabaseDataLocation, location)
+        assert sql_location["tables"] == [location["resource_name"]]
+        assert sql_location["db_schema"] == postgres_db.schema
+
+    # and every one of them is written back, attributed to the resource that read it
+    outputs = [
+        location for metrics in load_info.metrics.values() for location in metrics[0]["outputs"]
+    ]
+    written_tables = {
+        table
+        for location in outputs
+        if not location["resource_name"].startswith("_dlt")
+        for table in location["tables"]
+    }
+    assert written_tables == {
+        table["name"] for table in pipeline.default_schema.data_tables(seen_data_only=True)
+    }
+    naming = pipeline.default_schema.naming
+    for location in outputs:
+        assert location["physical_dataset_name"] == load_info.dataset_name
+        # a resource is named after the source table, the written table after normalizing it
+        if location["resource_name"] in expected_tables:
+            assert (
+                naming.normalize_table_identifier(location["resource_name"]) in location["tables"]
+            )
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+def test_load_sql_schema_loads_all_tables_parallel(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_schema_loads_all_tables_parallel", dev_mode=True
+    )
+    source = sql_database(
+        credentials=postgres_db.credentials,
+        schema=postgres_db.schema,
+        backend=backend,
+        reflection_level="minimal",
+        type_adapter_callback=default_test_callback(destination_config.destination_type, backend),
+    ).parallelize()
+
+    if destination_config.destination_type == "bigquery" and backend == "connectorx":
+        # connectorx generates nanoseconds time which bigquery cannot load
+        source.has_precision.add_map(convert_time_to_us)
+        source.has_precision_nullable.add_map(convert_time_to_us)
+
+    if backend != "sqlalchemy":
+        # always use mock json
+        source.has_precision.add_map(mock_json_column("json_col"))
+        source.has_precision_nullable.add_map(mock_json_column("json_col"))
+        # always use mock array
+        source.has_precision.add_map(mock_array_column("array_col"))
+        source.has_precision_nullable.add_map(mock_array_column("array_col"))
+
+    load_info = pipeline.run(source)
+    print(humanize.precisedelta(pipeline.last_trace.finished_at - pipeline.last_trace.started_at))
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+def test_load_sql_schema_loads_all_tables_parallel_connectorx_arrow_stream(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_schema_loads_all_tables_parallel_connectorx", dev_mode=True
+    )
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION__EXCLUDED_COLUMNS"] = '["array_col"]'
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION_NULLABLE__EXCLUDED_COLUMNS"] = '["array_col"]'
+
+    source = sql_database(
+        credentials=postgres_db.credentials,
+        schema=postgres_db.schema,
+        backend="connectorx",
+        reflection_level="minimal",
+        backend_kwargs={"return_type": "arrow_stream"},
+        type_adapter_callback=default_test_callback(
+            destination_config.destination_type, "connectorx"
+        ),
+    ).parallelize()
+
+    if destination_config.destination_type == "bigquery":
+        # connectorx generates nanoseconds time which bigquery cannot load
+        source.has_precision.add_map(convert_time_to_us)
+        source.has_precision_nullable.add_map(convert_time_to_us)
+
+    load_info = pipeline.run(source)
+    # print(humanize.precisedelta(pipeline.last_trace.finished_at - pipeline.last_trace.started_at))
+    assert_load_info(load_info)
+    assert_row_counts(pipeline, postgres_db)
+
+    # make sure timestamp ntz is correct (stream converts them to dates, we convert them back)
+    assert (
+        pipeline.default_schema.tables["has_precision"]["columns"]["datetime_ntz_col"]["data_type"]
+        == "timestamp"
+    )
+    # fetch more than one row to avoid flakiness when first value lands on exact ms
+    data_ = pipeline.dataset().table("has_precision").limit(100).arrow()
+    import pyarrow as pa  # local import for assertions
+
+    # verify Arrow logical type and timezone
+    col_field = data_.schema.field("datetime_ntz_col")
+    assert pa.types.is_timestamp(col_field.type)
+    assert col_field.type.unit == "us"
+
+    # connectorx arrow_stream now returns timestamp columns as timestamp[ns] (older versions
+    # returned date64[ms]); we cast them to timestamp[us]. postgres has microsecond precision,
+    # so it must be preserved here - values are NOT truncated to milliseconds.
+    micros = pa.compute.cast(data_["datetime_ntz_col"], pa.int64()).combine_chunks()
+    for i in range(len(micros)):
+        assert micros[i].is_valid
+    # at least one value carries sub-millisecond microseconds, proving the precision survived
+    assert any(micros[i].as_py() % 1000 != 0 for i in range(len(micros)))
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+def test_load_sql_table_names(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    pipeline = destination_config.setup_pipeline("test_load_sql_table_names", dev_mode=True)
+    tables = ["chat_channel", "chat_message"]
+    load_info = pipeline.run(
+        sql_database(
+            credentials=postgres_db.credentials,
+            schema=postgres_db.schema,
+            table_names=tables,
+            reflection_level="minimal",
+            backend=backend,
+        )
+    )
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db, tables)
+
+    # each table resource records the database it read, addressed without credentials
+    extract_info = pipeline.last_trace.last_extract_info
+    inputs = extract_info.metrics[extract_info.loads_ids[0]][0]["inputs"]
+    by_resource = {location["resource_name"]: location for location in inputs}
+    assert set(by_resource) == set(tables)
+    for table in tables:
+        location = cast(TSqlDatabaseDataLocation, by_resource[table])
+        assert location["kind"] == "sql_database"
+        assert location["tables"] == [table]
+        assert location["db_schema"] == postgres_db.schema
+        assert location["database"] == postgres_db.credentials.database
+        assert location["location"].startswith("postgresql://")
+        assert postgres_db.credentials.password not in location["location"]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+def test_load_sql_table_incremental(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    """Run pipeline twice. Insert more rows after first run
+    and ensure only those rows are stored after the second run.
+    """
+    os.environ["SOURCES__SQL_DATABASE__CHAT_MESSAGE__INCREMENTAL__CURSOR_PATH"] = "updated_at"
+
+    if not IS_SQL_ALCHEMY_20 and backend == "connectorx":
+        pytest.skip("Test will not run on sqlalchemy 1.4 with connectorx")
+
+    pipeline = destination_config.setup_pipeline("test_load_sql_table_incremental", dev_mode=True)
+    tables = ["chat_message"]
+
+    def make_source():
+        return sql_database(
+            credentials=postgres_db.credentials,
+            schema=postgres_db.schema,
+            table_names=tables,
+            reflection_level="minimal",
+            backend=backend,
+        )
+
+    load_info = pipeline.run(make_source())
+    assert_load_info(load_info)
+    postgres_db.fake_messages(n=100)
+    load_info = pipeline.run(make_source())
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db, tables)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+@pytest.mark.rfam
+def test_load_mysql_data_load(
+    destination_config: DestinationTestConfiguration, backend: TableBackend
+) -> None:
+    # reflect a database
+    credentials = ConnectionStringCredentials(
+        "mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam"
+    )
+    database = sql_database(credentials)
+    assert "family" in database.resources
+
+    if backend == "connectorx":
+        # connector-x has different connection string format
+        backend_kwargs = {"conn": "mysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam"}
+    else:
+        backend_kwargs = {}
+
+    # no longer needed: asdecimal used to infer decimal or not
+    # def _double_as_decimal_adapter(table: sa.Table) -> sa.Table:
+    #     for column in table.columns.values():
+    #         if isinstance(column.type, sa.Double):
+    #             column.type.asdecimal = False
+
+    # load a single table
+    family_table = sql_table(
+        credentials="mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam",
+        table="family",
+        backend=backend,
+        reflection_level="minimal",
+        backend_kwargs=backend_kwargs,
+        chunk_size=100,
+        # table_adapter_callback=_double_as_decimal_adapter,
+    )
+
+    pipeline = destination_config.setup_pipeline("test_load_mysql_data_load", dev_mode=True)
+    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
+    assert_load_info(load_info)
+    counts_1 = load_table_counts(pipeline, "family")
+
+    # load again also with merge
+    family_table = sql_table(
+        credentials="mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam",
+        table="family",
+        backend=backend,
+        reflection_level="minimal",
+        # we also try to remove dialect automatically
+        backend_kwargs={},
+        chunk_size=100,
+        # table_adapter_callback=_double_as_decimal_adapter,
+    )
+    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
+    assert_load_info(load_info)
+    counts_2 = load_table_counts(pipeline, "family")
+    # no duplicates
+    assert counts_1 == counts_2 == {"family": 100}
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+def test_load_sql_table_resource_loads_data(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    @dlt.source
+    def sql_table_source() -> List[DltResource]:
+        return [
+            sql_table(
+                credentials=postgres_db.credentials,
+                schema=postgres_db.schema,
+                table="chat_message",
+                reflection_level="minimal",
+                backend=backend,
+            )
+        ]
+
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_table_resource_loads_data", dev_mode=True
+    )
+    load_info = pipeline.run(sql_table_source())
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db, ["chat_message"])
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
+def test_load_sql_table_resource_incremental(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    if not IS_SQL_ALCHEMY_20 and backend == "connectorx":
+        pytest.skip("Test will not run on sqlalchemy 1.4 with connectorx")
+
+    @dlt.source
+    def sql_table_source() -> List[DltResource]:
+        return [
+            sql_table(
+                credentials=postgres_db.credentials,
+                schema=postgres_db.schema,
+                table="chat_message",
+                incremental=dlt.sources.incremental("updated_at"),
+                reflection_level="minimal",
+                backend=backend,
+            )
+        ]
+
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_table_resource_incremental", dev_mode=True
+    )
+    load_info = pipeline.run(sql_table_source())
+    assert_load_info(load_info)
+    postgres_db.fake_messages(n=100)
+    load_info = pipeline.run(sql_table_source())
+    assert_load_info(load_info)
+
+    assert_row_counts(pipeline, postgres_db, ["chat_message"])
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
+def test_load_sql_table_resource_incremental_initial_value(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+    backend: TableBackend,
+) -> None:
+    if not IS_SQL_ALCHEMY_20 and backend == "connectorx":
+        pytest.skip("Test will not run on sqlalchemy 1.4 with connectorx")
+
+    @dlt.source
+    def sql_table_source() -> List[DltResource]:
+        return [
+            sql_table(
+                credentials=postgres_db.credentials,
+                schema=postgres_db.schema,
+                table="chat_message",
+                incremental=dlt.sources.incremental(
+                    "updated_at",
+                    postgres_db.table_infos["chat_message"]["created_at"].start_value,
+                ),
+                reflection_level="minimal",
+                backend=backend,
+            )
+        ]
+
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_table_resource_incremental_initial_value", dev_mode=True
+    )
+    load_info = pipeline.run(sql_table_source())
+    assert_load_info(load_info)
+    assert_row_counts(pipeline, postgres_db, ["chat_message"])

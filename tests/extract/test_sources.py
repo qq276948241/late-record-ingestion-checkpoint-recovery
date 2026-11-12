@@ -1,0 +1,2450 @@
+import itertools
+import time
+
+from typing import Any, Dict, Iterator
+
+import pytest
+import asyncio
+from pytest_mock import MockerFixture
+
+import dlt, os
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.inject import get_fun_spec
+from dlt.common.configuration.specs import BaseConfiguration
+from dlt.common.data_types.typing import TDataType
+from dlt.common.exceptions import DictValidationException, PipelineStateNotAvailable
+from dlt.common.normalizers.json.relational import DataItemNormalizer as RelationalNormalizer
+from dlt.common.normalizers.naming.snake_case import NamingConvention as SnakeCaseNamingConvention
+from dlt.common.pipeline import StateInjectableContext
+from dlt.common.schema import Schema
+from dlt.common.schema.typing import TColumnProp, TColumnSchema
+from dlt.common.schema import utils
+from dlt.common.typing import TDataItems, TTableNames
+
+from dlt.extract import DltResource, DltSource, Incremental
+from dlt.extract.hints import TResourceNestedHints
+from dlt.extract.items import TableNameMeta
+from dlt.extract.state import source_state
+from dlt.extract.source import DltResourceDict
+from dlt.extract.exceptions import (
+    DataItemRequiredForDynamicTableHints,
+    InconsistentTableTemplate,
+    InvalidParentResourceDataType,
+    InvalidParentResourceIsAFunction,
+    InvalidResourceDataTypeMultiplePipes,
+    InvalidTransformerDataTypeGeneratorFunctionRequired,
+    InvalidTransformerGeneratorFunction,
+    ParametrizedResourceUnbound,
+    ResourceNotATransformer,
+    ResourceNotFoundError,
+    ResourcesNotFoundError,
+)
+from dlt.extract.items_transform import LimitItem
+from dlt.extract.pipe import Pipe
+from dlt.extract.utils import dynstr, make_schema_with_default_name
+from tests.common.utils import load_yml_case
+
+
+@pytest.fixture(autouse=True)
+def switch_to_fifo():
+    """most of the following tests rely on the old default fifo next item mode"""
+    os.environ["EXTRACT__NEXT_ITEM_MODE"] = "fifo"
+    yield
+    del os.environ["EXTRACT__NEXT_ITEM_MODE"]
+
+
+def test_basic_source() -> None:
+    def basic_gen():
+        yield 1
+
+    schema = Schema("test")
+    s = DltSource.from_data(schema, "section", basic_gen)
+    assert s.name == "test"
+    assert s.section == "section"
+    assert s.max_table_nesting is None
+    assert s.root_key is None
+    assert s.schema_contract is None
+    assert s.exhausted is False
+    assert s.schema is schema
+    assert len(s.resources) == 1
+    assert s.resources == s.selected_resources
+
+    # set some props
+    s.max_table_nesting = 10
+    assert s.max_table_nesting == 10
+    s.root_key = True
+    assert s.root_key is True
+    s.schema_contract = "evolve"
+    assert s.schema_contract == "evolve"
+
+    s.max_table_nesting = None
+    s.root_key = False
+    s.schema_contract = None
+
+    assert s.max_table_nesting is None
+    assert s.root_key is False
+    assert s.schema_contract is None
+
+
+def test_root_key_backward_compat() -> None:
+    def basic_gen():
+        yield 1
+
+    eth_V11 = load_yml_case("schemas/eth/ethereum_schema_v11")
+    orig_schema = Schema.from_dict(eth_V11)
+    s = DltSource.from_data(orig_schema, "section", basic_gen)
+
+    # set none surfaces a real value
+    s.root_key = None
+    assert s.root_key is True
+    config = RelationalNormalizer.get_normalizer_config(orig_schema)
+    # dropped root propagation so this is false
+    assert config["propagation"]["root"] == {}
+    assert s._get_root_key_legacy(config) is None
+
+    eth_V11 = load_yml_case("schemas/eth/ethereum_schema_v11")
+    orig_schema = Schema.from_dict(eth_V11)
+    s = DltSource.from_data(orig_schema, "section", basic_gen)
+
+    assert s.root_key is True
+    assert s.root_key is True
+    config = RelationalNormalizer.get_normalizer_config(orig_schema)
+    assert config["propagation"]["root"] == {}
+
+
+def test_call_data_resource() -> None:
+    with pytest.raises(TypeError):
+        DltResource.from_data([1], name="t")()
+
+
+def test_parametrized_resource() -> None:
+    def parametrized(p1, /, p2, *, p3=None):
+        assert p1 == "p1"
+        assert p2 == 1
+        assert p3 is None
+        yield 1
+
+    r = DltResource.from_data(parametrized)
+    info = str(r)
+
+    # contains parametrized info
+    assert "This resource is parametrized and takes the following arguments" in info
+    # does not contain iterate info
+    assert "If you want to see the data items in the resource you" not in info
+
+    # iterating the source will raise unbound exception
+    with pytest.raises(ParametrizedResourceUnbound) as py_ex:
+        list(r)
+    assert py_ex.value.func_name == "parametrized"
+    assert py_ex.value.resource_name == "parametrized"
+
+    r = DltResource.from_data(parametrized)
+    # bind
+    assert list(r("p1", 1, p3=None)) == [1]
+    # take info from bound resource
+    info = str(r("p1", 1, p3=None))
+    assert "If you want to see the data items in the resource you" in info
+
+    # as part of the source
+    r = DltResource.from_data(parametrized)
+    s = DltSource(Schema("source"), "module", [r])
+
+    with pytest.raises(ParametrizedResourceUnbound) as py_ex:
+        list(s)
+
+    # call the resource
+    assert list(s.parametrized("p1", 1, p3=None)) == [1]
+    # the resource in the source is still unbound
+    with pytest.raises(ParametrizedResourceUnbound) as py_ex:
+        list(s)
+    # so bind it
+    s.parametrized.bind("p1", 1)
+    assert list(s) == [1]
+
+
+def test_parametrized_transformer() -> None:
+    def good_transformer(item, /, p1, p2, *, p3=None):
+        assert p1 == "p1"
+        assert p2 == 2
+        assert p3 is None
+
+        for i in range(p2):
+            yield {"wrap": item, "mark": p1, "iter": i}
+
+    def bad_transformer():
+        yield 2
+
+    def bad_transformer_2(item, p1, /):
+        yield 2
+
+    def bad_transformer_3(*, item):
+        yield 2
+
+    r = dlt.resource(["itemX", "itemY"], name="items")
+
+    # transformer must be created on a callable with at least one argument
+    with pytest.raises(InvalidTransformerDataTypeGeneratorFunctionRequired):
+        dlt.transformer(data_from=r)("a")  # type: ignore[arg-type]
+    with pytest.raises(InvalidTransformerDataTypeGeneratorFunctionRequired):
+        dlt.transformer(data_from=r)(bad_transformer())
+
+    # transformer must take at least one arg
+    with pytest.raises(InvalidTransformerGeneratorFunction) as py_ex:
+        dlt.transformer(data_from=r)(bad_transformer)  # type: ignore[arg-type]
+    assert py_ex.value.code == 1
+    # transformer may have only one positional argument and it must be first
+    with pytest.raises(InvalidTransformerGeneratorFunction) as py_ex:
+        dlt.transformer(data_from=r)(bad_transformer_2)
+    assert py_ex.value.code == 2
+    # first argument cannot be kw only
+    with pytest.raises(InvalidTransformerGeneratorFunction) as py_ex:
+        dlt.transformer(data_from=r)(bad_transformer_3)  # type: ignore[arg-type]
+    assert py_ex.value.code == 3
+
+    # transformer must take data from a resource
+    with pytest.raises(InvalidParentResourceIsAFunction):
+        dlt.transformer(data_from=bad_transformer)(good_transformer)
+    with pytest.raises(InvalidParentResourceDataType):
+        dlt.transformer(data_from=bad_transformer())(good_transformer)
+
+    # transformer is unbound
+    r = dlt.resource(["itemX", "itemY"], name="items")
+    t = dlt.transformer(data_from=r)(good_transformer)
+    with pytest.raises(ParametrizedResourceUnbound):
+        list(t)
+
+    # pass wrong arguments
+    r = dlt.resource(["itemX", "itemY"], name="items")
+    t = dlt.transformer(data_from=r)(good_transformer)
+    with pytest.raises(TypeError):
+        list(t("p1", 1, 2, 3, 4))  # type: ignore
+
+    # pass arguments that fully bind the item
+    r = dlt.resource(["itemX", "itemY"], name="items")
+    t = dlt.transformer(data_from=r)(good_transformer)
+    with pytest.raises(TypeError):
+        t(item={}, p1="p2", p2=1)  # type: ignore
+
+    r = dlt.resource(["itemX", "itemY"], name="items")
+    t = dlt.transformer(data_from=r)(good_transformer)
+    items = list(t(p1="p1", p2=2))
+
+    def assert_items(_items: TDataItems) -> None:
+        # 2 items yielded * p2=2
+        assert len(_items) == 2 * 2
+        assert _items[0] == {"wrap": "itemX", "mark": "p1", "iter": 0}
+        assert _items[3] == {"wrap": "itemY", "mark": "p1", "iter": 1}
+
+    assert_items(items)
+
+    # parameters passed as args
+    r = dlt.resource(["itemX", "itemY"], name="items")
+    t = dlt.transformer(data_from=r)(good_transformer)
+    # match parent
+    assert id(t._parent) == id(r)
+    items = list(t("p1", 2))
+    assert_items(items)
+
+    # as part of a source
+    s = DltSource(Schema("source"), "module", [r, t])
+    # name and instance is matching
+    assert s.items.name == s.good_transformer._parent.name
+    assert id(s.items) == id(s.good_transformer._parent)
+    # pipe ids are matching
+    assert s.items._pipe.instance_id == s.good_transformer._parent._pipe.instance_id
+    # instances must be consistent
+    assert id(s.items._pipe) == id(s.good_transformer._parent._pipe)
+    assert id(s.items._pipe) == id(s.good_transformer._pipe.parent)
+
+
+def test_resource_bind_to_params_when_in_source() -> None:
+    @dlt.resource
+    def parametrized(_range: int):
+        yield list(range(_range))
+
+    # calling the resource creates new instance
+    r1 = parametrized(6)
+    r2 = parametrized(7)
+    assert r1 is not r2 is not parametrized
+    assert r1.source_name is r2.source_name is None
+    # pipes got cloned and instance id changed when resource is cloned
+    assert r1._pipe is not r2._pipe is not parametrized._pipe
+    assert r1._pipe.instance_id != r2._pipe.instance_id != parametrized._pipe.instance_id
+
+    # add parametrized to source
+    @dlt.source
+    def test_source():
+        return parametrized
+
+    s = test_source()
+    # we cloned the instance
+    cloned_r = s.resources["parametrized"]
+    assert cloned_r is not parametrized
+    assert cloned_r.source_name == "test_source"
+    # original pipe id is kept when adding to sources
+    assert cloned_r._pipe.instance_id == parametrized._pipe.instance_id
+
+    # calling resources always create a copy
+    cr_1 = cloned_r(10)
+    # does not have source_name set
+    assert cr_1.source_name is None
+    # different instance
+    assert cloned_r is not cr_1
+    assert cloned_r._pipe.instance_id == parametrized._pipe.instance_id
+
+    # call bind directly to replace resource in place
+    bound_r = s.parametrized.bind(10)
+    # does not clone
+    assert bound_r._pipe is cloned_r._pipe
+
+    # will raise
+    with pytest.raises(TypeError):
+        # already bound
+        cloned_r(10)
+    assert list(s) == list(range(10))
+
+
+def test_resource_bind_to_params_call_forms() -> None:
+    @dlt.resource
+    def returns_res(_input):
+        # resource returning
+        return _input
+
+    @dlt.resource
+    def returns_pipe(_input):
+        yield _input
+
+    @dlt.resource
+    def regular(_input):
+        yield from _input
+
+    # add filtering lambda
+    regular.add_filter(lambda x: x == "A")
+    assert len(regular._pipe) == 2
+    # binding via call preserves filter (only gen replaced, other steps remain)
+    b_regular = regular("ABCA")
+    assert len(b_regular._pipe) == 2
+    # filter works
+    assert list(b_regular) == ["A", "A"]
+    # resource is different instance
+    assert regular is not b_regular
+    # pipe got cloned and instance id changed
+    assert regular._pipe is not b_regular._pipe
+    assert regular._pipe.instance_id != b_regular._pipe.instance_id
+
+    returns_res.add_filter(lambda x: x == "A")
+    assert len(returns_res._pipe) == 2
+    b_returns_res = returns_res(["A", "A", "B", "B"])
+    assert len(b_returns_res._pipe) == 2
+    assert returns_res is not b_returns_res
+    assert returns_res._pipe is not b_returns_res._pipe
+
+    returns_pipe.add_filter(lambda x: x == "A")
+    assert len(returns_pipe._pipe) == 2
+    b_returns_pipe = returns_pipe("ABCA")
+    assert len(b_returns_pipe._pipe) == 2
+
+    @dlt.source
+    def test_source():
+        return returns_res, returns_pipe, regular
+
+    # similar rests within sources
+    s = test_source()
+
+    # clone of resource in the source, including pipe
+    assert s.regular is not regular
+    assert s.regular._pipe is not regular._pipe
+    # instance id is kept when adding to source
+    assert s.regular._pipe.instance_id == regular._pipe.instance_id
+
+    # will repeat each string 3 times
+    s.regular.add_map(lambda i: i * 3)
+    assert len(regular._pipe) == 2
+    assert len(s.regular._pipe) == 3
+
+    # call
+    regular_pipe = s.regular._pipe
+    assert list(s.regular(["A", "A", "B", "B"])) == ["AAA", "AAA"]
+    assert s.regular._pipe is regular_pipe
+    # bind
+    s.regular.bind([["A"], ["A"], ["B", "A"], ["B", "C"]])
+    assert list(s.regular) == ["AAA", "AAA", "AAA"]
+    assert s.regular._pipe is regular_pipe
+
+    s.returns_res.add_map(lambda i: i * 3)
+    s.returns_res.bind(["X", "Y", "Z", "A"])
+    # keeps mappings and filters
+    assert len(s.returns_res._pipe) == 3
+    assert list(s.returns_res) == ["AAA"]
+
+    s.returns_pipe.add_map(lambda i: i * 3)
+    s.returns_pipe.bind(["X", "Y", "M", "A"])
+    assert len(s.returns_pipe._pipe) == 3
+    assert list(s.returns_pipe) == ["AAA"]
+
+    # s.regular is exhausted so set it again
+    # add lambda that after filtering for A, will multiply it by 4
+    s.resources["regular"] = regular.add_map(lambda i: i * 4)(["A", "Y"])
+    assert list(s) == ["AAA", "AAA", "AAAA"]
+
+
+def test_call_clone_separate_pipe() -> None:
+    all_yields = []
+
+    def some_data_gen(param: str):
+        all_yields.append(param)
+        yield param
+
+    @dlt.resource
+    def some_data(param: str):
+        yield from some_data_gen(param)
+
+    # create two resource instances and extract in single ad hoc resource
+    data1 = some_data("state1")
+    data1._pipe.name = "state1_data"
+    dlt.pipeline(dev_mode=True).extract([data1, some_data("state2")], schema=Schema("default"))
+    # both should be extracted. what we test here is the combination of binding the resource by calling it that clones the internal pipe
+    # and then creating a source with both clones. if we keep same pipe id when cloning on call, a single pipe would be created shared by two resources
+    assert all_yields == ["state1", "state2"]
+
+
+def test_call_dynstr_resource_rename() -> None:
+    @dlt.resource(name=lambda args: args["table"])
+    def get_table(table):
+        yield {"table": table, "value": [1, 2, 3]}
+
+    assert isinstance(get_table.name, dynstr)
+    assert get_table.name == "get_table"
+
+    # binding to args will set the resource name
+    users_table = get_table("users")
+    assert users_table.name == "users"
+    assert not isinstance(users_table.name, dynstr)
+    # pipe cloned
+    assert users_table._pipe is not get_table._pipe
+    assert users_table._pipe.instance_id != get_table._pipe.instance_id
+
+
+def test_resource_bind_lazy_eval() -> None:
+    @dlt.resource
+    def needs_param(param):
+        yield from range(param)
+
+    @dlt.transformer(data_from=needs_param(3))
+    def tx_form(item, multi):
+        yield item * multi
+
+    @dlt.transformer(data_from=tx_form(2))
+    def tx_form_fin(item, div):
+        yield item / div
+
+    @dlt.transformer(data_from=needs_param)
+    def tx_form_dir(item, multi):
+        yield item * multi
+
+    # tx_form takes data from needs_param(3) which is lazily evaluated
+    assert list(tx_form(2)) == [0, 2, 4]
+    # so it will not get exhausted
+    assert list(tx_form(2)) == [0, 2, 4]
+
+    # same for tx_form_fin
+    assert list(tx_form_fin(3)) == [0, 2 / 3, 4 / 3]
+    assert list(tx_form_fin(3)) == [0, 2 / 3, 4 / 3]
+
+    # binding `needs_param`` in place will not affect the tx_form and tx_form_fin (they operate on copies)
+    needs_param.bind(4)
+    assert list(tx_form(2)) == [0, 2, 4]
+    # eval needs_param
+    assert list(needs_param) == [0, 1, 2, 3]
+    assert list(tx_form(2)) == [0, 2, 4]
+
+    # this also works, evaluations always happen on copies
+    assert list(tx_form_dir(3)) == [0, 3, 6, 9]
+
+
+def test_transformer_preliminary_step() -> None:
+    def yield_twice(item):
+        yield item.upper()
+        yield item.upper()
+
+    tx_stage = dlt.transformer()(yield_twice)()
+    # filter out small caps and insert this before the head
+    tx_stage.add_filter(lambda letter: letter.isupper(), 0)
+    # be got filtered out before duplication
+    assert list(dlt.resource(["A", "b", "C"], name="data") | tx_stage) == ["A", "A", "C", "C"]
+
+    # filter after duplication
+    tx_stage = dlt.transformer()(yield_twice)()
+    tx_stage.add_filter(lambda letter: letter.isupper())
+    # nothing is filtered out: on duplicate we also capitalize so filter does not trigger
+    assert list(dlt.resource(["A", "b", "C"], name="data") | tx_stage) == [
+        "A",
+        "A",
+        "B",
+        "B",
+        "C",
+        "C",
+    ]
+
+
+def test_set_table_name() -> None:
+    r = dlt.resource(["A", "b", "C"], name="data")
+    assert r.table_name == "data"
+    r.table_name = "letters"
+    assert r.table_name == "letters"
+    r.table_name = lambda letter: letter
+    assert callable(r.table_name)
+
+
+def test_select_resources() -> None:
+    @dlt.source
+    def test_source(no_resources):
+        for i in range(no_resources):
+            yield dlt.resource(["A"] * i, name="resource_" + str(i))
+
+    s = test_source(10)
+    all_resource_names = ["resource_" + str(i) for i in range(10)]
+    assert list(s.resources.keys()) == all_resource_names
+    # by default all resources are selected
+    assert list(s.selected_resources) == all_resource_names
+    assert list(s.resources.selected) == all_resource_names
+    # select non existing resource
+    with pytest.raises(ResourcesNotFoundError) as py_ex:
+        s.with_resources("resource_10", "resource_1", "unknown")
+    assert py_ex.value.available_resources == set(all_resource_names)
+    assert py_ex.value.not_found_resources == set(("resource_10", "unknown"))
+    # make sure the selected list was not changed
+    assert list(s.selected_resources) == all_resource_names
+    info = str(s)
+    assert "resource `resource_1` is selected" in info
+
+    # successful select
+    s_sel = s.with_resources("resource_1", "resource_7")
+    # returns a clone
+    assert s is not s_sel
+    assert (
+        list(s_sel.selected_resources)
+        == ["resource_1", "resource_7"]
+        == list(s_sel.resources.selected)
+    )
+    assert list(s_sel.resources) == all_resource_names
+    info = str(s_sel)
+    assert "resource `resource_0` is not selected" in info
+    # original is not affected
+    assert list(s.selected_resources) == all_resource_names
+
+    # reselect
+    assert list(s.with_resources("resource_8").selected_resources) == ["resource_8"]
+    # nothing selected
+    assert list(s.with_resources().selected_resources) == []
+    # nothing is selected so nothing yielded
+    assert list(s.with_resources()) == []
+
+
+def test_clone_source() -> None:
+    @dlt.source
+    def test_source(no_resources):
+        def _gen(i):
+            yield "A" * i
+
+        for i in range(no_resources):
+            yield dlt.resource(_gen(i), name="resource_" + str(i))
+
+    s = test_source(4)
+    all_resource_names = ["resource_" + str(i) for i in range(4)]
+    clone_s = s.clone()
+    assert len(s.resources) == len(clone_s.resources) == len(all_resource_names)
+    assert s.schema is not clone_s.schema
+    for name in all_resource_names:
+        # resource is a clone
+        assert s.resources[name] is not clone_s.resources[name]
+        assert s.resources[name]._pipe is not clone_s.resources[name]._pipe
+        # but we keep pipe names and instance ids
+        assert s.resources[name].name == clone_s.resources[name].name
+        assert s.resources[name]._pipe.instance_id == clone_s.resources[name]._pipe.instance_id
+
+    assert list(s) == ["", "A", "AA", "AAA"]
+    # we expired generators
+    assert list(clone_s) == []
+
+    # clone parametrized generators
+
+    @dlt.source  # type: ignore[no-redef]
+    def test_source(no_resources):
+        def _gen(i):
+            yield "A" * i
+
+        for i in range(no_resources):
+            yield dlt.resource(_gen, name="resource_" + str(i))
+
+    s = test_source(4)
+    clone_s = s.clone()
+    for idx, name in enumerate(all_resource_names):
+        # bind resources
+        s.resources[name].bind(idx)
+        clone_s.resources[name].bind(idx)
+
+    # now thanks to late eval both sources evaluate separately
+    assert list(s) == ["", "A", "AA", "AAA"]
+    assert list(clone_s) == ["", "A", "AA", "AAA"]
+
+
+def test_multiple_parametrized_transformers_in_source() -> None:
+    @dlt.source
+    def _source(test_set: int = 1):
+        @dlt.resource(selected=False)
+        def _r1():
+            yield ["a", "b", "c"]
+
+        @dlt.transformer(data_from=_r1, selected=False)
+        def _t1(items, suffix):
+            yield list(map(lambda i: i + "_" + suffix, items))
+
+        @dlt.transformer(data_from=_t1)
+        def _t2(items, mul):
+            yield items * mul
+
+        assert _t2._parent is _t1
+
+        if test_set == 1:
+            return _r1, _t1, _t2
+        if test_set == 2:
+            return _t1, _t2
+        if test_set == 3:
+            # parametrize _t1
+            return _t1("2") | _t2
+        if test_set == 4:
+            # true pipelining fun
+            return _r1() | _t1("2") | _t2(2)
+        if test_set == 5:
+            # ad hoc resource
+            return ["a", "b", "c"] | _t1("2") | _t2(2)
+        if test_set == 6:
+            partial_pipe = _t1("2")
+            # emulate manually created pipe with parents
+            partial_pipe._pipe.parent = Pipe.from_data("ersatz", ["a", "b", "c"])
+            partial_pipe._parent = None
+            return partial_pipe | _t2(2)
+
+    expected_data = ["a_2", "b_2", "c_2", "a_2", "b_2", "c_2"]
+
+    def _assert_valid_clone(s_: DltSource) -> None:
+        # clone s with name and let internal validation to do asserts
+        cloned_s = s_.clone("cloned_s")
+        assert len(cloned_s.resources.extracted) == len(s_.resources.extracted)
+        assert list(cloned_s.resources._cloned_pairs.keys()) == list(
+            s_.resources._cloned_pairs.keys()
+        )
+
+    # this s contains all resources
+    s = _source(1)
+    # all resources will be extracted (even if just the _t2 is selected)
+    assert sorted([r.name for r in s.resources.extracted]) == sorted(["_t2", "_r1", "_t1"])
+    assert set(s.resources.selected_dag) == {("_r1", "_t1"), ("_t1", "_t2")}
+    components = s.decompose("scc")
+    # only one isolated component
+    assert len(components) == 1
+    # only _t2 is selected so component has only this node explicitly
+    assert set(components[0].selected_resources.keys()) == {"_t2"}
+
+    # parametrize now
+    s.resources["_t1"].bind("2")
+    s._t2.bind(2)
+    assert list(s) == expected_data
+    assert sorted([r.name for r in s.resources.extracted]) == sorted(["_t2", "_r1", "_t1"])
+    # deselect _t2 and now nothing is selected
+    s._t2.selected = False
+    assert [r.name for r in s.resources.extracted] == []
+    assert set(s.resources.selected_dag) == set()
+    assert s.decompose("scc") == []
+
+    s._r1.selected = True
+    # now only _r1
+    assert sorted([r.name for r in s.resources.extracted]) == ["_r1"]
+    assert set(s.resources.selected_dag) == {("_r1", "_r1")}
+    assert set(s.decompose("scc")[0].selected_resources.keys()) == {"_r1"}
+
+    _assert_valid_clone(s)
+
+    # this s contains only transformers
+    s2 = _source(2)
+    # the _r will be extracted but it is not in the resources list so we create a mock resource for it
+    assert sorted([r.name for r in s2.resources.extracted]) == sorted(["_t2", "_r1", "_t1"])
+    s2._t1.bind("2")
+    s2._t2.bind(2)
+    assert list(s2) == expected_data
+    # also dag has all the edges - including those outside of resources in the source
+    assert set(s2.resources.selected_dag) == {("_r1", "_t1"), ("_t1", "_t2")}
+    assert set(s2.decompose("scc")[0].selected_resources.keys()) == {"_t2"}
+    # select the _t1
+    s2._t1.selected = True
+    assert set(s2.decompose("scc")[0].selected_resources.keys()) == {"_t2", "_t1"}
+
+    _assert_valid_clone(s2)
+
+    s3 = _source(3)
+    # here _t1 and _r1 are not in the source
+    assert sorted([r.name for r in s3.resources.extracted]) == sorted(["_t2", "_r1", "_t1"])
+    s3._t2.bind(2)
+    assert list(s3) == expected_data
+    assert set(s3.resources.selected_dag) == {("_r1", "_t1"), ("_t1", "_t2")}
+
+    _assert_valid_clone(s3)
+
+    s4 = _source(4)
+    # here we return a pipe
+    assert sorted([r.name for r in s4.resources.extracted]) == sorted(["_t2", "_r1", "_t1"])
+    assert list(s4) == expected_data
+    assert set(s4.resources.selected_dag) == {("_r1", "_t1"), ("_t1", "_t2")}
+
+    _assert_valid_clone(s4)
+
+    s5 = _source(5)
+    # get auto resource name for piped in list
+    iter_resource = s5._t2._parent._pipe.parent.name
+    assert sorted([r.name for r in s5.resources.extracted]) == sorted(["_t2", iter_resource, "_t1"])
+    assert set(s5) == set(expected_data)
+
+    _assert_valid_clone(s5)
+
+    # with ad hoc pipe connected to transformer
+    s6 = _source(6)
+    assert sorted([r.name for r in s6.resources.extracted_pipes]) == sorted(
+        ["_t2", "ersatz", "_t1"]
+    )
+    assert sorted([r.name for r in s6.resources.extracted]) == ["_t1", "_t2"]
+    assert sorted(list(s6)) == sorted(expected_data)
+    top_pipe = s6._t2._parent._pipe.parent
+    assert top_pipe.name == "ersatz"
+    with pytest.raises(ResourceNotFoundError) as r_ex:
+        s6.resources.with_pipe(top_pipe)
+    assert r_ex.value.resource_name == "ersatz"
+
+    _assert_valid_clone(s6)
+
+
+def test_extracted_resources_selector() -> None:
+    @dlt.source
+    def _source(test_set: int = 1):
+        @dlt.resource(selected=False, write_disposition="append")
+        def _r1():
+            yield ["a", "b", "c"]
+
+        @dlt.transformer(data_from=_r1, selected=False, write_disposition="replace")
+        def _t1(items, suffix):
+            yield list(map(lambda i: i + "_" + suffix, items))
+
+        @dlt.transformer(data_from=_r1, write_disposition="merge")
+        def _t2(items, mul):
+            yield items * mul
+
+        if test_set == 1:
+            return _r1, _t1, _t2
+        if test_set == 2:
+            return _t1, _t2
+
+    s = _source(1)
+    # t1 not selected
+    extracted_dict = {r.name: r for r in s.resources.extracted}
+    assert sorted(extracted_dict.keys()) == sorted(["_t2", "_r1"])
+    # append and replace
+    assert extracted_dict["_r1"].write_disposition == "append"
+    assert extracted_dict["_t2"].write_disposition == "merge"
+    # # select _t1
+    s._t1.bind("x").selected = True
+    extracted_dict = {r.name: r for r in s.resources.extracted}
+    assert sorted(extracted_dict.keys()) == sorted(["_t2", "_r1", "_t1"])
+    assert extracted_dict["_t1"].write_disposition == "replace"
+
+    s2 = _source(1)
+    # are we a clone?
+    assert s2._t1.selected is False
+
+    s3 = _source(2)
+    # only _t2 is enabled
+    extracted_dict = {r.name: r for r in s3.resources.extracted}
+    assert sorted(extracted_dict.keys()) == sorted(["_t2", "_r1"])
+    # _r1 is append
+    assert extracted_dict["_r1"].write_disposition == "append"
+
+    s3._t1.selected = True
+    extracted_dict = {r.name: r for r in s3.resources.extracted}
+    assert sorted(extracted_dict.keys()) == sorted(["_t2", "_r1", "_t1"])
+    assert extracted_dict["_r1"].write_disposition == "append"
+    s3._t2.selected = False
+    extracted_dict = {r.name: r for r in s3.resources.extracted}
+    assert sorted(extracted_dict.keys()) == sorted(["_r1", "_t1"])
+    # inherits from _t1
+    assert extracted_dict["_r1"].write_disposition == "append"
+
+
+def test_source_decompose() -> None:
+    @dlt.source
+    def _source():
+        @dlt.resource(selected=True)
+        def _r_init():
+            yield ["-", "x", "!"]
+
+        @dlt.resource(selected=False)
+        def _r1():
+            yield ["a", "b", "c"]
+
+        @dlt.transformer(data_from=_r1, selected=True)
+        def _t1(items, suffix):
+            yield list(map(lambda i: i + "_" + suffix, items))
+
+        @dlt.transformer(data_from=_r1)
+        def _t2(items, mul):
+            yield items * mul
+
+        @dlt.transformer(data_from=_r1)
+        def _t3(items, mul):
+            for item in items:
+                yield item.upper() * mul
+
+        # add something to init
+        @dlt.transformer(data_from=_r_init)
+        def _t_init_post(items):
+            for item in items:
+                yield item * 2
+
+        @dlt.resource
+        def _r_isolee():
+            yield from ["AX", "CV", "ED"]
+
+        return _r_init, _t_init_post, _r1, _t1("POST"), _t2(3), _t3(2), _r_isolee
+
+    # when executing, we get the same data no matter the decomposition
+    direct_data = list(_source())
+    # no decomposition
+    none_data = []
+    for comp in _source().decompose("none"):
+        none_data.extend(list(comp))
+    assert direct_data == none_data
+
+    scc_data = []
+    for comp in _source().decompose("scc"):
+        scc_data.extend(list(comp))
+    assert direct_data == scc_data
+
+    # keeps order of resources inside
+    # here we didn't eliminate (_r_init, _r_init) as this not impacts decomposition, however this edge is not necessary
+    assert _source().resources.selected_dag == [
+        ("_r_init", "_r_init"),
+        ("_r_init", "_t_init_post"),
+        ("_r1", "_t1"),
+        ("_r1", "_t2"),
+        ("_r1", "_t3"),
+        ("_r_isolee", "_r_isolee"),
+    ]
+    components = _source().decompose("scc")
+    # first element contains _r_init
+    assert "_r_init" in components[0].resources.selected.keys()
+    # last is isolee
+    assert "_r_isolee" in components[-1].resources.selected.keys()
+
+    # groups isolated components
+    assert len(components) == 3
+    assert set(components[1].resources.selected.keys()) == {"_t1", "_t2", "_t3"}
+
+    # keeps isolated resources
+    assert list(components[-1].resources.selected.keys()) == ["_r_isolee"]
+
+
+def test_illegal_double_bind() -> None:
+    @dlt.resource()
+    def _r1():
+        yield ["a", "b", "c"]
+
+    assert _r1.args_bound is False
+    assert _r1().args_bound is True
+
+    with pytest.raises(TypeError) as py_ex:
+        _r1()()
+    assert "Parametrized resource" in str(py_ex.value)
+
+    with pytest.raises(TypeError) as py_ex:
+        _r1.bind().bind()
+    assert "Parametrized resource" in str(py_ex.value)
+
+    bound_r = dlt.resource([1, 2, 3], name="rx")
+    assert bound_r.args_bound is True
+    with pytest.raises(TypeError):
+        _r1()
+
+    def _gen():
+        yield from [1, 2, 3]
+
+    assert dlt.resource(_gen()).args_bound is True
+
+
+@dlt.resource
+def res_in_res(table_name, w_d):
+    def _gen(s):
+        yield from s
+
+    # NOTE: this is illegal now
+    return dlt.resource(_gen, name=table_name, write_disposition=w_d)
+
+
+def test_resource_returning_resource() -> None:
+    @dlt.source
+    def source_r_in_r():
+        yield res_in_res
+
+    s = source_r_in_r()
+    assert s.res_in_res.name == "res_in_res"
+    # this will return internal resource
+    r_i = s.res_in_res("table", "merge")
+    # we removed resources returning resources so those are just arguments
+    # and not applied to "inner" resource
+    assert r_i.name == "res_in_res"
+    assert r_i.compute_table_schema()["write_disposition"] == "append"
+
+    # type error: r_i was already bound above!
+    with pytest.raises(TypeError):
+        list(r_i("ABC"))
+
+
+def test_source_dynamic_resource_attrs() -> None:
+    # resources are also types
+
+    @dlt.source
+    def test_source(no_resources):
+        for i in range(no_resources):
+            yield dlt.resource(["A"] * i, name="resource_" + str(i))
+
+    s = test_source(10)
+    assert s.resource_1.name == s.resources["resource_1"].name
+    assert id(s.resource_1) == id(s.resources["resource_1"])
+    with pytest.raises(AttributeError):
+        s.resource_30
+
+
+def test_source_resource_attrs_with_conflicting_attrs() -> None:
+    """Resource names that conflict with DltSource attributes do not work with attribute access"""
+    dlt.pipeline(dev_mode=True)  # Create pipeline so state property can be accessed
+    names = ["state", "resources", "schema", "name", "clone"]
+
+    @dlt.source
+    def test_source() -> Iterator[DltResource]:
+        for name in names:
+            yield dlt.resource(["A"], name=name)
+
+    s = test_source()
+
+    # Resources are in resource dict but attributes are not created
+    assert set(s.resources.keys()) == set(names)
+    for name in names:
+        assert not isinstance(getattr(s, name), DltResource)
+
+
+def test_add_transform_steps() -> None:
+    # add all step types, using indexes. final steps
+    # gen -> map that converts to str and multiplies character -> filter str of len 2 -> yield all characters in str separately
+    r = (
+        dlt.resource([1, 2, 3, 4], name="all")
+        .add_limit(3)
+        .add_yield_map(lambda i: (yield from i))
+        .add_map(lambda i: str(i) * i, 1)
+        .add_filter(lambda i: len(i) == 2, 2)
+    )
+    assert list(r) == ["2", "2"]
+
+
+def test_add_transform_steps_pipe() -> None:
+    r = dlt.resource([1, 2, 3], name="all") | (lambda i: str(i) * i) | (lambda i: (yield from i))
+    assert list(r) == ["1", "2", "2", "3", "3", "3"]
+
+
+def test_add_transformer_right_pipe() -> None:
+    # def tests right hand pipe
+    r = [1, 2, 3] | dlt.transformer(lambda i: i * 2, name="lambda")
+    # resource was created for a list
+    assert r._pipe.parent.name.startswith("iter")
+    assert list(r) == [2, 4, 6]
+
+    # works for iterators
+    r = iter([1, 2, 3]) | dlt.transformer(lambda i: i * 3, name="lambda")
+    assert list(r) == [3, 6, 9]
+
+    # must be a transformer
+    with pytest.raises(ResourceNotATransformer):
+        iter([1, 2, 3]) | dlt.resource(lambda i: i * 3, name="lambda")
+
+
+def test_limit_infinite_counter() -> None:
+    r = dlt.resource(itertools.count(), name="infinity").add_limit(10)
+    assert r.limit.limit(30) == 10 * 30
+    assert list(r) == list(range(10))
+
+
+@pytest.mark.parametrize("limit", (None, -1, 0, 10))
+def test_limit_edge_cases(limit: int) -> None:
+    r = dlt.resource(range(20), name="resource").add_limit(limit)  # type: ignore[call-overload]
+
+    @dlt.resource()
+    async def r_async():
+        for i in range(20):
+            await asyncio.sleep(0.01)
+            yield i
+
+    @dlt.resource(parallelized=True)
+    def parallelized_resource():
+        for i in range(20):
+            yield i
+
+    sync_list = list(r)
+    async_list = list(r_async().add_limit(limit))
+    parallelized_list = list(parallelized_resource().add_limit(limit))
+
+    # all lists should be the same
+    assert sync_list == async_list == parallelized_list
+
+    if limit == 10:
+        assert r.limit.limit(50) == 10 * 50
+        assert sync_list == list(range(10))
+    elif limit in [None, -1]:
+        assert r.limit.limit(50) is None
+        assert sync_list == list(range(20))
+    elif limit == 0:
+        assert r.limit.limit(50) == 0
+        assert sync_list == []
+    else:
+        raise AssertionError(f"Unexpected limit: {limit}")
+
+
+def test_limit_empty_batches() -> None:
+    counter = 0
+
+    @dlt.resource
+    def empty_page():
+        nonlocal counter
+        for _ in range(3):
+            counter += 1
+            yield []
+
+    list(empty_page().add_limit(1))
+    assert counter == 1
+
+    counter = 0
+    list(empty_page().add_limit(1, count_rows=True))
+    assert counter == 3
+
+    counter = 0
+    list(empty_page().add_limit(max_time=10))
+    assert counter == 3
+
+
+def test_limit_skips_hints_only_items() -> None:
+    counter = 0
+
+    @dlt.resource
+    def pages():
+        nonlocal counter
+        # an empty list with hints is not a page
+        yield dlt.mark.with_hints(
+            [], dlt.mark.make_hints(columns=[{"name": "hinted", "data_type": "text"}])
+        )
+        for i in range(3):
+            counter += 1
+            yield [{"id": i}]
+
+    assert list(pages().add_limit(1)) == [{"id": 0}]
+    assert counter == 1
+    assert list(pages().add_limit(1, count_rows=True)) == [{"id": 0}]
+
+    # hints still reach the extractor
+    pipeline = dlt.pipeline(dev_mode=True)
+    pipeline.extract(pages().add_limit(1))
+    assert "hinted" in pipeline.default_schema.get_table_columns("pages")
+
+
+@pytest.mark.parametrize(
+    "parent_selected", [True, False], ids=["parent_selected", "parent_not_selected"]
+)
+@pytest.mark.parametrize("limit_on", ["source", "transformer"])
+def test_limit_transformer_pushed_to_parent(parent_selected: bool, limit_on: str) -> None:
+    pages = 0
+
+    def numbers():
+        nonlocal pages
+        for i in range(5):
+            pages += 1
+            yield [i * 10, i * 10 + 1]
+
+    @dlt.source
+    def numbers_source():
+        parent = dlt.resource(numbers, name="parent", selected=parent_selected)
+        yield parent
+        yield parent | dlt.transformer(name="child")(lambda items: [{"of": i} for i in items])
+
+    source = numbers_source()
+    if limit_on == "source":
+        source.add_limit(1)
+    else:
+        source.resources["child"].add_limit(1)
+
+    items = list(source)
+    assert pages == 1
+    assert [item for item in items if isinstance(item, dict)] == [{"of": 0}, {"of": 1}]
+    assert [item for item in items if isinstance(item, int)] == ([0, 1] if parent_selected else [])
+
+
+def test_limit_transformer_pushdown_rules(mocker: MockerFixture) -> None:
+    # limits compare by settings
+    assert LimitItem(1, None, False) == LimitItem(1, None, False)
+    assert LimitItem(1, None, False) != LimitItem(1, None, True)
+    assert LimitItem(None, None, False) == LimitItem(-1, None, False)
+
+    warning_spy = mocker.spy(dlt.common.logger, "warning")
+    grandparent = dlt.resource([1, 2, 3, 4, 5], name="grandparent")
+    t1 = dlt.transformer(lambda i: i * 2, name="t1")
+    t2 = dlt.transformer(lambda i: i + 1, name="t2")
+    chain = grandparent | t1 | t2
+
+    # the limit goes to the head of the chain
+    chain.add_limit(1)
+    assert grandparent.limit.max_items == 1
+    assert t1.limit is None and t2.limit is None
+    assert list(chain) == [3]
+    warning_spy.assert_not_called()
+
+    # a different limit on the head is replaced with a warning, the last limit wins
+    grandparent.add_limit(3)
+    t2.add_limit(1)
+    assert grandparent.limit.max_items == 1
+    assert warning_spy.call_count == 1
+    assert "`grandparent`" in warning_spy.call_args[0][0]
+
+    # the same limit is replaced without a warning
+    t1.add_limit(1)
+    assert warning_spy.call_count == 1
+
+    # a transformer that is not bound to a resource cannot be limited
+    unbound = dlt.transformer(lambda i: i, name="unbound")
+    unbound.add_limit(1)
+    assert warning_spy.call_count == 2
+    assert DltResource.Empty._pipe.get_by_type(LimitItem) is None
+    assert list(dlt.resource([1, 2, 3], name="data") | unbound) == [1, 2, 3]
+
+
+def test_limit_skip_filtered_batches() -> None:
+    counter = 0
+
+    @dlt.resource
+    def just_counter():
+        nonlocal counter
+        for i in range(10):
+            counter += 1
+            yield [i]
+
+    # fully filtered items are skipped
+    assert list(just_counter().add_filter(lambda i: i % 2 == 0).add_limit(2)) == [0, 2]
+    assert counter == 3  # one odd number skipped
+
+
+def test_various_limit_setups() -> None:
+    # basic test
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(3)
+    assert list(r) == [1, 2, 3]
+
+    # yield map test
+    r = (
+        dlt.resource([1, 2, 3, 4, 5], name="test")
+        .add_map(lambda i: str(i) * i, 1)
+        .add_yield_map(lambda i: (yield from i))
+        .add_limit(3)
+    )
+    # limit is applied at the end
+    assert list(r) == ["1", "2", "2"]  # "3" ,"3" ,"3" ,"4" ,"4" ,"4" ,"4", ...]
+
+    # nested lists test (limit only applied to yields, not actual items)
+    r = dlt.resource([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], name="test").add_limit(3)
+    assert list(r) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    # transformer test
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(4)
+    t = dlt.transformer(lambda i: i * 2, name="test")
+    assert list(r) == [1, 2, 3, 4]
+    assert list(r | t) == [2, 4, 6, 8]
+
+    # limit on transformer replaces the limit of its parent
+    t = t.add_limit(2)
+    assert r.limit.max_items == 2
+    assert list(r | t) == [2, 4]
+
+    # limits are fully replaced (more genereous limit applied later takes precedence)
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(3).add_limit(4)
+    assert list(r) == [1, 2, 3, 4]
+
+
+def test_limit_empty_items() -> None:
+    r = (
+        dlt.resource([[1], [2, 3, 4, 5], [6]], name="test")
+        .add_filter(lambda i: i != 1)
+        .add_limit(1)
+    )
+    # we filter [1] so it becomes [] and we do not count empty list
+    # into limit so we get
+    assert list(r) == [2, 3, 4, 5]
+
+
+def test_limit_max_time() -> None:
+    @dlt.resource()
+    def r():
+        for i in range(100):
+            time.sleep(0.1)
+            yield i
+
+    @dlt.resource()
+    async def r_async():
+        for i in range(100):
+            await asyncio.sleep(0.1)
+            yield i
+
+    r_limit = r().add_limit(max_time=1)
+    assert r_limit.limit.limit(100) is None
+    sync_list = list(r_limit)
+    r_async_limit = r_async().add_limit(max_time=1)
+    assert r_async_limit.limit.limit(100) is None
+    async_list = list(r_async_limit)
+
+    # we should have extracted 10 items within 1 second, sleep is included in the resource
+    # we allow for some variance in the number of items, as the sleep is not super precise
+    # on mac os we even sometimes just get 4 items...
+    allowed_results = [list(range(i)) for i in [12, 11, 10, 9, 8, 7, 6, 5, 4]]
+    assert sync_list in allowed_results
+    assert async_list in allowed_results
+
+
+def test_limit_count_by_rows() -> None:
+    # no batching - processing row by row
+    r = dlt.resource([1, 2, 3, 4, 5], name="test")
+    r_limit = r._clone().add_limit(3, count_rows=True)
+    assert list(r_limit) == [1, 2, 3]
+    # chunk size ignored when counting by rows
+    assert r_limit.limit.limit(chunk_size=5) == 3
+
+    # counts batches
+    r = dlt.resource([[1, 2, 3], [4, 5], [6, 7]], name="test")
+    # NOTE: if batches are irregular, LimitItem::limit has no meaning
+    assert list(r._clone().add_limit(3, count_rows=False)) == [1, 2, 3, 4, 5, 6, 7]
+    # counts rows
+    assert list(r._clone().add_limit(3, count_rows=True)) == [1, 2, 3]
+
+    # last batch will not be cut so we get it in full
+    r_limit = r._clone().add_limit(4, count_rows=True)
+    assert list(r_limit) == [1, 2, 3, 4, 5]
+    # still the limit is 3 items
+    assert r_limit.limit.limit(5) == 4
+
+    # list in batches are single rows
+    r = dlt.resource([[1, [2, 3]], [4, [5]]], name="test")
+    assert list(r._clone().add_limit(2, count_rows=True)) == [1, [2, 3]]
+
+
+def test_limit_source() -> None:
+    def mul_c(item):
+        yield from "A" * (item + 2)
+
+    @dlt.source
+    def infinite_source():
+        for idx in range(3):
+            r = dlt.resource(itertools.count(), name=f"infinity_{idx}").add_limit(10)
+            yield r
+            yield r | dlt.transformer(name=f"mul_c_{idx}")(mul_c)
+
+    # transformer is not limited to 2 elements, infinite resource is, we have 3 resources
+    assert list(infinite_source().add_limit(2)) == ["A", "A", 0, "A", "A", "A", 1] * 3
+
+
+def test_limit_source_count_items() -> None:
+    def mul_c():
+        while True:
+            yield ["A", "B"]
+
+    @dlt.source
+    def infinite_source():
+        return dlt.resource(mul_c)
+
+    # transformer is not limited to 2 elements, infinite resource is, we have 3 resources
+    assert list(infinite_source().add_limit(3, count_rows=True)) == ["A", "B", "A", "B"]
+
+
+def test_limit_yield_cleanup() -> None:
+    state: Dict[str, Any] = {}
+
+    @dlt.resource()
+    def r():
+        for i in range(100):
+            time.sleep(0.1)
+            try:
+                yield i
+            finally:
+                # it is safe to update the state even in case of an error
+                state["i"] = i
+
+        state["OK"] = "OK"
+
+    assert len(list(r().add_limit(max_items=10))) == 10
+    assert state["i"] == 9
+    assert "OK" not in state
+
+    state.clear()
+
+    @dlt.resource()
+    def r_exit():
+        try:
+            for i in range(100):
+                time.sleep(0.1)
+                try:
+                    yield i
+                finally:
+                    # it is safe to update the state even in case of an error
+                    state["i"] = i
+        finally:
+            state["OK"] = "OK"
+
+    # here both state and final OK are done
+
+    assert len(list(r_exit().add_limit(max_items=10))) == 10
+    assert state["i"] == 9
+    assert state["OK"] == "OK"
+
+    # if we forward a generator
+    state.clear()
+
+    @dlt.resource()
+    def r_from():
+        try:
+            for i in range(100):
+                time.sleep(0.1)
+                try:
+                    iter_ = iter([1, 2, 3])
+                    yield from iter_
+                finally:
+                    # it is safe to update the state even in case of an error
+                    state["i"] = i
+        finally:
+            state["OK"] = "OK"
+
+    l_ = list(r_from().add_limit(max_items=10))
+    # we stopped iter_ in the middle of it. so it was NOT processed like atomic package
+    assert len(l_) == 10
+    assert state["i"] == 3
+
+    # hack: make sure iter_ is exhausted first
+    # TODO: add a mechanism to exhaust such generator before calling the resource first
+    os.environ["EXTRACT__NEXT_ITEM_MODE"] = "fifo"
+    state.clear()
+
+    @dlt.resource()
+    def r_iter():
+        try:
+            for i in range(100):
+                time.sleep(0.1)
+                try:
+
+                    def _igen():
+                        yield from [1, 2, 3]
+                        print("igen END")
+
+                    print("->IGEN")
+                    yield _igen()
+                    print("IGEN->")
+                finally:
+                    # it is safe to update the state even in case of an error
+                    state["i"] = i
+        finally:
+            state["OK"] = "OK"
+
+    l_ = list(r_iter().add_limit(max_items=10))
+    print(l_)
+    print(state)
+
+
+@pytest.mark.parametrize("item_mode", ["async", "deferred", "nested_source"])
+def test_limit_drops_items_in_flight(item_mode: str) -> None:
+    """Items arriving after the limit is reached do not pass the steps before the limit"""
+    mapped = []
+
+    @dlt.resource
+    def r():
+        if item_mode == "nested_source":
+            yield iter(range(20))
+            return
+        for i in range(20):
+            if item_mode == "async":
+
+                async def _get_async(i: int = i) -> int:
+                    await asyncio.sleep(0.05)
+                    return i
+
+                yield _get_async()
+            else:
+
+                @dlt.defer
+                def _get_deferred(i: int = i) -> int:
+                    time.sleep(0.05)
+                    return i
+
+                yield _get_deferred()
+
+    def _record(i: int) -> int:
+        mapped.append(i)
+        return i
+
+    items = list(r().add_limit(5).add_map(_record))
+    assert len(items) == 5
+    assert mapped == items
+
+
+@pytest.mark.parametrize("limit_on", ["resource", "transformer"])
+def test_limit_zero_does_not_start_generator(limit_on: str) -> None:
+    calls = []
+
+    @dlt.resource
+    def parent():
+        calls.append("parent")
+        yield from range(3)
+
+    @dlt.transformer
+    def child(item: int):
+        calls.append("child")
+        yield item
+
+    if limit_on == "resource":
+        assert list(parent().add_limit(0)) == []
+        assert calls == []
+    else:
+        # add_limit moves the limit to the parent so we place it in the transformer pipe
+        chain = (parent() | child).add_step(LimitItem(0, None, False))
+        assert list(chain) == []
+        assert calls == ["parent"]
+
+
+def test_source_state() -> None:
+    @dlt.source
+    def test_source(expected_state):
+        assert source_state() == expected_state
+        return DltResource(Pipe.from_data("pipe", [1, 2, 3]), None, False)
+
+    with pytest.raises(PipelineStateNotAvailable):
+        test_source({}).state
+
+    dlt.pipeline(dev_mode=True)
+    assert test_source({}).state == {}
+
+    # inject state to see if what we write in state is there
+    with Container().injectable_context(StateInjectableContext(state={})) as state:
+        test_source({}).state["value"] = 1  # type: ignore[index]
+        test_source({"value": 1})
+        assert state.state == {"sources": {"test_source": {"value": 1}}}
+
+
+def test_resource_state() -> None:
+    @dlt.resource
+    def test_resource():
+        yield [1, 2, 3]
+
+    @dlt.source(schema=Schema("schema_section"))
+    def test_source():
+        return test_resource
+
+    r = test_resource()
+    s = test_source()
+    assert s.name == "schema_section"
+
+    with pytest.raises(PipelineStateNotAvailable):
+        r.state
+    with pytest.raises(PipelineStateNotAvailable):
+        s.state
+    with pytest.raises(PipelineStateNotAvailable):
+        s.test_resource.state
+
+    p = dlt.pipeline(dev_mode=True)
+    assert r.state == {}
+    assert s.state == {}
+    assert s.test_resource.state == {}
+
+    with Container().injectable_context(StateInjectableContext(state={})) as state:
+        r.state["direct"] = True  # type: ignore[index]
+        s.test_resource.state["in-source"] = True  # type: ignore[index]
+        # resource section is current module
+        print(state.state)
+        # the resource that is a part of the source will create a resource state key in the source state key
+        assert state.state["sources"]["schema_section"] == {
+            "resources": {"test_resource": {"in-source": True}}
+        }
+        assert s.state == {"resources": {"test_resource": {"in-source": True}}}
+        # the resource will create key which is default schema name
+        assert state.state["sources"][make_schema_with_default_name(p.pipeline_name)] == {
+            "resources": {"test_resource": {"direct": True}}
+        }
+
+
+def test_resource_dict_add_set() -> None:
+    def input_gen():
+        yield from [1, 2, 3]
+
+    def tx_step(item):
+        return item * 2
+
+    res_dict = DltResourceDict("source", "section")
+    input_r = DltResource.from_data(input_gen)
+    input_r_orig_pipe = input_r._pipe
+    input_tx = DltResource.from_data(tx_step, data_from=DltResource.Empty)
+    input_tx_orig_pipe = input_tx._pipe
+
+    res_dict["tx_step"] = input_r | input_tx
+    # pipes cloned on setter
+    assert res_dict["tx_step"] is not input_tx
+    assert res_dict["tx_step"]._pipe is not input_tx._pipe
+    # pipes in original resources not touched
+    assert input_r_orig_pipe == input_r._pipe
+    assert input_tx_orig_pipe == input_tx._pipe
+
+    # now add the parent
+    res_dict["input_gen"] = input_r
+    # got cloned
+    assert res_dict["input_gen"] is not input_r
+    # but the clone points to existing parent
+    assert res_dict["input_gen"]._pipe is res_dict["tx_step"]._pipe.parent
+    assert res_dict._new_pipes == []
+    assert len(res_dict._cloned_pairs) == 2
+    res_dict["tx_clone"] = (input_r | input_tx).with_name("tx_clone")
+    assert res_dict["tx_clone"]._pipe.parent is not res_dict["input_gen"]._pipe
+    assert len(res_dict._cloned_pairs) == 4
+    assert input_r_orig_pipe == input_r._pipe
+    assert input_tx_orig_pipe == input_tx._pipe
+
+    # add all together
+    res_dict = DltResourceDict("source", "section")
+    res_dict.add(input_r, input_r | input_tx)
+    assert res_dict._new_pipes == []
+    assert res_dict._suppress_clone_on_setitem is False
+    assert res_dict["input_gen"]._pipe is res_dict["tx_step"]._pipe.parent
+    # pipes in original resources not touched
+    assert input_r_orig_pipe == input_r._pipe
+    assert input_tx_orig_pipe == input_tx._pipe
+
+    # replace existing resource which has the old pipe
+    res_dict["input_gen"] = input_r
+    # an existing clone got assigned
+    assert res_dict["input_gen"]._pipe is res_dict["tx_step"]._pipe.parent
+    # keep originals
+    assert input_r_orig_pipe == input_r._pipe
+    assert input_tx_orig_pipe == input_tx._pipe
+
+    # replace existing resource which has the new pipe
+    input_r_cloned_pipe = input_r()
+    res_dict["input_gen"] = input_r_cloned_pipe
+    # we have disconnected gen and parent of tx
+    assert res_dict["input_gen"]._pipe is not res_dict["tx_step"]._pipe.parent
+    # keep originals
+    assert input_r_orig_pipe == input_r._pipe
+    assert input_tx_orig_pipe == input_tx._pipe
+    # keeps all references to pipes and resources as we have disjoint trees
+    assert len(res_dict._cloned_pairs) == 3
+    assert len(res_dict._resource_pipes) == 3
+
+    # now also set transformer
+    res_dict["tx_step"] = input_r_cloned_pipe | input_tx()
+    # we were able to remove dangling pipes and resources
+    assert len(res_dict._cloned_pairs) == 2
+    assert len(res_dict._resource_pipes) == 2
+
+    # can't set with different name than resource really has
+    with pytest.raises(ValueError):
+        res_dict["input_gen_x"] = input_r.with_name("uniq")
+
+    # can't add resource with same name again
+    with pytest.raises(InvalidResourceDataTypeMultiplePipes):
+        res_dict.add(input_r)
+
+
+@pytest.mark.parametrize("add_mode", ("add", "dict", "set"))
+def test_add_transformer_to_source(add_mode: str) -> None:
+    @dlt.resource(name="numbers")
+    def number_gen(init):
+        yield from range(init, init + 5)
+
+    @dlt.source
+    def number_source():
+        return number_gen
+
+    source = number_source()
+
+    @dlt.transformer
+    def multiplier(item):
+        return item * 2
+
+    mul_pipe = source.numbers | multiplier()
+
+    if add_mode == "add":
+        source.resources.add(mul_pipe)
+    elif add_mode == "dict":
+        source.resources["multiplier"] = mul_pipe
+    else:
+        source.multiplier = mul_pipe
+
+    # need to bind numbers
+    with pytest.raises(ParametrizedResourceUnbound):
+        list(source)
+
+    source.numbers.bind(10)
+    # both numbers and multiplier are evaluated, numbers only once
+    assert list(source) == [20, 10, 22, 11, 24, 12, 26, 13, 28, 14]
+
+
+def test_unknown_resource_access() -> None:
+    @dlt.resource(name="numbers")
+    def number_gen(init):
+        yield from range(init, init + 5)
+
+    @dlt.source
+    def number_source():
+        return number_gen
+
+    source = number_source()
+
+    with pytest.raises(AttributeError):
+        source.unknown
+
+    with pytest.raises(KeyError):
+        source.resources["unknown"]
+
+
+def test_clone_resource_on_call():
+    @dlt.resource(name="gene")
+    def number_gen(init):
+        yield from range(init, init + 5)
+
+    @dlt.transformer()
+    def multiplier(number, mul):
+        return number * mul
+
+    gene_clone = number_gen(10)
+    assert gene_clone is not number_gen
+    # call clones internally and creates resource with separate pipes
+    assert gene_clone._pipe is not number_gen._pipe
+    assert gene_clone._pipe.instance_id != number_gen._pipe.instance_id
+    assert gene_clone.name == number_gen.name
+
+    pipe = number_gen | multiplier
+    pipe_clone = pipe(4)
+    assert pipe_clone._pipe is not pipe._pipe
+    assert pipe._pipe is multiplier._pipe
+    # but parents are the same
+    assert pipe_clone._pipe.parent is number_gen._pipe
+    with pytest.raises(ParametrizedResourceUnbound):
+        list(pipe_clone)
+    # bind the original directly via pipe
+    pipe_clone._pipe.parent.bind_gen(10)
+    assert list(pipe_clone) == [40, 44, 48, 52, 56]
+
+
+def test_resource_keep_instances_on_bind():
+    @dlt.resource(name="gene")
+    def number_gen():
+        yield from range(1, 5)
+
+    @dlt.transformer
+    def multiplier(number, mul):
+        return number * mul
+
+    pipe = number_gen | multiplier
+    bound_pipe = pipe.bind(3)
+    assert bound_pipe is pipe is multiplier
+    assert bound_pipe._pipe is pipe._pipe
+    assert bound_pipe._pipe.parent is pipe._pipe.parent
+
+
+@dlt.resource(selected=False)
+def number_gen_ext(max_r=3):
+    yield from range(1, max_r)
+
+
+def test_clone_resource_with_rename():
+    assert get_fun_spec(number_gen_ext) is not BaseConfiguration
+    gene_r = number_gen_ext.with_name("gene")
+    assert number_gen_ext.name == "number_gen_ext"
+    assert gene_r.name == "gene"
+    assert number_gen_ext.section == gene_r.section
+    assert get_fun_spec(gene_r) is get_fun_spec(number_gen_ext)
+    assert gene_r.selected == number_gen_ext.selected is False
+
+
+def test_source_multiple_iterations() -> None:
+    def some_data():
+        yield [1, 2, 3]
+        yield [1, 2, 3]
+
+    s = DltSource(Schema("source"), "module", [dlt.resource(some_data())])
+    assert s.exhausted is False
+    assert list(s) == [1, 2, 3, 1, 2, 3]
+    assert s.exhausted is True
+    assert list(s) == []
+    info = str(s)
+    assert "Source is already iterated" in info
+
+
+def test_exhausted_property() -> None:
+    # this example will be exhausted after iteration
+    def open_generator_data():
+        yield from [1, 2, 3, 4]
+
+    s = DltSource(Schema("source"), "module", [dlt.resource(open_generator_data())])
+    assert s.exhausted is False
+    assert next(iter(s)) == 1
+    assert s.exhausted is True
+
+    # lists will not exhaust
+    s = DltSource(
+        Schema("source"),
+        "module",
+        [dlt.resource([1, 2, 3, 4], table_name="table", name="resource")],
+    )
+    assert s.exhausted is False
+    assert next(iter(s)) == 1
+    assert s.exhausted is False
+
+    # iterators will not exhaust
+    s = DltSource(
+        Schema("source"),
+        "module",
+        [dlt.resource(iter([1, 2, 3, 4]), table_name="table", name="resource")],
+    )
+    assert s.exhausted is False
+    assert next(iter(s)) == 1
+    assert s.exhausted is False
+
+    # having on exhausted generator resource will make the whole source exhausted
+    def open_generator_data():  # type: ignore[no-redef]
+        yield from [1, 2, 3, 4]
+
+    s = DltSource(
+        Schema("source"),
+        "module",
+        [
+            dlt.resource([1, 2, 3, 4], table_name="table", name="resource"),
+            dlt.resource(open_generator_data()),
+        ],
+    )
+    assert s.exhausted is False
+
+    # execute the whole source
+    list(s)
+    assert s.exhausted is True
+
+    # source with transformers also exhausts
+    @dlt.source
+    def mysource():
+        r = dlt.resource(itertools.count(start=1), name="infinity").add_limit(5)
+        yield r
+        yield r | dlt.transformer(name="double")(lambda x: x * 2)
+
+    s = mysource()
+    assert s.exhausted is False
+    assert next(iter(s)) == 2  # transformer is returned before resource
+    assert s.exhausted is False
+
+
+def test_exhausted_with_limit() -> None:
+    def open_generator_data():
+        yield from [1, 2, 3, 4]
+
+    s = DltSource(
+        Schema("source"),
+        "module",
+        [dlt.resource(open_generator_data)],
+    )
+    assert s.exhausted is False
+    list(s)
+    assert s.exhausted is False
+
+    # use limit
+    s.add_limit(1)
+    list(s)
+    # must still be false, limit should not open generator if it is still generator function
+    assert s.exhausted is False
+    assert list(s) == [1]
+
+
+def test_clone_resource_with_name() -> None:
+    @dlt.resource(selected=False)
+    def _r1():
+        yield ["a", "b", "c"]
+
+    @dlt.transformer(selected=True)
+    def _t1(items, suffix):
+        yield list(map(lambda i: i + "_" + suffix, items))
+
+    r1 = _r1()
+    r1_clone = r1.with_name("r1_clone")
+    # new name of resource and pipe
+    assert r1_clone.name == "r1_clone"
+    assert r1_clone._pipe.name == "r1_clone"
+    assert r1_clone.table_name == "r1_clone"
+    # original keeps old name and pipe
+    assert r1._pipe is not r1_clone._pipe
+    assert r1.name == "_r1"
+    assert r1.table_name == "_r1"
+
+    # clone transformer before it is bound
+    bound_t1_clone = r1_clone | _t1.with_name("t1_clone")("ax")
+    bound_t1_clone_2 = r1_clone | _t1("ax_2").with_name("t1_clone_2")
+    assert bound_t1_clone.name == "t1_clone"
+    assert bound_t1_clone_2.name == "t1_clone_2"
+    assert bound_t1_clone.table_name == "t1_clone"
+    assert bound_t1_clone_2.table_name == "t1_clone_2"
+    # but parent is the same (we cloned only transformer - before it is bound)
+    assert bound_t1_clone_2._pipe.parent is bound_t1_clone._pipe.parent
+
+    # evaluate transformers
+    assert list(bound_t1_clone) == ["a_ax", "b_ax", "c_ax"]
+    assert list(bound_t1_clone_2) == ["a_ax_2", "b_ax_2", "c_ax_2"]
+
+    # clone pipes (bound transformer)
+    pipe_r1 = _r1()
+    pipe_t1 = _t1("cx")
+    pipe_r1_t1 = pipe_r1 | pipe_t1
+    pipe_r1_t1_clone = pipe_r1_t1.with_name("pipe_clone")
+    assert pipe_r1_t1_clone.name == "pipe_clone"
+    # parent of the pipe also cloned and renamed
+    assert pipe_r1_t1_clone._pipe.parent.name == "_r1_pipe_clone"
+    # originals are not affected
+    assert pipe_r1.name == "_r1"
+    assert pipe_t1.name == "_t1"
+    assert pipe_t1._parent is pipe_r1
+    assert pipe_t1._parent._pipe is pipe_r1._pipe
+    # binding a transformer is not cloning the original, also instance ids are separate
+    assert pipe_t1._pipe is pipe_r1_t1._pipe
+    assert pipe_r1._pipe is pipe_r1_t1._pipe.parent
+    # with_name clones
+    assert pipe_t1._pipe is not pipe_r1_t1_clone._pipe
+    assert pipe_r1._pipe is not pipe_r1_t1_clone._pipe.parent
+    # renaming also clones parents
+    assert pipe_r1_t1_clone._parent is not pipe_r1
+    assert pipe_r1_t1_clone._pipe.parent is pipe_r1_t1_clone._parent._pipe
+
+    # rename again
+    pipe_r1_t1_clone_2 = pipe_r1_t1_clone.with_name("pipe_clone_2")
+    # replace previous name part (pipe_clone in _r1_pipe_clone) with pipe_clone_2
+    assert pipe_r1_t1_clone_2._pipe.parent.name == "_r1_pipe_clone_2"
+    assert pipe_r1_t1_clone_2._parent is not pipe_r1
+    assert pipe_r1_t1_clone_2._pipe.parent is pipe_r1_t1_clone_2._parent._pipe
+
+    # preserves table name if set
+    table_t1 = _r1 | _t1
+    table_t1.table_name = "Test_Table"
+    table_t1_clone = table_t1.with_name("table_t1_clone")
+    assert table_t1_clone.name == "table_t1_clone"
+    assert table_t1_clone.table_name == "Test_Table"
+
+    # also preserves when set the same name as resource name
+    assert table_t1.name == "_t1"
+    table_t1.table_name = "_t1"
+    table_t1_clone = table_t1.with_name("table_t1_clone")
+    assert table_t1_clone.name == "table_t1_clone"
+    assert table_t1_clone.table_name == "_t1"
+
+
+def test_apply_hints() -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    empty_table_schema = {
+        "name": "empty_gen",
+        "columns": {},
+        "resource": "empty_gen",
+        "write_disposition": "append",
+    }
+
+    empty = DltResource.from_data(empty_gen)
+
+    empty_r = empty()
+    # check defaults
+    assert empty_r.name == empty.name == empty_r.table_name == empty.table_name == "empty_gen"
+    # assert empty_r._table_schema_template is None
+    assert empty_r.compute_table_schema() == empty_table_schema
+    assert empty_r.write_disposition == "append"
+
+    empty_r.apply_hints(write_disposition="replace")
+    assert empty_r.write_disposition == "replace"
+    empty_r.write_disposition = "merge"
+    assert empty_r.compute_table_schema()["write_disposition"] == "merge"
+    # delete hint
+    empty_r.apply_hints(write_disposition="")
+    empty_r.write_disposition = "append"
+    assert empty_r.compute_table_schema()["write_disposition"] == "append"
+
+    empty_r.apply_hints(
+        table_name="table",
+        parent_table_name="parent",
+        primary_key=["a", "b"],
+        merge_key=["c", "a"],
+        schema_contract="freeze",
+        table_format="delta",
+        file_format="jsonl",
+    )
+    table = empty_r.compute_table_schema()
+    assert table["columns"]["a"] == {
+        "merge_key": True,
+        "name": "a",
+        "nullable": False,
+        "primary_key": True,
+    }
+    assert table["columns"]["b"] == {"name": "b", "nullable": False, "primary_key": True}
+    assert table["columns"]["c"] == {"merge_key": True, "name": "c", "nullable": False}
+    assert table["name"] == "table"
+    assert table["parent"] == "parent"
+    assert empty_r.table_name == "table"
+    assert table["schema_contract"] == "freeze"
+    assert table["table_format"] == "delta"
+    assert table["file_format"] == "jsonl"
+
+    # reset
+    empty_r.apply_hints(
+        table_name="",
+        parent_table_name="",
+        table_format="",
+        file_format="",
+        primary_key=[],
+        merge_key="",
+        columns={},
+        incremental=Incremental.EMPTY,
+        schema_contract={},
+    )
+    assert empty_r._hints == {
+        "columns": {},
+        "incremental": Incremental.EMPTY,
+        "validator": None,
+        "write_disposition": "append",
+        "original_columns": {},
+        "merge_key": "",
+        "primary_key": [],
+    }
+    empty_keys_table_schema = empty_table_schema
+    empty_keys_table_schema["columns"] = {}
+    table = empty_r.compute_table_schema()
+    assert table == empty_keys_table_schema
+
+    # combine columns with primary key
+    empty_r = empty()
+    empty_r.apply_hints(
+        columns={"tags": {"data_type": "json", "primary_key": False}},
+        primary_key="tags",
+        merge_key="tags",
+    )
+    # primary key not set here
+    assert empty_r.columns["tags"] == {"data_type": "json", "name": "tags", "primary_key": False}
+    # only in the computed table
+    assert empty_r.compute_table_schema()["columns"]["tags"] == {
+        "data_type": "json",
+        "name": "tags",
+        "nullable": False,  # NOT NULL because `tags` do not define it
+        "primary_key": True,
+        "merge_key": True,
+    }
+    # test SCD2 write disposition hint
+    empty_r.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "scd2",
+            "validity_column_names": ["from", "to"],
+        }
+    )
+    assert empty_r._hints["write_disposition"] == {
+        "disposition": "merge",
+        "strategy": "scd2",
+        "validity_column_names": ["from", "to"],
+    }
+    assert "from" not in empty_r._hints["columns"]
+    assert "to" not in empty_r._hints["columns"]
+    table = empty_r.compute_table_schema()
+    assert table["write_disposition"] == "merge"
+    assert table["x-merge-strategy"] == "scd2"
+    assert "from" in table["columns"]
+    assert "x-valid-from" in table["columns"]["from"]
+    assert "to" in table["columns"]
+    assert "x-valid-to" in table["columns"]["to"]
+
+    # Test table references hint
+    reference_hint = [
+        dict(
+            referenced_table="other_table",
+            columns=["a", "b"],
+            referenced_columns=["other_a", "other_b"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint)
+    assert empty_r._hints["references"] == reference_hint
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint
+
+    # Apply references again, list is extended
+    reference_hint_2 = [
+        dict(
+            referenced_table="other_table_2",
+            columns=["c", "d"],
+            referenced_columns=["other_c", "other_d"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint_2)
+    assert empty_r._hints["references"] == reference_hint + reference_hint_2
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint + reference_hint_2
+
+    # Duplicate reference is replaced
+    reference_hint_3 = [
+        dict(
+            referenced_table="other_table",
+            columns=["a2", "b2"],
+            referenced_columns=["other_a2", "other_b2"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint_3)
+    assert empty_r._hints["references"] == reference_hint_3 + reference_hint_2
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint_3 + reference_hint_2
+
+
+def test_apply_dynamic_hints() -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    empty = DltResource.from_data(empty_gen)
+
+    empty_r = empty()
+    with pytest.raises(InconsistentTableTemplate):
+        empty_r.apply_hints(parent_table_name=lambda ev: ev["p"], write_disposition=None)
+
+    empty_r.apply_hints(
+        table_name=lambda ev: ev["t"], parent_table_name=lambda ev: ev["p"], write_disposition=None
+    )
+    assert empty_r._table_name_hint_fun is not None
+    assert empty_r._table_has_other_dynamic_hints is True
+
+    assert empty_r.has_dynamic_table_name is True
+    assert empty_r.has_other_dynamic_hints is True
+
+    with pytest.raises(DataItemRequiredForDynamicTableHints):
+        empty_r.compute_table_schema()
+    table = empty_r.compute_table_schema({"t": "table", "p": "parent"})
+    assert table["name"] == "table"
+    assert table["parent"] == "parent"
+
+    # try write disposition and primary key
+    empty_r.apply_hints(primary_key=lambda ev: ev["pk"], write_disposition=lambda ev: ev["wd"])
+    table = empty_r.compute_table_schema(
+        {"t": "table", "p": "parent", "pk": ["a", "b"], "wd": "skip"}
+    )
+    assert table["write_disposition"] == "skip"
+    assert "a" in table["columns"]
+
+    # validate fails
+    with pytest.raises(DictValidationException):
+        empty_r.compute_table_schema(
+            {"t": "table", "p": "parent", "pk": ["a", "b"], "wd": "x-skip"}
+        )
+
+    # dynamic columns
+    empty_r.apply_hints(columns=lambda ev: ev["c"])
+    table = empty_r.compute_table_schema(
+        {"t": "table", "p": "parent", "pk": ["a", "b"], "wd": "skip", "c": [{"name": "tags"}]}
+    )
+    assert table["columns"]["tags"] == {"name": "tags"}
+
+
+def test_apply_hints_complex_migration() -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    empty = DltResource.from_data(empty_gen)
+    empty_r = empty()
+
+    def dyn_type(ev):
+        # must return columns in one of the known formats
+        return [{"name": "dyn_col", "data_type": ev["dt"]}]
+
+    # start with static columns, update to dynamic
+    empty_r.apply_hints(
+        table_name=lambda ev: ev["t"], columns=[{"name": "dyn_col", "data_type": "json"}]
+    )
+
+    table = empty_r.compute_table_schema({"t": "table"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
+
+    empty_r.apply_hints(table_name=lambda ev: ev["t"], columns=dyn_type)
+    table = empty_r.compute_table_schema({"t": "table", "dt": "complex"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
+
+    # start with dynamic
+    empty_r = empty()
+    empty_r.apply_hints(table_name=lambda ev: ev["t"], columns=dyn_type)
+    table = empty_r.compute_table_schema({"t": "table", "dt": "complex"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
+
+
+def test_apply_hints_table_variants() -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    empty = DltResource.from_data(empty_gen)
+
+    # table name must be a string
+    with pytest.raises(ValueError):
+        empty.apply_hints(write_disposition="append", create_table_variant=True)
+    with pytest.raises(ValueError):
+        empty.apply_hints(
+            table_name=lambda ev: ev["t"], write_disposition="append", create_table_variant=True
+        )
+
+    # table a with replace
+    empty.apply_hints(table_name="table_a", write_disposition="replace", create_table_variant=True)
+    table_a = empty.compute_table_schema(meta=TableNameMeta("table_a"))
+    assert table_a["name"] == "table_a"
+    assert table_a["write_disposition"] == "replace"
+    # a registered variant carries its variant name
+    assert table_a["variant_name"] == "table_a"
+
+    # unknown table (without variant) - created out resource hints
+    table_unk = empty.compute_table_schema(meta=TableNameMeta("table_unk"))
+    assert table_unk["name"] == "table_unk"
+    assert table_unk["write_disposition"] == "append"
+    # not a registered variant - dispatched table name carries no variant_name
+    assert "variant_name" not in table_unk
+
+    # resource hints are base for table variants
+    empty.apply_hints(
+        primary_key="id",
+        incremental=dlt.sources.incremental(cursor_path="x"),
+        columns=[{"name": "id", "data_type": "bigint"}],
+    )
+    empty.apply_hints(table_name="table_b", write_disposition="merge", create_table_variant=True)
+    table_b = empty.compute_table_schema(meta=TableNameMeta("table_b"))
+    assert table_b["name"] == "table_b"
+    assert table_b["write_disposition"] == "merge"
+    assert table_b["variant_name"] == "table_b"
+    assert len(table_b["columns"]) == 1
+    assert table_b["columns"]["id"]["primary_key"] is True
+    # overwrite table_b, remove column def and primary_key
+    empty.apply_hints(table_name="table_b", columns=[], primary_key=(), create_table_variant=True)
+    table_b = empty.compute_table_schema(meta=TableNameMeta("table_b"))
+    assert table_b["name"] == "table_b"
+    assert table_b["write_disposition"] == "merge"
+    assert len(table_b["columns"]) == 0
+
+    # dyn hints not allowed
+    with pytest.raises(InconsistentTableTemplate):
+        empty.apply_hints(
+            table_name="table_b", write_disposition=lambda ev: ev["wd"], create_table_variant=True
+        )
+
+
+@pytest.mark.parametrize("key_prop", ("primary_key", "merge_key"))
+def test_apply_hints_keys(key_prop: TColumnProp) -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    key_columns = ["id_1", "id_2"]
+
+    empty = DltResource.from_data(empty_gen)
+    # apply compound key
+    empty.apply_hints(**{key_prop: key_columns})  # type: ignore
+    table = empty.compute_table_schema()
+    actual_keys = utils.get_columns_names_with_prop(table, key_prop, include_incomplete=True)
+    assert actual_keys == key_columns
+    # nullable is false
+    actual_keys = utils.get_columns_names_with_prop(table, "nullable", include_incomplete=True)
+    assert actual_keys == key_columns
+
+    # apply new key
+    key_columns_2 = ["id_1", "id_3"]
+    empty.apply_hints(**{key_prop: key_columns_2})  # type: ignore
+    table = empty.compute_table_schema()
+    actual_keys = utils.get_columns_names_with_prop(table, key_prop, include_incomplete=True)
+    assert actual_keys == key_columns_2
+    actual_keys = utils.get_columns_names_with_prop(table, "nullable", include_incomplete=True)
+    assert actual_keys == key_columns_2
+
+    # if column is present for a key, it get merged and nullable should be preserved
+    id_2_col: TColumnSchema = {
+        "name": "id_2",
+        "data_type": "bigint",
+    }
+
+    empty.apply_hints(**{key_prop: key_columns}, columns=[id_2_col])  # type: ignore
+    table = empty.compute_table_schema()
+    actual_keys = utils.get_columns_names_with_prop(table, key_prop, include_incomplete=True)
+    assert set(actual_keys) == set(key_columns)
+    # nullable not set in id_2_col so NOT NULL is set
+    actual_keys = utils.get_columns_names_with_prop(table, "nullable", include_incomplete=True)
+    assert set(actual_keys) == set(key_columns)
+
+    id_2_col["nullable"] = True
+    empty.apply_hints(**{key_prop: key_columns}, columns=[id_2_col])  # type: ignore
+    table = empty.compute_table_schema()
+    actual_keys = utils.get_columns_names_with_prop(table, key_prop, include_incomplete=True)
+    assert set(actual_keys) == set(key_columns)
+    # id_2 set to NULL
+    actual_keys = utils.get_columns_names_with_prop(table, "nullable", include_incomplete=True)
+    assert set(actual_keys) == {"id_1"}
+
+    # apply key via schema
+    id_2_col[key_prop] = True
+
+    empty = DltResource.from_data(empty_gen)
+    empty.apply_hints(**{key_prop: key_columns_2}, columns=[id_2_col])  # type: ignore
+    table = empty.compute_table_schema()
+    # only 2 columns specified via the direct key hint are set so
+    actual_keys = utils.get_columns_names_with_prop(table, key_prop, include_incomplete=True)
+    assert actual_keys == key_columns_2
+    actual_keys = utils.get_columns_names_with_prop(table, "nullable", include_incomplete=True)
+    assert actual_keys == key_columns_2
+
+
+def test_apply_nested_hints():
+    data = [
+        {
+            "id": 1,
+            "outer1": [
+                {"outer1_id": "2", "innerfoo": [{"innerfoo_id": "3"}]},
+            ],
+            "outer2": [
+                {"outer2_id": "4", "innerbar": [{"innerbar_id": "5"}]},
+            ],
+        }
+    ]
+    resource_name = "with_nested_hints"
+    nested_resource = DltResource.from_data(data, name=resource_name)
+
+    # before applying any hints
+    initial_schema = {
+        "name": resource_name,
+        "columns": {},
+        "resource": resource_name,
+        "write_disposition": "append",
+    }
+    assert nested_resource.nested_hints is None
+    assert nested_resource.compute_table_schema() == initial_schema
+
+    # apply nested hints
+    outer1_id_new_type: TDataType = "double"
+    outer2_innerbar_id_new_type: TDataType = "bigint"
+    nested_hints: Dict[TTableNames, TResourceNestedHints] = {
+        ("outer1",): dict(
+            columns={"outer1_id": {"name": "outer1_id", "data_type": outer1_id_new_type}}
+        ),
+        ("outer2", "innerbar"): dict(
+            columns={
+                "innerbar_id": {"name": "innerbar_id", "data_type": outer2_innerbar_id_new_type}
+            }
+        ),
+    }
+    expected_nested_schemas = [
+        {
+            "name": "with_nested_hints__outer1",
+            "parent": "with_nested_hints",
+            "columns": {"outer1_id": {"name": "outer1_id", "data_type": "double"}},
+        },
+        {
+            "name": "with_nested_hints__outer2__innerbar",
+            "parent": "with_nested_hints__outer2",
+            "columns": {"innerbar_id": {"name": "innerbar_id", "data_type": "bigint"}},
+        },
+    ]
+
+    nested_resource.apply_hints(nested_hints=nested_hints)
+    assert nested_resource.nested_hints == nested_hints
+
+    nested_schemas = nested_resource.compute_nested_table_schemas(
+        resource_name, naming=SnakeCaseNamingConvention()
+    )
+    assert nested_schemas == expected_nested_schemas
+
+    # apply hints again
+    nested_hints = {
+        ("outer1",): {
+            "columns": {
+                "outer1_id": {"name": "outer1_id", "data_type": "decimal", "precision": 18}
+            },
+            "references": [
+                {
+                    "columns": ["outer1_id"],
+                    "referenced_columns": ["outer1_fk_1"],
+                    "referenced_table": "external_table",
+                }
+            ],
+            "file_format": "parquet",
+            "table_format": "delta",
+            "schema_contract": "discard_value",
+        },
+        ("outer2", "innerbar"): {"merge_key": "innerfoo_id"},
+    }
+    nested_resource.apply_hints(nested_hints=nested_hints)
+    nested_schemas = nested_resource.compute_nested_table_schemas(
+        resource_name, naming=SnakeCaseNamingConvention()
+    )
+    # currently new hints overwrite fully old hints. nothing gets merged
+    assert nested_schemas == [
+        {
+            "columns": {
+                "outer1_id": {"name": "outer1_id", "data_type": "decimal", "precision": 18}
+            },
+            "references": [
+                {
+                    "columns": ["outer1_id"],
+                    "referenced_columns": ["outer1_fk_1"],
+                    "referenced_table": "external_table",
+                }
+            ],
+            "file_format": "parquet",
+            "table_format": "delta",
+            "schema_contract": "discard_value",
+            "name": "with_nested_hints__outer1",
+            "parent": "with_nested_hints",
+        },
+        {
+            "columns": {
+                "innerfoo_id": {"name": "innerfoo_id", "nullable": False, "merge_key": True}
+            },
+            "name": "with_nested_hints__outer2__innerbar",
+            "resource": "with_nested_hints",
+        },
+    ]
+    # with_nested_hints__outer2__innerbar not a nested table
+    assert utils.is_nested_table(nested_schemas[1]) is False
+    assert utils.may_be_nested(nested_schemas[1]) is False
+
+
+def test_resource_no_template() -> None:
+    empty = DltResource.from_data([1, 2, 3], name="table")
+    assert empty.write_disposition == "append"
+    assert empty.compute_table_schema()["write_disposition"] == "append"
+    empty.apply_hints()
+    assert empty.write_disposition == "append"
+    assert empty.compute_table_schema()["write_disposition"] == "append"
+
+
+def test_selected_pipes_with_duplicates():
+    def input_gen():
+        yield from [1, 2, 3]
+
+    def tx_step(item):
+        return item * 2
+
+    input_r = DltResource.from_data(input_gen)
+    input_r_clone = input_r.with_name("input_gen_2")
+
+    # separate resources have separate pipe instances
+    source = DltSource(Schema("dupes"), "module", [input_r, input_r_clone])
+    pipes = source.resources.pipes
+    assert len(pipes) == 2
+    assert pipes[0].name == "input_gen"
+    assert source.resources[pipes[0].name] == source.input_gen
+    selected_pipes = source.resources.selected_pipes
+    assert len(selected_pipes) == 2
+    assert selected_pipes[0].name == "input_gen"
+    assert list(source) == [1, 2, 3, 1, 2, 3]
+
+    # cloned from fresh resource
+    source = DltSource(
+        Schema("dupes"),
+        "module",
+        [DltResource.from_data(input_gen), DltResource.from_data(input_gen).with_name("gen_2")],
+    )
+    assert list(source) == [1, 2, 3, 1, 2, 3]
+
+    # clone transformer
+    input_r = DltResource.from_data(input_gen)
+    input_tx = DltResource.from_data(tx_step, data_from=DltResource.Empty)
+    source = DltSource(
+        Schema("dupes"), "module", [input_r, (input_r | input_tx).with_name("tx_clone")]
+    )
+    pipes = source.resources.pipes
+    assert len(pipes) == 2
+    assert source.resources[pipes[0].name] == source.input_gen
+    assert source.resources[pipes[1].name] == source.tx_clone
+    selected_pipes = source.resources.selected_pipes
+    assert len(selected_pipes) == 2
+    assert list(source) == [1, 2, 3, 2, 4, 6]
+
+
+def test_source_repr() -> None:
+    @dlt.source
+    def number_source():
+        @dlt.resource(name="numbers")
+        def number_gen(init):
+            yield from range(init, init + 5)
+
+        return [number_gen]
+
+    sentinel = object()
+    source = number_source()
+
+    repr_ = source.__repr__()
+    assert isinstance(repr_, str)
+    assert "dlt.source(" in repr_
+
+    # check that properties used by `__repr__` exist
+    assert getattr(source, "name", sentinel) is not sentinel
+    assert getattr(source, "schema_contract", sentinel) is not sentinel
+    assert getattr(source, "exhausted", sentinel) is not sentinel
+    assert getattr(source, "resources", sentinel) is not sentinel
+    # we expected resources to exist
+    assert isinstance(source.resources, dict)
+
+
+def test_resource_dict_repr() -> None:
+    @dlt.source
+    def number_source():
+        @dlt.resource(name="numbers")
+        def number_gen(init):
+            yield from range(init, init + 5)
+
+        return [number_gen]
+
+    sentinel = object()
+    resources = number_source().resources
+
+    repr_ = resources.__repr__()
+    assert isinstance(repr_, str)
+
+    # check that properties used by `__repr__` exist
+    assert getattr(resources, "selected", sentinel) is not sentinel
+    assert getattr(resources, "extracted", sentinel) is not sentinel
+
+
+def test_resource_repr() -> None:
+    from dlt.extract.items_transform import LimitItem
+
+    @dlt.resource(name="numbers")
+    def number_gen(init):
+        yield from range(init, init + 5)
+
+    sentinel = object()
+    resource = number_gen(0)
+
+    repr_ = resource.__repr__()
+    assert isinstance(repr_, str)
+    assert "dlt.resource(" in repr_
+
+    # check that properties used by `__repr__` exist
+    assert getattr(resource, "name", sentinel) is not sentinel
+    assert getattr(resource, "_hints", sentinel) is not sentinel
+    assert getattr(resource, "_pipe", sentinel) is not sentinel
+    assert getattr(resource._pipe, "steps", sentinel) is not sentinel
+    assert getattr(resource, "incremental", sentinel) is not sentinel
+    assert getattr(resource, "validator", sentinel) is not sentinel
+    assert getattr(resource, "is_transformer", sentinel) is not sentinel
+
+    # the resource repr check if `._pipe.step` includes a `LimitItem` step
+    assert getattr(LimitItem(None, None, False), "max_items", sentinel) is not sentinel
+
+    # repr for empty resource
+    repr_ = DltResource.Empty.__repr__()
+    assert isinstance(repr_, str)
+    assert "dlt.resource(" in repr_

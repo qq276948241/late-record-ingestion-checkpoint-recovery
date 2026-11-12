@@ -1,0 +1,11 @@
+jaffle_shop:
+  target: analytics
+  outputs:
+    analytics:
+      type: postgres
+      host: "{{ env_var('DLT__CREDENTIALS__HOST') }}"
+      user: "{{ env_var('DLT__CREDENTIALS__USERNAME') }}"
+      password: "{{ env_var('DLT__CREDENTIALS__PASSWORD') }}"
+      port: 5432
+      dbname: "{{ env_var('DLT__CREDENTIALS__DATABASE') }}"
+      schema: "{{ var('dbt_schema') }}"

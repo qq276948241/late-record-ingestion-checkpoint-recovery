@@ -1,0 +1,70 @@
+{
+  "name": "dlt-docs",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start": "cd .. && make start",
+    "build": "cd .. && make build",
+    "clear": "docusaurus clear",
+    "serve": "docusaurus serve --dir build/docs",
+    "search-index": "pagefind",
+    "clear-versions": "node tools/clear_versions.js",
+    "update-versions": "node tools/update_versions.js",
+    "compile-redirects": "node tools/compile_redirects.js",
+    "check-orphan-docs": "node tools/check_orphan_docs.js",
+    "check-orphan-docs:all": "node tools/check_orphan_docs.js --all",
+    "build:cloudflare": "npm run build",
+    "serve:cloudflare": "wrangler dev --port 3001 --local",
+    "preview:cloudflare": "npm run build && npm run serve:cloudflare",
+    "deploy:cloudflare": "npm run build && wrangler deploy",
+    "verify-llms": "node scripts/verify-llms-txt.js",
+    "verify-redirects": "node scripts/verify-redirects.js",
+    "lint": "biome check .",
+    "lint:format": "biome check --write ."
+  },
+  "dependencies": {
+    "@docusaurus/core": "~3.9.2",
+    "@docusaurus/faster": "~3.9.2",
+    "@docusaurus/preset-classic": "~3.9.2",
+    "@docusaurus/theme-common": "~3.9.2",
+    "@docusaurus/theme-mermaid": "~3.9.2",
+    "@mdx-js/react": "^3.1.0",
+    "@microlabs/otel-cf-workers": "1.0.0-rc.49",
+    "clsx": "^1.2.1",
+    "dedent": "^1.5.1",
+    "dotenv": "^16.3.1",
+    "prism-react-renderer": "^1.3.5",
+    "raw-loader": "^4.0.2",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-twitter-embed": "^4.0.4",
+    "semver": "^7.6.3",
+    "string-dedent": "^3.0.1",
+    "sync-fetch": "^0.5.2",
+    "toml": "^3.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@docusaurus/module-type-aliases": "~3.9.2",
+    "pagefind": "^1.5.2",
+    "wrangler": "^4.38.0"
+  },
+  "browserslist": {
+    "production": [
+      ">0.5%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.4"
+  }
+}

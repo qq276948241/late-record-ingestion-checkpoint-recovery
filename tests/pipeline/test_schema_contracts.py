@@ -1,0 +1,1782 @@
+import dlt, pytest
+import contextlib
+from typing import Any, Callable, ClassVar, Dict, Iterator, Literal, Union, Optional, Type, cast
+
+from dlt.common import Decimal
+from dlt.common.destination.typing import PreparedTableSchema
+from dlt.common.schema.typing import (
+    TColumnSchema,
+    TSchemaContract,
+    TSchemaContractDict,
+    TSchemaEvolutionMode,
+)
+from dlt.common.utils import uniq_id
+from dlt.common.schema import Schema
+from dlt.common.schema.utils import new_table
+from dlt.common.schema.exceptions import DataValidationError
+from dlt.common.typing import TDataItems
+from dlt.destinations import snowflake
+from dlt.extract.hints import make_hints
+
+from dlt.extract import DltResource
+from dlt.load.exceptions import LoadClientJobException
+from dlt.pipeline.pipeline import Pipeline
+from dlt.pipeline.exceptions import PipelineStepFailed
+from dlt.extract.exceptions import ResourceExtractionError
+
+from tests.pipeline.utils import load_table_counts, assert_load_info
+from tests.utils import (
+    TestDataItemFormat,
+    skip_if_not_active,
+    data_to_item_format,
+    ALL_TEST_DATA_ITEM_FORMATS,
+)
+
+skip_if_not_active("duckdb")
+
+SCHEMA_CONTRACT = ["evolve", "discard_value", "discard_row", "freeze"]
+LOCATIONS = ["source", "resource", "override"]
+SCHEMA_ELEMENTS = ["tables", "columns", "data_type"]
+
+
+OLD_COLUMN_NAME = "name"
+NEW_COLUMN_NAME = "new_col"
+VARIANT_COLUMN_NAME = "some_int__v_text"
+SUBITEMS_TABLE = "items__sub_items"
+NEW_ITEMS_TABLE = "new_items"
+ITEMS_TABLE = "items"
+
+
+@contextlib.contextmanager
+def raises_step_exception(check_raise: bool = True, expected_nested_error: Type[Any] = None) -> Any:
+    expected_nested_error = expected_nested_error or DataValidationError
+    if not check_raise:
+        yield
+        return
+    with pytest.raises(PipelineStepFailed) as py_exc:
+        yield
+    if py_exc.value.step == "extract":
+        assert isinstance(py_exc.value.__context__, expected_nested_error)
+        assert py_exc.value.has_pending_data is False
+    else:
+        # normalize
+        assert isinstance(py_exc.value.__context__.__context__, expected_nested_error)
+        assert py_exc.value.has_pending_data is True
+    assert py_exc.value.is_package_partially_loaded is False
+
+
+def items(settings: TSchemaContract) -> Any:
+    # NOTE: names must be normalizeds
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {"id": index, "SomeInt": 1, "name": f"item {index}"}
+
+    return load_items
+
+
+def items_with_variant(settings: TSchemaContract) -> Any:
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {"id": index, "name": f"item {index}", "SomeInt": "hello"}
+
+    return load_items
+
+
+def items_with_new_column(settings: TSchemaContract) -> Any:
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {"id": index, "name": f"item {index}", "New^Col": "hello"}
+
+    return load_items
+
+
+def items_with_subtable(settings: TSchemaContract) -> Any:
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {
+                "id": index,
+                "name": f"item {index}",
+                "sub_items": [
+                    {"id": index + 1000, "SomeInt": 5, "name": f"sub item {index + 1000}"}
+                ],
+            }
+
+    return load_items
+
+
+def items_with_new_column_in_subtable(settings: TSchemaContract) -> Any:
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {
+                "id": index,
+                "name": f"item {index}",
+                "sub_items": [
+                    {"id": index + 1000, "name": f"sub item {index + 1000}", "New^Col": "hello"}
+                ],
+            }
+
+    return load_items
+
+
+def items_with_variant_in_subtable(settings: TSchemaContract) -> Any:
+    @dlt.resource(name="Items", write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {
+                "id": index,
+                "name": f"item {index}",
+                "sub_items": [
+                    {"id": index + 1000, "name": f"sub item {index + 1000}", "SomeInt": "hello"}
+                ],
+            }
+
+    return load_items
+
+
+def new_items(settings: TSchemaContract) -> Any:
+    @dlt.resource(name=NEW_ITEMS_TABLE, write_disposition="append", schema_contract=settings)
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {"id": index, "some_int": 1, "name": f"item {index}"}
+
+    return load_items
+
+
+def new_items_with_columns(settings: TSchemaContract) -> Any:
+    """Resource with explicit complete column definitions, simulating a Pydantic model."""
+
+    @dlt.resource(
+        name=NEW_ITEMS_TABLE,
+        write_disposition="append",
+        schema_contract=settings,
+        columns={
+            "id": {"data_type": "bigint"},
+            "some_int": {"data_type": "bigint"},
+            "name": {"data_type": "text"},
+        },
+    )
+    def load_items():
+        for _, index in enumerate(range(0, 10), 1):
+            yield {"id": index, "some_int": 1, "name": f"item {index}"}
+
+    return load_items
+
+
+def run_resource(
+    pipeline: Pipeline,
+    resource_fun: Callable[..., DltResource],
+    settings: Any,
+    item_format: TestDataItemFormat = "object",
+    duplicates: int = 1,
+) -> None:
+    for item in settings.keys():
+        assert item in LOCATIONS
+        ev_settings = settings[item]
+        if ev_settings in SCHEMA_CONTRACT:
+            continue
+        for key, val in ev_settings.items():
+            assert val in SCHEMA_CONTRACT
+            assert key in SCHEMA_ELEMENTS
+
+    @dlt.source(name="freeze_tests", schema_contract=settings.get("source"))
+    def source() -> Iterator[DltResource]:
+        for idx in range(duplicates):
+            resource: DltResource = resource_fun(settings.get("resource"))
+            if item_format != "object":
+                resource._pipe.replace_gen(data_to_item_format(item_format, resource._pipe.gen()))  # type: ignore
+            resource.table_name = resource.name
+            yield resource.with_name(resource.name + str(idx))
+
+    # run pipeline
+    pipeline.run(source(), schema_contract=settings.get("override"))
+
+    # check global settings
+    assert pipeline.default_schema._settings.get("schema_contract", None) == (
+        settings.get("override") or settings.get("source")
+    )
+
+    # check items table settings
+    # assert pipeline.default_schema.tables[ITEMS_TABLE].get("schema_contract", {}) == (settings.get("resource") or {})
+
+    # check effective table settings
+    # assert resolve_contract_settings_for_table(None, "items", pipeline.default_schema) == expand_schema_contract_settings(settings.get("resource") or settings.get("override") or "evolve")
+
+
+def get_pipeline():
+    import duckdb
+
+    return dlt.pipeline(
+        pipeline_name="contracts_" + uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+        dev_mode=True,
+    )
+
+
+@pytest.mark.parametrize("contract_setting", SCHEMA_CONTRACT)
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+@pytest.mark.parametrize("item_format", ALL_TEST_DATA_ITEM_FORMATS)
+def test_new_tables_without_columns(
+    contract_setting: TSchemaEvolutionMode, setting_location: str, item_format: TestDataItemFormat
+) -> None:
+    """Tables that are not explicitly defined (contain no complete columns) are
+    considered data-driven and "tables" settings will apply to them
+    """
+    pipeline = get_pipeline()
+
+    full_settings = {setting_location: {"tables": contract_setting}}
+    run_resource(pipeline, items, {}, item_format)
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+    assert OLD_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+    run_resource(pipeline, items_with_new_column, full_settings, item_format)
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 20
+    assert NEW_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+    # test adding new table
+    with raises_step_exception(contract_setting == "freeze"):
+        run_resource(pipeline, new_items, full_settings, item_format)
+    table_counts = load_table_counts(pipeline)
+    assert table_counts.get(NEW_ITEMS_TABLE, 0) == (10 if contract_setting in ["evolve"] else 0)
+    # delete extracted files if left after exception
+    pipeline.drop_pending_packages()
+
+    # NOTE: arrow / pandas do not support variants and subtables so we must skip
+    if item_format == "object":
+        # run add variant column
+        run_resource(pipeline, items_with_variant, full_settings)
+        table_counts = load_table_counts(pipeline)
+        assert table_counts[ITEMS_TABLE] == 30
+        assert VARIANT_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+        # test adding new subtable
+        with raises_step_exception(contract_setting == "freeze"):
+            run_resource(pipeline, items_with_subtable, full_settings)
+
+        table_counts = load_table_counts(pipeline)
+        assert table_counts[ITEMS_TABLE] == 30 if contract_setting in ["freeze"] else 40
+        assert table_counts.get(SUBITEMS_TABLE, 0) == (10 if contract_setting in ["evolve"] else 0)
+
+
+@pytest.mark.parametrize("contract_setting", SCHEMA_CONTRACT)
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+@pytest.mark.parametrize("item_format", ALL_TEST_DATA_ITEM_FORMATS)
+def test_new_tables_with_columns(
+    contract_setting: TSchemaEvolutionMode, setting_location: str, item_format: TestDataItemFormat
+) -> None:
+    """Tables defined with explicit columns= dict (not pydantic) are still subject to the
+    `tables` contract. They behave like tables without columns for the purpose of new table
+    checks — only `evolve` allows the new table through.
+    """
+    pipeline = get_pipeline()
+
+    full_settings = {setting_location: {"tables": contract_setting}}
+
+    # load items
+    run_resource(pipeline, items, {}, item_format)
+
+    # load other table
+    with raises_step_exception(contract_setting == "freeze"):
+        run_resource(pipeline, new_items_with_columns, full_settings, item_format)
+    table_counts = load_table_counts(pipeline)
+    # only evolve allows new table, other modes discard
+    assert table_counts.get(NEW_ITEMS_TABLE, 0) == (10 if contract_setting == "evolve" else 0)
+    pipeline.drop_pending_packages()
+
+
+@pytest.mark.parametrize("contract_setting", SCHEMA_CONTRACT)
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+@pytest.mark.parametrize("item_format", ALL_TEST_DATA_ITEM_FORMATS)
+def test_new_columns(
+    contract_setting: TSchemaEvolutionMode, setting_location: str, item_format: TestDataItemFormat
+) -> None:
+    full_settings = {setting_location: {"columns": contract_setting}}
+
+    pipeline = get_pipeline()
+    run_resource(pipeline, items, {}, item_format)
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+    assert OLD_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+    # new should work
+    run_resource(pipeline, new_items, full_settings, item_format)
+    table_counts = load_table_counts(pipeline)
+    expected_items_count = 10
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[NEW_ITEMS_TABLE] == 10
+
+    # test adding new column twice: filter will try to catch it before it is added for the second time
+    with raises_step_exception(contract_setting == "freeze"):
+        run_resource(pipeline, items_with_new_column, full_settings, item_format, duplicates=2)
+    # delete extracted files if left after exception
+    pipeline.drop_pending_packages()
+
+    if contract_setting == "evolve":
+        assert NEW_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+    else:
+        assert NEW_COLUMN_NAME not in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+    table_counts = load_table_counts(pipeline)
+    expected_items_count += 20 if contract_setting in ["evolve", "discard_value"] else 0
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+
+    # NOTE: arrow / pandas do not support variants and subtables so we must skip
+    if item_format == "object":
+        # subtable should work
+        run_resource(pipeline, items_with_subtable, full_settings)
+        table_counts = load_table_counts(pipeline)
+        expected_items_count += 10
+        expected_subtable_items_count = 10
+        assert table_counts[ITEMS_TABLE] == expected_items_count
+        assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+
+        # test adding variant column
+        run_resource(pipeline, items_with_variant, full_settings)
+        # variants are not new columns and should be able to always evolve
+        assert VARIANT_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+        table_counts = load_table_counts(pipeline)
+        expected_items_count += 10
+        assert table_counts[ITEMS_TABLE] == expected_items_count
+
+        # test adding new column in subtable (subtable exists already)
+        with raises_step_exception(contract_setting == "freeze"):
+            run_resource(pipeline, items_with_new_column_in_subtable, full_settings, item_format)
+        # delete extracted files if left after exception
+        pipeline.drop_pending_packages()
+        table_counts = load_table_counts(pipeline)
+        # main table only does not get loaded on freeze exception
+        expected_items_count += 0 if contract_setting in ["freeze"] else 10
+        # subtable gets loaded on evolve and discard
+        expected_subtable_items_count += (
+            10 if contract_setting in ["evolve", "discard_value"] else 0
+        )
+        assert table_counts[ITEMS_TABLE] == expected_items_count
+        assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+        # new column may only appear in evolve mode
+        if contract_setting == "evolve":
+            assert NEW_COLUMN_NAME in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+        else:
+            assert NEW_COLUMN_NAME not in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+
+        # loading variant column will always work in subtable
+        run_resource(pipeline, items_with_variant_in_subtable, full_settings, item_format)
+        table_counts = load_table_counts(pipeline)
+        expected_subtable_items_count += 10
+        expected_items_count += 10
+        assert table_counts[ITEMS_TABLE] == expected_items_count
+        assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+        assert VARIANT_COLUMN_NAME in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+
+
+@pytest.mark.parametrize("contract_setting", SCHEMA_CONTRACT)
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+def test_variant_columns(contract_setting: TSchemaEvolutionMode, setting_location: str) -> None:
+    full_settings = {setting_location: {"data_type": contract_setting}}
+    pipeline = get_pipeline()
+    run_resource(pipeline, items, {})
+    table_counts = load_table_counts(pipeline)
+    expected_items_count = 10
+    expected_subtable_items_count = 0
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert OLD_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+    # subtable should work
+    run_resource(pipeline, items_with_subtable, full_settings)
+    table_counts = load_table_counts(pipeline)
+    expected_items_count += 10
+    expected_subtable_items_count += 10
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+
+    # new should work
+    run_resource(pipeline, new_items, full_settings)
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+    assert table_counts[NEW_ITEMS_TABLE] == 10
+
+    # test adding new column
+    run_resource(pipeline, items_with_new_column, full_settings)
+    table_counts = load_table_counts(pipeline)
+    expected_items_count += 10
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+    assert NEW_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+
+    # test adding variant column
+    with raises_step_exception(contract_setting == "freeze"):
+        run_resource(pipeline, items_with_variant, full_settings)
+    pipeline.drop_pending_packages()
+
+    if contract_setting == "evolve":
+        assert VARIANT_COLUMN_NAME in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+    else:
+        assert VARIANT_COLUMN_NAME not in pipeline.default_schema.tables[ITEMS_TABLE]["columns"]
+    table_counts = load_table_counts(pipeline)
+    expected_items_count += 10 if contract_setting in ["evolve", "discard_value"] else 0
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+
+    # test adding new column in subtable (subtable exists already)
+    run_resource(pipeline, items_with_new_column_in_subtable, full_settings)
+    table_counts = load_table_counts(pipeline)
+    expected_items_count += 10
+    expected_subtable_items_count += 10
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+    assert NEW_COLUMN_NAME in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+
+    # loading variant column will always work in subtable
+    with raises_step_exception(contract_setting == "freeze"):
+        run_resource(pipeline, items_with_variant_in_subtable, full_settings)
+    table_counts = load_table_counts(pipeline)
+    # main table only does not get loaded on freeze exception
+    expected_items_count += 0 if contract_setting in ["freeze"] else 10
+    # subtable gets loaded on evolve and discard
+    expected_subtable_items_count += 10 if contract_setting in ["evolve", "discard_value"] else 0
+    assert table_counts[ITEMS_TABLE] == expected_items_count
+    assert table_counts[SUBITEMS_TABLE] == expected_subtable_items_count
+    # new column may only appear in evolve mode
+    if contract_setting == "evolve":
+        assert VARIANT_COLUMN_NAME in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+    else:
+        assert VARIANT_COLUMN_NAME not in pipeline.default_schema.tables[SUBITEMS_TABLE]["columns"]
+
+
+def test_settings_precedence() -> None:
+    pipeline = get_pipeline()
+
+    # load some data
+    run_resource(pipeline, items, {})
+
+    # trying to add new column when forbidden on resource will fail
+    run_resource(pipeline, items_with_new_column, {"resource": {"columns": "discard_row"}})
+
+    # when allowed on override it will work
+    run_resource(
+        pipeline,
+        items_with_new_column,
+        {"resource": {"columns": "freeze"}, "override": {"columns": "evolve"}},
+    )
+
+
+def test_settings_precedence_2() -> None:
+    pipeline = get_pipeline()
+
+    # load some data
+    run_resource(pipeline, items, {"source": {"data_type": "discard_row"}})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # trying to add variant when forbidden on source will fail
+    run_resource(pipeline, items_with_variant, {"source": {"data_type": "discard_row"}})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # if allowed on resource it will pass
+    run_resource(
+        pipeline,
+        items_with_variant,
+        {"resource": {"data_type": "evolve"}, "source": {"data_type": "discard_row"}},
+    )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 20
+
+    # if allowed on override it will also pass
+    run_resource(
+        pipeline,
+        items_with_variant,
+        {
+            "resource": {"data_type": "discard_row"},
+            "source": {"data_type": "discard_row"},
+            "override": {"data_type": "evolve"},
+        },
+    )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 30
+
+
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+def test_change_mode(setting_location: str) -> None:
+    pipeline = get_pipeline()
+
+    # load some data
+    run_resource(pipeline, items, {})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # trying to add variant when forbidden will fail
+    run_resource(pipeline, items_with_variant, {setting_location: {"data_type": "discard_row"}})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # now allow
+    run_resource(pipeline, items_with_variant, {setting_location: {"data_type": "evolve"}})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 20
+
+
+@pytest.mark.parametrize("setting_location", LOCATIONS)
+def test_single_settings_value(setting_location: str) -> None:
+    pipeline = get_pipeline()
+
+    run_resource(pipeline, items, {})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # trying to add variant when forbidden will fail
+    run_resource(pipeline, items_with_variant, {setting_location: "discard_row"})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # trying to add new column will fail
+    run_resource(pipeline, items_with_new_column, {setting_location: "discard_row"})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+
+    # trying to add new table will fail
+    run_resource(pipeline, new_items, {setting_location: "discard_row"})
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 10
+    assert NEW_ITEMS_TABLE not in table_counts
+
+
+def test_data_contract_interaction() -> None:
+    """
+    ensure data contracts with pydantic are enforced properly
+    """
+    from pydantic import BaseModel
+
+    class Items(BaseModel):
+        id: int  # noqa: A003
+        name: Optional[str]
+        amount: Union[int, str, None]
+
+        class Config:
+            extra = "forbid"
+
+    @dlt.resource(name="items")
+    def get_items():
+        yield from [
+            {
+                "id": 5,
+                "name": "dave",
+                "amount": 6,
+            }
+        ]
+
+    @dlt.resource(name="items", columns=Items)
+    def get_items_with_model():
+        yield from [
+            {
+                "id": 5,
+                "name": "dave",
+                "amount": 6,
+            }
+        ]
+
+    @dlt.resource(name="items")
+    def get_items_new_col():
+        yield from [{"id": 5, "name": "dave", "amount": 6, "new_col": "hello"}]
+
+    # test valid object
+    pipeline = get_pipeline()
+    # items with model work
+    pipeline.run([get_items_with_model()])
+    assert pipeline.last_trace.last_normalize_info.row_counts.get("items", 0) == 1
+
+    # loading once with pydantic will freeze the cols
+    pipeline = get_pipeline()
+    pipeline.run([get_items_with_model()])
+    with raises_step_exception(True):
+        pipeline.run([get_items_new_col()])
+
+    # it is possible to override contract when there are new columns
+    # items with model alone does not work, since contract is set to freeze
+    pipeline = get_pipeline()
+    pipeline.run([get_items_with_model()])
+    pipeline.run([get_items_new_col()], schema_contract="evolve")
+    assert pipeline.last_trace.last_normalize_info.row_counts.get("items", 0) == 1
+
+
+def test_different_objects_in_one_load() -> None:
+    pipeline = get_pipeline()
+
+    @dlt.resource(name="items")
+    def get_items():
+        yield {"id": 1, "name": "dave", "amount": 50}
+        yield {"id": 2, "name": "dave", "amount": 50, "new_column": "some val"}
+
+    pipeline.run([get_items()], schema_contract={"columns": "freeze", "tables": "evolve"})
+    assert pipeline.last_trace.last_normalize_info.row_counts[ITEMS_TABLE] == 2
+
+
+@pytest.mark.parametrize("table_mode", ["discard_row", "evolve", "freeze"])
+def test_dynamic_tables(table_mode: str) -> None:
+    pipeline = get_pipeline()
+
+    # adding columns with a data type makes this columns complete which makes this table complete -> it fails in the normalize because
+    #   the tables is NOT new according to normalizer so the row is not discarded
+    # remove that and it will pass because the table contains just one incomplete column so it is incomplete so it is treated as new
+    # if you uncomment update code in the extract the problem probably goes away
+    @dlt.resource(name="items", table_name=lambda i: i["tables"], columns={"id": {}})
+    def get_items():
+        yield {
+            "id": 1,
+            "tables": "one",
+        }
+        yield {"id": 2, "tables": "two", "new_column": "some val"}
+
+    with raises_step_exception(table_mode == "freeze"):
+        pipeline.run([get_items()], schema_contract={"tables": table_mode})
+
+    if table_mode != "freeze":
+        assert pipeline.last_trace.last_normalize_info.row_counts.get("one", 0) == (
+            1 if table_mode == "evolve" else 0
+        )
+        assert pipeline.last_trace.last_normalize_info.row_counts.get("two", 0) == (
+            1 if table_mode == "evolve" else 0
+        )
+
+
+@pytest.mark.parametrize("column_mode", ["discard_row", "evolve", "freeze"])
+def test_defined_column_in_new_table(column_mode: str) -> None:
+    pipeline = get_pipeline()
+
+    @dlt.resource(name="items", columns=[{"name": "id", "data_type": "bigint", "nullable": False}])
+    def get_items():
+        yield {
+            "id": 1,
+            "key": "value",
+        }
+
+    pipeline.run([get_items()], schema_contract={"columns": column_mode})
+    assert pipeline.last_trace.last_normalize_info.row_counts.get("items", 0) == 1
+
+
+@pytest.mark.parametrize("column_mode", ["freeze", "discard_row", "evolve"])
+def test_new_column_from_hint_and_data(column_mode: str) -> None:
+    pipeline = get_pipeline()
+
+    # we define complete column on id, this creates a complete table
+    # normalizer does not know that it is a new table and discards the row
+    # and it also excepts on column freeze
+
+    @dlt.resource(name="items", columns=[{"name": "id", "data_type": "bigint", "nullable": False}])
+    def get_items():
+        yield {
+            "id": 1,
+            "key": "value",
+        }
+
+    pipeline.run([get_items()], schema_contract={"columns": column_mode})
+    assert pipeline.last_trace.last_normalize_info.row_counts.get("items", 0) == 1
+
+
+@pytest.mark.parametrize("column_mode", ["freeze", "discard_row", "evolve"])
+def test_two_new_columns_from_two_rows(column_mode: str) -> None:
+    pipeline = get_pipeline()
+
+    # this creates a complete table in first row
+    # and adds a new column to complete tables in 2nd row
+    # the test does not fail only because you clone schema in normalize
+
+    @dlt.resource()
+    def items():
+        yield {
+            "id": 1,
+        }
+        yield {
+            "id": 1,
+            "key": "value",
+        }
+
+    pipeline.run([items()], schema_contract={"columns": column_mode})
+    assert pipeline.last_trace.last_normalize_info.row_counts[ITEMS_TABLE] == 2
+
+
+@pytest.mark.parametrize("column_mode", ["freeze", "discard_row", "evolve"])
+def test_dynamic_new_columns(column_mode: str) -> None:
+    pipeline = get_pipeline()
+
+    # fails because dlt is not able to add _dlt_load_id to tables. I think we should do an exception for those
+    # 1. schema.dlt_tables() - everything evolve
+    # 2. is_dlt_column (I hope we have helper) - column evolve, data_type freeze
+
+    def dynamic_columns(item):
+        if item["id"] == 1:
+            return [{"name": "key", "data_type": "text", "nullable": True}]
+        if item["id"] == 2:
+            return [{"name": "id", "data_type": "bigint", "nullable": True}]
+
+    @dlt.resource(name="items", table_name=lambda i: "items", schema_contract={"columns": column_mode})  # type: ignore
+    def get_items():
+        yield {
+            "id": 1,
+            "key": "value",
+        }
+        yield {
+            "id": 2,
+            "key": "value",
+        }
+
+    items = get_items()
+    items.apply_hints(columns=dynamic_columns)
+    # apply hints apply to `items` not the original resource, so doing get_items() below removed them completely
+    pipeline.run(items)
+    assert pipeline.last_trace.last_normalize_info.row_counts.get("items", 0) == 2
+
+
+@pytest.mark.parametrize("contract_setting", SCHEMA_CONTRACT)
+@pytest.mark.parametrize("as_list", [True, False])
+def test_pydantic_contract_implementation(
+    contract_setting: TSchemaEvolutionMode, as_list: bool
+) -> None:
+    from pydantic import BaseModel
+
+    class Items(BaseModel):
+        # for variant test below we must allow allow id to be nullable
+        id: Optional[int]  # noqa: A003
+        name: str
+
+    def get_items(as_list: bool = False):
+        items = [
+            {
+                "id": 5,
+                "name": "dave",
+            }
+        ]
+        if as_list:
+            yield items
+        else:
+            yield from items
+
+    def get_items_extra_attribute(as_list: bool = False):
+        items = [{"id": 5, "name": "dave", "blah": "blubb"}]
+        if as_list:
+            yield items
+        else:
+            yield from items
+
+    def get_items_extra_variant(as_list: bool = False):
+        items = [
+            {
+                "id": "five",
+                "name": "dave",
+            }
+        ]
+        if as_list:
+            yield items
+        else:
+            yield from items
+
+    # test columns complying to model
+    pipeline = get_pipeline()
+    pipeline.run(
+        [get_items(as_list)],
+        schema_contract=TSchemaContractDict(columns=contract_setting),
+        columns=Items,
+        table_name="items",
+    )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 1
+
+    # test columns extra attribute
+    with raises_step_exception(
+        contract_setting in ["freeze"],
+        expected_nested_error=(
+            ResourceExtractionError if contract_setting == "freeze" else NotImplementedError
+        ),
+    ):
+        pipeline.run(
+            [get_items_extra_attribute(as_list)],
+            schema_contract=TSchemaContractDict(columns=contract_setting),
+            columns=Items,
+            table_name="items",
+        )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 1 if (contract_setting in ["freeze", "discard_row"]) else 2
+
+    # test columns with variant
+    with raises_step_exception(
+        contract_setting in ["freeze", "discard_value"],
+        expected_nested_error=(
+            ResourceExtractionError if contract_setting == "freeze" else NotImplementedError
+        ),
+    ):
+        pipeline.run(
+            [get_items_extra_variant(as_list)],
+            schema_contract={"data_type": contract_setting},
+            columns=Items,
+            table_name="items",
+        )
+    table_counts = load_table_counts(pipeline)
+    assert table_counts[ITEMS_TABLE] == 1 if (contract_setting in ["freeze", "discard_row"]) else 3
+
+
+def test_nested_hints_contract() -> None:
+    @dlt.resource(
+        nested_hints={"list": dlt.mark.make_nested_hints(schema_contract={"columns": "freeze"})},
+        write_disposition="append",
+        schema_contract="evolve",
+    )
+    def nested_data():
+        yield [{"id": 1, "list": [{"l": 1}, {"l": 2}, {"l": 3}]}]
+
+    p = dlt.pipeline(
+        pipeline_name="test_nested_hints_file_format", destination="duckdb", dataset_name="local"
+    )
+    p.run(nested_data())
+
+    # add column in root table
+
+    def nested_data():  # type: ignore[no-redef]
+        yield [{"id": 1, "opt": True}]
+
+    p.run(nested_data())
+
+    # add column in nested data
+
+    def nested_data():  # type: ignore[no-redef]
+        yield [{"id": 1, "list": [{"l": 1, "opt": True}, {"l": 2}, {"l": 3}]}]
+
+    # that actually works - raise on freeze
+    with raises_step_exception():
+        p.run(nested_data())
+
+
+def test_nested_hints_evolve_once() -> None:
+    @dlt.resource(
+        nested_hints={"list": dlt.mark.make_nested_hints(schema_contract={"columns": "freeze"})},
+        write_disposition="append",
+        schema_contract="evolve",
+    )
+    def nested_data():
+        yield [{"id": 1, "list": [{"l": 1}, {"l": 2}, {"l": 3}]}]
+
+    p = dlt.pipeline(
+        pipeline_name="test_nested_hints_file_format", destination="duckdb", dataset_name="local"
+    )
+    p.extract(nested_data())
+    # evolve once must be set on nested tables
+    nested_data__list = p.default_schema.tables["nested_data__list"]
+    assert nested_data__list["schema_contract"] == {"columns": "freeze"}
+    assert nested_data__list["x-normalizer"] == {"evolve-columns-once": True}
+
+
+def test_write_to_existing_database_tables_frozen() -> None:
+    pipeline = get_pipeline()
+
+    # Create a database schema with table
+    with pipeline.sql_client() as c:
+        table_name = c.make_qualified_table_name("test_items")
+        c.create_dataset()
+        c.execute_sql(
+            f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, name VARCHAR NOT NULL,"
+            " _dlt_load_id VARCHAR NOT NULL, _dlt_id VARCHAR NOT NULL)"
+        )
+
+    data = [
+        {"id": 101, "name": "sub item 101"},
+        {"id": 101, "name": "sub item 102"},
+    ]
+
+    # we are trying to load to a table existing on the destination but not known to our internal schema
+    # this will fail!
+    with raises_step_exception(
+        expected_nested_error=DataValidationError,
+    ):
+        pipeline.run(
+            data,
+            table_name="test_items",
+            schema_contract={"tables": "freeze", "columns": "freeze", "data_type": "freeze"},
+        )
+
+
+@pytest.mark.parametrize(
+    "nested_item",
+    [
+        [1, 2],
+        [
+            {
+                "timestamp": 82178.1298812,
+            }
+        ],
+    ],
+    ids=["nested_item_list", "nested_item_dict"],
+)
+def test_coerce_null_value_in_nested_table(nested_item: TDataItems) -> None:
+    """Ensure that a column previously loaded as a child table
+    does not create new columns in a subsequent run when it has no values."""
+    pipeline = get_pipeline()
+
+    @dlt.resource
+    def nested(data: TDataItems):
+        yield data
+
+    # create parent and child tables
+    data = [
+        {
+            "timestamp": 82178.1298812,
+            "a": [
+                {
+                    "timestamp": 82178.1298812,
+                    "b": nested_item,
+                }
+            ],
+        },
+    ]
+    pipeline.run(nested(data), schema_contract={"columns": "freeze"})
+
+    assert "nested" in pipeline.default_schema.tables
+    assert "nested__a" in pipeline.default_schema.tables
+    assert "nested__a__b" in pipeline.default_schema.tables
+
+    # verify that empty child table columns don't create new columns,
+    # i.e. violate the freeze contract on columns
+    data = [
+        {
+            "timestamp": 82178.1298812,
+            "a": [
+                {
+                    "timestamp": 82178.1298812,
+                    "b": None,
+                }
+            ],
+        },
+    ]
+    pipeline.run(nested(data), schema_contract={"columns": "freeze"})
+
+    data = [
+        {
+            "timestamp": 82178.1298812,
+            "a": None,
+        },
+    ]
+    pipeline.run(nested(data), schema_contract={"columns": "freeze"})
+
+
+def test_coerce_null_value_in_column_created_as_compound_columns() -> None:
+    """Ensure that a column previously loaded as compound columns in tha same table
+    does not create new column in a subsequent run when it has no values."""
+    pipeline = get_pipeline()
+
+    @dlt.resource
+    def nested(data: TDataItems):
+        yield data
+
+    data = [
+        # uncomment this to get "a" column generated and associated warning
+        # this is acceptable for now
+        # {
+        #     "timestamp": 82178.1298812,
+        #     "a": None,
+        # },
+        {
+            "timestamp": 82178.1298812,
+            "a": {
+                "timestamp": 82178.1298812,
+                "d": 82178.1298812,
+            },
+        },
+        {
+            "timestamp": 82178.1298812,
+            "a": None,
+        },
+    ]
+    pipeline.run(nested(data), schema_contract={"columns": "freeze"})
+
+    assert "nested" in pipeline.default_schema.tables
+    assert "a__timestamp" in pipeline.default_schema.tables["nested"]["columns"]
+    assert "a__d" in pipeline.default_schema.tables["nested"]["columns"]
+    # assert "a" not in pipeline.default_schema.tables["nested"]["columns"]
+
+    # verify that empty column that was previously flattened
+    # doesn't create new column, i.e. violate the freeze contract on columns
+    data = [
+        {
+            "timestamp": 82178.1298812,
+            "a": None,
+        },
+    ]
+    pipeline.run(nested(data), schema_contract={"columns": "freeze"})
+    assert "a" not in pipeline.default_schema.tables["nested"]["columns"]
+
+
+@pytest.mark.parametrize("contract_setting", ["freeze", "discard_value", "discard_row"])
+def test_resource_columns_dict_change_on_existing_table(
+    contract_setting: TSchemaEvolutionMode,
+) -> None:
+    """Changing an existing column property via columns= should be accepted at schema level."""
+    pipeline = get_pipeline()
+
+    columns_v1: Dict[str, TColumnSchema] = {
+        "id": {"name": "id", "data_type": "bigint"},
+        "name": {"name": "name", "data_type": "text", "nullable": True},
+    }
+
+    @dlt.resource(
+        name="items",
+        columns=columns_v1,
+        schema_contract=TSchemaContractDict(columns=contract_setting),
+    )
+    def get_items_v1():
+        yield [{"id": 1, "name": "alice"}]
+
+    info = pipeline.run(get_items_v1())
+    assert_load_info(info)
+    table = pipeline.default_schema.get_table("items")
+    assert table["columns"]["name"].get("nullable") is True
+
+    # run 2: change nullable on name column (True → False)
+    # only test extract — whether the destination supports ALTER COLUMN is a separate concern
+    columns_v2: Dict[str, TColumnSchema] = {
+        "id": {"name": "id", "data_type": "bigint"},
+        "name": {"name": "name", "data_type": "text", "nullable": False},
+    }
+
+    @dlt.resource(
+        name="items",
+        columns=columns_v2,
+        schema_contract=TSchemaContractDict(columns=contract_setting),
+    )
+    def get_items_v2():
+        yield [{"id": 2, "name": "bob"}]
+
+    # extract and normalize only — the schema contract should not block this change
+    pipeline.extract(get_items_v2())
+    pipeline.normalize()
+    table = pipeline.default_schema.get_table("items")
+    assert (
+        table["columns"]["name"].get("nullable") is False
+    ), f"column nullable change from resource definition should be accepted with {contract_setting}"
+
+
+@pytest.mark.parametrize("contract_setting", ["freeze", "discard_value", "discard_row"])
+@pytest.mark.parametrize("authoritative", [True, False])
+def test_pydantic_model_evolve_on_existing_table(
+    contract_setting: TSchemaEvolutionMode, authoritative: bool
+) -> None:
+    """With is_authoritative_model=True, new columns from an evolved pydantic model bypass
+    contract checks. Without it, they are subject to contract enforcement."""
+    from typing import ClassVar, Optional
+
+    from pydantic import BaseModel
+
+    from dlt.common.libs.pydantic import DltConfig
+
+    pipeline = get_pipeline()
+
+    dlt_cfg: DltConfig = {"is_authoritative_model": True} if authoritative else {}
+
+    class ItemsV1(BaseModel):
+        dlt_config: ClassVar[DltConfig] = dlt_cfg
+
+        id: int  # noqa: A003
+        name: str
+
+    @dlt.resource(
+        name="items",
+        columns=ItemsV1,
+        schema_contract=TSchemaContractDict(columns=contract_setting),
+    )
+    def get_items_v1():
+        yield [{"id": 1, "name": "alice"}]
+
+    info = pipeline.run(get_items_v1())
+    assert_load_info(info)
+
+    # run 2: model adds a new nullable field
+    class ItemsV2(BaseModel):
+        dlt_config: ClassVar[DltConfig] = dlt_cfg
+
+        id: int  # noqa: A003
+        name: str
+        email: Optional[str] = None
+
+    @dlt.resource(
+        name="items",
+        columns=ItemsV2,
+        schema_contract=TSchemaContractDict(columns=contract_setting),
+    )
+    def get_items_v2():
+        yield [{"id": 2, "name": "bob", "email": "bob@test.com"}]
+
+    if authoritative:
+        # authoritative model bypasses contract — new column always accepted
+        info = pipeline.run(get_items_v2())
+        assert_load_info(info)
+        table = pipeline.default_schema.get_table("items")
+        assert "email" in table["columns"]
+        assert load_table_counts(pipeline)["items"] == 2
+    elif contract_setting == "freeze":
+        with raises_step_exception():
+            pipeline.run(get_items_v2())
+    else:
+        info = pipeline.run(get_items_v2())
+        assert_load_info(info)
+        table = pipeline.default_schema.get_table("items")
+        # contract blocks the new column
+        assert "email" not in table["columns"]
+
+
+def test_replace_contract_discard_all_rows_truncates() -> None:
+    pipeline = get_pipeline()
+
+    @dlt.resource(
+        name="items",
+        write_disposition="replace",
+        columns={"id": {"data_type": "bigint"}},
+        schema_contract={"columns": "discard_row"},
+    )
+    def items(with_new_column: bool) -> Any:
+        # with_new_column adds a NEW column `extra` to every row so discard_row drops them all
+        if with_new_column:
+            yield from [{"id": i, "extra": i} for i in range(5)]
+        else:
+            yield from [{"id": i} for i in range(5)]
+
+    # run 1: rows survive (no new column) - table is populated
+    info = pipeline.run(items(False))
+    assert_load_info(info)
+    assert load_table_counts(pipeline)["items"] == 5
+
+    # run 2: every row is dropped by the contract -> empty job -> replace truncates the table
+    info = pipeline.run(items(True))
+    assert_load_info(info)
+    assert pipeline.last_trace.last_normalize_info.row_counts["items"] == 0
+    assert load_table_counts(pipeline).get("items", 0) == 0
+    # the new column was blocked by the contract
+    assert "extra" not in pipeline.default_schema.get_table("items")["columns"]
+
+
+def test_upsert_contract_discard_all_rows_never_seen_table_not_verified() -> None:
+    """A never-seen `upsert` table whose rows are all dropped by a contract must not be materialized
+    or verified. Before the fix the normalizer wrote an empty job for it, which both flagged the
+    table seen-data that triggered various schema checks that were failing."""
+    pipeline = get_pipeline()
+
+    # establish `items` in the schema (so `evolve-columns-once` does not apply) WITHOUT data:
+    # complete `val`, hint-only (untyped) primary key `id`, upsert, columns: discard_row
+    schema = Schema("contracts")
+    table = new_table(
+        "items", write_disposition="merge", schema_contract={"columns": "discard_row"}
+    )
+    table["x-merge-strategy"] = "upsert"  # type: ignore[typeddict-unknown-key]
+    table["columns"] = {
+        "val": {"name": "val", "data_type": "text"},
+        "id": {"name": "id", "primary_key": True, "nullable": False},
+    }
+    schema.update_table(table, normalize_identifiers=False)
+
+    @dlt.resource(name="items")
+    def items() -> Any:
+        # every row carries a NEW column `extra` so discard_row drops them all
+        yield [{"id": i, "val": "x", "extra": i} for i in range(3)]
+
+    # before the fix this raised `No primary key defined` during verify_schema at the load step
+    info = pipeline.run(items(), schema=schema)
+    assert_load_info(info)
+    # the table that never received data is not created at the destination
+    with pipeline.sql_client() as client:
+        existing = [
+            row[0]
+            for row in client.execute_sql(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema ="
+                " current_schema()"
+            )
+        ]
+    assert "items" not in existing
+
+
+@pytest.mark.parametrize("contract_setting", ["freeze", "discard_value", "discard_row"])
+def test_pydantic_model_forbid_extra_evolve_on_existing_table(
+    contract_setting: TSchemaEvolutionMode,
+) -> None:
+    """Pydantic model with extra=forbid and is_authoritative_model=True: the contract
+    is derived from extra (freeze). Model evolution should still be accepted because
+    the model is authoritative."""
+    from typing import ClassVar, Optional
+
+    from pydantic import BaseModel
+
+    from dlt.common.libs.pydantic import DltConfig
+
+    pipeline = get_pipeline()
+
+    class ItemsV1(BaseModel):
+        dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+        class Config:
+            extra = "forbid"
+
+        id: int  # noqa: A003
+        name: str
+
+    # no explicit schema_contract: derived from extra=forbid → columns=freeze
+    @dlt.resource(name="items", columns=ItemsV1)
+    def get_items_v1():
+        yield [{"id": 1, "name": "alice"}]
+
+    info = pipeline.run(get_items_v1())
+    assert_load_info(info)
+
+    class ItemsV2(BaseModel):
+        dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+        class Config:
+            extra = "forbid"
+
+        id: int  # noqa: A003
+        name: str
+        email: Optional[str] = None
+
+    @dlt.resource(name="items", columns=ItemsV2)
+    def get_items_v2():
+        yield [{"id": 2, "name": "bob", "email": "bob@test.com"}]
+
+    info = pipeline.run(get_items_v2())
+    assert_load_info(info)
+    table = pipeline.default_schema.get_table("items")
+    assert (
+        "email" in table["columns"]
+    ), "column 'email' from evolved pydantic model should be accepted"
+    assert load_table_counts(pipeline)["items"] == 2
+
+
+@pytest.mark.parametrize("contract_setting", ["freeze", "discard_value", "discard_row"])
+def test_arrow_data_new_column_blocked_by_contract(contract_setting: TSchemaEvolutionMode) -> None:
+    """Arrow table schemas are data-derived. New columns in arrow data that are NOT
+    in the resource's column definition should be subject to contract enforcement."""
+    import pyarrow as pa
+
+    pipeline = get_pipeline()
+
+    # run 1: create table with two columns
+    table_v1 = pa.table({"id": [1], "name": ["alice"]})
+
+    @dlt.resource(name="items", schema_contract=TSchemaContractDict(columns=contract_setting))
+    def get_items_v1():
+        yield table_v1
+
+    info = pipeline.run(get_items_v1())
+    assert_load_info(info)
+
+    # run 2: arrow data has a new column not in the original schema
+    table_v2 = pa.table({"id": [2], "name": ["bob"], "email": ["bob@test.com"]})
+
+    @dlt.resource(name="items", schema_contract=TSchemaContractDict(columns=contract_setting))
+    def get_items_v2():
+        yield table_v2
+
+    # new column from arrow data should be blocked by contract
+    if contract_setting == "freeze":
+        with raises_step_exception():
+            pipeline.run(get_items_v2())
+    else:
+        info = pipeline.run(get_items_v2())
+        assert_load_info(info)
+        table = pipeline.default_schema.get_table("items")
+        # discard_value and discard_row should NOT add the new column
+        assert (
+            "email" not in table["columns"]
+        ), f"arrow-data column 'email' should be blocked by {contract_setting}"
+
+
+@pytest.mark.parametrize("item_format", ["pandas", "arrow-table", "arrow-batch"])
+@pytest.mark.parametrize("data_type_contract", ["evolve", "discard_value"])
+def test_arrow_hint_changes_data_type(
+    item_format: TestDataItemFormat, data_type_contract: TSchemaEvolutionMode
+) -> None:
+    """Text hint over decimal arrow data (ie. sql_database reflection) leaves no stale scale."""
+    pipeline = get_pipeline()
+    contract: TSchemaContract = {"data_type": data_type_contract}
+    decimals = data_to_item_format(item_format, [{"id": 1, "value": Decimal("10.25")}])
+    texts = data_to_item_format(item_format, [{"id": 2, "value": "some text"}])
+    text_hint: TColumnSchema = {"data_type": "text", "precision": 50}
+    decimal_hint: TColumnSchema = {"data_type": "decimal", "precision": 10, "scale": 2}
+
+    # new table: contract does not apply, text hint replaces arrow decimal type
+    pipeline.extract(
+        dlt.resource(
+            decimals, name=NEW_ITEMS_TABLE, columns={"value": text_hint}, schema_contract=contract
+        )
+    )
+    # existing decimal column: text hint is accepted or discarded by the contract
+    pipeline.extract(
+        dlt.resource(
+            decimals, name=ITEMS_TABLE, columns={"value": decimal_hint}, schema_contract=contract
+        )
+    )
+    pipeline.normalize()
+    pipeline.extract(
+        dlt.resource(
+            texts, name=ITEMS_TABLE, columns={"value": text_hint}, schema_contract=contract
+        )
+    )
+
+    expected = [(NEW_ITEMS_TABLE, text_hint, "VARCHAR(50)")]
+    if data_type_contract == "evolve":
+        expected.append((ITEMS_TABLE, text_hint, "VARCHAR(50)"))
+    else:
+        expected.append((ITEMS_TABLE, decimal_hint, "NUMBER(10,2)"))
+    mapper = snowflake().capabilities().get_type_mapper()
+    for table_name, hint, destination_type in expected:
+        table = pipeline.default_schema.get_table(table_name)
+        column = table["columns"]["value"]
+        assert column == {"name": "value", "nullable": True, **hint}
+        # a stale scale fails in VARCHAR(%i) with TypeError
+        assert (
+            mapper.to_destination_type(column, cast(PreparedTableSchema, table)) == destination_type
+        )
+
+
+@pytest.mark.parametrize("item_format", ["pandas", "arrow-table", "arrow-batch"])
+@pytest.mark.parametrize("contract_mode", ["discard_row", "discard_value"])
+@pytest.mark.parametrize("schema_entity", ["columns", "data_type"])
+@pytest.mark.parametrize("dynamic_table_name", [False, True], ids=["static_name", "dynamic_name"])
+def test_arrow_contract_filters_follow_arrow_schema(
+    item_format: TestDataItemFormat,
+    contract_mode: TSchemaEvolutionMode,
+    schema_entity: str,
+    dynamic_table_name: bool,
+) -> None:
+    """Contract filters apply to each arrow item, also when an item lacks the filtered column."""
+    pipeline = get_pipeline()
+    # `columns` filters a new column, `data_type` filters text values of a bigint column
+    column = NEW_COLUMN_NAME if schema_entity == "columns" else "value"
+    existing = {"id": 1} if schema_entity == "columns" else {"id": 1, column: 1}
+    pipeline.run(data_to_item_format(item_format, [existing]), table_name=ITEMS_TABLE)
+
+    @dlt.resource(
+        name=ITEMS_TABLE,
+        table_name=(lambda _: ITEMS_TABLE) if dynamic_table_name else ITEMS_TABLE,
+        schema_contract=cast(TSchemaContractDict, {schema_entity: contract_mode}),
+    )
+    def arrow_items():
+        yield from data_to_item_format(
+            item_format, [{"id": 2, column: None}, {"id": 3, column: "x"}]
+        )
+        yield from data_to_item_format(item_format, [{"id": 4}])
+        yield from data_to_item_format(
+            item_format, [{"id": 5, column: "y"}, {"id": 6, column: None}]
+        )
+        # bigint values are new for `columns` and valid for `data_type`
+        yield from data_to_item_format(item_format, [{"id": 7, column: 7}])
+
+    assert_load_info(pipeline.run(arrow_items()))
+
+    rows = pipeline.dataset()[ITEMS_TABLE].order_by("id").fetchall()
+    if schema_entity == "columns":
+        assert column not in pipeline.default_schema.get_table_columns(ITEMS_TABLE)
+        expected_ids = [1, 2, 4, 6] if contract_mode == "discard_row" else [1, 2, 3, 4, 5, 6, 7]
+        assert [row[0] for row in rows] == expected_ids
+    else:
+        assert (
+            pipeline.default_schema.get_table_columns(ITEMS_TABLE)[column]["data_type"] == "bigint"
+        )
+        expected_values = {1: 1, 2: None, 4: None, 6: None, 7: 7}
+        if contract_mode == "discard_value":
+            expected_values.update({3: None, 5: None})
+        assert {row[0]: row[1] for row in rows} == expected_values
+
+    # a new table is discarded with all its items
+    @dlt.resource(name=NEW_ITEMS_TABLE, schema_contract={"tables": contract_mode})
+    def new_arrow_items():
+        yield from data_to_item_format(item_format, [{"id": 1}])
+        yield from data_to_item_format(item_format, [{"id": 2}])
+
+    pipeline.run(new_arrow_items())
+    assert NEW_ITEMS_TABLE not in pipeline.default_schema.tables
+
+
+TABLE_NAME_MAP = {"click": "click_events", "purchase": "purchase_events", "debug": "debug_events"}
+
+
+@pytest.mark.parametrize("shared_base", [True, False], ids=["shared_base", "no_base"])
+@pytest.mark.parametrize("dispatch", ["mark", "dynamic"], ids=["mark", "dynamic"])
+def test_discriminated_union_computes_schema_from_item(shared_base: bool, dispatch: str) -> None:
+    """Pipeline loads events discriminated on 'kind', dispatched to tables whose names
+    differ from the discriminator values. The union covers only click and purchase;
+    debug events are discarded by pydantic validation.
+
+    Parametrized over:
+    - shared_base: variants inherit a common EventBase vs. standalone models
+    - dispatch: dlt.mark.with_table_name vs. table_name=<function> on resource
+    """
+    from pydantic import Field, RootModel
+    from typing_extensions import Annotated
+
+    from dlt.common.libs.pydantic import BaseModel, DltConfig
+    from dlt.extract.validation import PydanticValidator
+
+    if shared_base:
+
+        class EventBase(BaseModel):
+            kind: str
+            id: int  # noqa: A003
+
+        class ClickEvent(EventBase):
+            kind: Literal["click"]
+            element_id: str
+
+        class PurchaseEvent(EventBase):
+            kind: Literal["purchase"]
+            amount: float
+
+    else:
+
+        class ClickEvent(BaseModel):  # type: ignore[no-redef]
+            kind: Literal["click"]
+            id: int  # noqa: A003
+            element_id: str
+
+        class PurchaseEvent(BaseModel):  # type: ignore[no-redef]
+            kind: Literal["purchase"]
+            id: int  # noqa: A003
+            amount: float
+
+    EventUnion = Annotated[
+        Union[ClickEvent, PurchaseEvent],
+        Field(discriminator="kind"),
+    ]
+
+    class Event(RootModel[EventUnion]):
+        dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+    validator = PydanticValidator(Event, "evolve", "discard_row")
+    validator.table_name = "events"
+
+    click_item = {"kind": "click", "id": 1, "element_id": "btn_1"}
+    schema = validator.compute_table_schema(item=click_item)
+    assert schema is not None
+    assert set(schema["columns"].keys()) == {"kind", "id", "element_id"}
+
+    purchase_item = {"kind": "purchase", "id": 3, "amount": 99.99}
+    schema = validator.compute_table_schema(item=purchase_item)
+    assert schema is not None
+    assert set(schema["columns"].keys()) == {"kind", "id", "amount"}
+
+    debug_item = {"kind": "debug", "id": 4, "debug_payload": "test"}
+    assert validator.compute_table_schema(item=debug_item) is None
+
+    schema_no_item = validator.compute_table_schema()
+    assert schema_no_item is not None
+    assert set(schema_no_item["columns"].keys()) == {"kind", "id"}
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_disc_union_" + uniq_id(),
+        destination="duckdb",
+    )
+
+    items = [
+        {"kind": "click", "id": 1, "element_id": "btn_1"},
+        {"kind": "click", "id": 2, "element_id": "btn_2"},
+        {"kind": "purchase", "id": 3, "amount": 99.99},
+        {"kind": "debug", "id": 4, "debug_payload": "test"},
+    ]
+
+    if dispatch == "mark":
+
+        @dlt.resource(
+            name="events",
+            columns=Event,
+            schema_contract={"data_type": "discard_row"},
+        )
+        def event_stream():
+            for item in items:
+                yield dlt.mark.with_table_name(item, TABLE_NAME_MAP[str(item["kind"])])
+
+    else:
+
+        @dlt.resource(
+            name="events",
+            columns=Event,
+            table_name=lambda item: TABLE_NAME_MAP[item["kind"]],
+            schema_contract={"data_type": "discard_row"},
+        )
+        def event_stream():
+            yield from items
+
+    info = pipeline.run(event_stream())
+    assert_load_info(info)
+
+    click_table = pipeline.default_schema.get_table("click_events")
+    click_cols = set(c for c in click_table["columns"] if not c.startswith("_dlt_"))
+    assert "id" in click_cols
+    assert "element_id" in click_cols
+    assert "amount" not in click_cols
+
+    purchase_table = pipeline.default_schema.get_table("purchase_events")
+    purchase_cols = set(c for c in purchase_table["columns"] if not c.startswith("_dlt_"))
+    assert "id" in purchase_cols
+    assert "amount" in purchase_cols
+    assert "element_id" not in purchase_cols
+
+    assert "debug_events" not in pipeline.default_schema.tables
+
+    counts = load_table_counts(pipeline, "click_events", "purchase_events")
+    assert counts["click_events"] == 2
+    assert counts["purchase_events"] == 1
+
+
+@pytest.mark.parametrize(
+    "column_mode",
+    ["evolve", "freeze", "discard_value", "discard_row"],
+)
+def test_discriminated_union_column_contracts(column_mode: TSchemaEvolutionMode) -> None:
+    """Tests how the columns contract interacts with discriminated union validation.
+
+    Items include a click with extra field 'extra_info' and a debug event whose
+    discriminator value is NOT in the union.
+
+    data_type mirrors column_mode for evolve and freeze. For discard_value and
+    discard_row it falls back to discard_row (discard_value is not supported by
+    pydantic).
+
+    - evolve: extra field accepted, debug event passes through (data_type=evolve)
+    - freeze: extra field raises (data_type=freeze would also reject debug)
+    - discard_value: extra field stripped, debug event discarded
+    - discard_row: row with extra field and debug event both discarded
+    """
+    from pydantic import Field, RootModel
+    from typing_extensions import Annotated
+
+    from dlt.common.libs.pydantic import BaseModel, DltConfig
+
+    class ClickEvent(BaseModel):
+        kind: Literal["click"]
+        id: int  # noqa: A003
+        element_id: str
+
+    class PurchaseEvent(BaseModel):
+        kind: Literal["purchase"]
+        id: int  # noqa: A003
+        amount: float
+
+    EventUnion = Annotated[
+        Union[ClickEvent, PurchaseEvent],
+        Field(discriminator="kind"),
+    ]
+
+    class Event(RootModel[EventUnion]):
+        dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_disc_col_" + uniq_id(),
+        destination="duckdb",
+    )
+
+    items = [
+        {"kind": "click", "id": 1, "element_id": "btn_1"},
+        {"kind": "click", "id": 2, "element_id": "btn_2", "extra_info": "surprise"},
+        {"kind": "purchase", "id": 3, "amount": 99.99},
+        {"kind": "debug", "id": 4, "debug_payload": "test"},
+    ]
+
+    data_type_mode: TSchemaEvolutionMode = (
+        column_mode if column_mode in ("evolve", "freeze") else "discard_row"
+    )
+
+    @dlt.resource(
+        name="events",
+        columns=Event,
+        schema_contract={"columns": column_mode, "data_type": data_type_mode},
+    )
+    def event_stream():
+        for item in items:
+            yield dlt.mark.with_table_name(item, TABLE_NAME_MAP[str(item["kind"])])
+
+    if column_mode == "freeze":
+        with pytest.raises(PipelineStepFailed) as exc_info:
+            pipeline.run(event_stream())
+        assert isinstance(exc_info.value.__context__, ResourceExtractionError)
+        assert isinstance(exc_info.value.__context__.__context__, DataValidationError)
+        return
+
+    info = pipeline.run(event_stream())
+    assert_load_info(info)
+
+    click_table = pipeline.default_schema.get_table("click_events")
+    click_cols = set(c for c in click_table["columns"] if not c.startswith("_dlt_"))
+
+    if column_mode == "evolve":
+        assert "extra_info" in click_cols
+        counts = load_table_counts(pipeline, "click_events", "purchase_events", "debug_events")
+        assert counts["click_events"] == 2
+        assert counts["purchase_events"] == 1
+        assert counts["debug_events"] == 1
+    elif column_mode == "discard_value":
+        assert "extra_info" not in click_cols
+        assert "debug_events" not in pipeline.default_schema.tables
+        counts = load_table_counts(pipeline, "click_events", "purchase_events")
+        assert counts["click_events"] == 2
+        assert counts["purchase_events"] == 1
+    elif column_mode == "discard_row":
+        assert "extra_info" not in click_cols
+        assert "debug_events" not in pipeline.default_schema.tables
+        counts = load_table_counts(pipeline, "click_events", "purchase_events")
+        assert counts["click_events"] == 1
+        assert counts["purchase_events"] == 1
+
+
+@pytest.mark.parametrize("tables_contract", ["freeze", "evolve"])
+def test_model_data_contract_on_tables(tables_contract: str) -> None:
+    pipeline = get_pipeline()
+    pipeline.run(
+        [{"a": i, "b": i + 1} for i in range(10)],
+        table_name="example_table",
+    )
+    dataset = pipeline.dataset()
+    example_table_columns = dataset.schema.tables["example_table"]["columns"]
+
+    @dlt.resource(schema_contract={"tables": tables_contract})  # type: ignore
+    def copied_table() -> Any:
+        rel = dataset["example_table"][["a", "b", "_dlt_id"]].limit(5)
+        yield dlt.mark.with_hints(rel, hints=make_hints(columns=example_table_columns))
+
+    if tables_contract == "evolve":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+    else:
+        with pytest.raises(PipelineStepFailed) as py_exc:
+            pipeline.run([copied_table()], loader_file_format="model")
+        assert py_exc.value.step == "extract"
+        assert isinstance(py_exc.value.__context__, DataValidationError)
+        assert py_exc.value.__context__.schema_entity == "tables"
+        assert py_exc.value.__context__.contract_mode == "freeze"
+        assert py_exc.value.__context__.table_name == "copied_table"
+
+
+@pytest.mark.parametrize("columns_contract", ["freeze", "evolve", "discard_row", "discard_value"])
+def test_model_data_contract_on_columns(columns_contract: str) -> None:
+    pipeline = get_pipeline()
+    pipeline.run([{"a": i} for i in range(10)], table_name="copied_table")
+    pipeline.run([{"a": i, "b": i + 1} for i in range(10)], table_name="example_table")
+    dataset = pipeline.dataset()
+    example_table_columns = dataset.schema.tables["example_table"]["columns"]
+
+    @dlt.resource(schema_contract={"columns": columns_contract})  # type: ignore
+    def copied_table() -> Any:
+        rel = dataset["example_table"][["b", "_dlt_load_id", "_dlt_id"]].limit(5)
+        yield dlt.mark.with_hints(rel, hints=make_hints(columns=example_table_columns))
+
+    if columns_contract == "evolve":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        assert load_table_counts(pipeline, "copied_table", "example_table") == {
+            "copied_table": 15,
+            "example_table": 10,
+        }
+        result_items = dataset["copied_table"].df()["b"].tolist()
+        assert result_items[-5:] == [1, 2, 3, 4, 5]
+
+    elif columns_contract == "freeze":
+        with pytest.raises(PipelineStepFailed) as py_exc:
+            pipeline.run([copied_table()], loader_file_format="model")
+        assert py_exc.value.step == "extract"
+        assert isinstance(py_exc.value.__context__, DataValidationError)
+        assert py_exc.value.__context__.schema_entity == "columns"
+        assert py_exc.value.__context__.contract_mode == "freeze"
+        assert py_exc.value.__context__.table_name == "copied_table"
+
+    elif columns_contract == "discard_row":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        # the entire Relation item is discarded because it introduces column "b"
+        assert load_table_counts(pipeline, "copied_table", "example_table") == {
+            "copied_table": 10,
+            "example_table": 10,
+        }
+        assert "b" not in pipeline.default_schema.tables["copied_table"]["columns"]
+
+    elif columns_contract == "discard_value":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        assert load_table_counts(pipeline, "copied_table", "example_table") == {
+            "copied_table": 15,
+            "example_table": 10,
+        }
+        assert "b" not in pipeline.default_schema.tables["copied_table"]["columns"]
+        result_items = dataset["copied_table"].df()["a"].tolist()
+        assert result_items[:10] == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
+@pytest.mark.parametrize("data_type_contract", ["freeze", "evolve", "discard_row", "discard_value"])
+def test_model_data_contract_on_data_type(data_type_contract: str) -> None:
+    pipeline = get_pipeline()
+    pipeline.run([{"a": i} for i in range(10)], table_name="copied_table")
+    pipeline.run(
+        [{"a": string, "b": i} for i, string in enumerate(["I", "love", "dlt"])],
+        table_name="example_table",
+    )
+    dataset = pipeline.dataset()
+    example_table_columns = dataset.schema.tables["example_table"]["columns"]
+    copied_table_columns = dataset.schema.tables["copied_table"]["columns"]
+
+    assert copied_table_columns["a"]["data_type"] == "bigint"
+    assert example_table_columns["a"]["data_type"] == "text"
+
+    @dlt.resource(schema_contract={"data_type": data_type_contract}, table_name="copied_table")  # type: ignore
+    def copied_table() -> Any:
+        rel = dataset["example_table"][["a", "_dlt_load_id", "_dlt_id"]]
+        yield dlt.mark.with_hints(
+            rel,
+            hints=make_hints(columns={k: v for k, v in example_table_columns.items() if k != "b"}),
+        )
+
+    if data_type_contract == "freeze":
+        with pytest.raises(PipelineStepFailed) as py_exc:
+            pipeline.run([copied_table()], loader_file_format="model")
+        assert py_exc.value.step == "extract"
+        assert isinstance(py_exc.value.__context__, DataValidationError)
+    elif data_type_contract == "discard_row":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        assert load_table_counts(pipeline, "copied_table") == {"copied_table": 10}
+    elif data_type_contract == "discard_value":
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        assert load_table_counts(pipeline, "copied_table") == {"copied_table": 13}
+        result = dataset["copied_table"].df()
+        new_rows = result[result["_dlt_load_id"] == info.loads_ids[0]]
+        assert new_rows["a"].isna().all()
+    elif data_type_contract == "evolve":
+        with pytest.raises(PipelineStepFailed) as py_exc:
+            pipeline.run([copied_table()], loader_file_format="model")
+        assert py_exc.value.step == "load"
+        assert isinstance(py_exc.value.__context__, LoadClientJobException)
+
+
+@pytest.mark.parametrize("columns_contract", ["freeze", "discard_value"])
+def test_model_pydantic_contract(columns_contract: str) -> None:
+    """Pydantic model + contract enforcement on model/SQL resource."""
+    from pydantic import BaseModel
+
+    class CopiedRow(BaseModel):
+        a: int
+
+    pipeline = get_pipeline()
+    pipeline.run([{"a": i} for i in range(10)], table_name="copied_table")
+    pipeline.run([{"a": i, "b": i + 1} for i in range(10)], table_name="example_table")
+    dataset = pipeline.dataset()
+    example_table_columns = dataset.schema.tables["example_table"]["columns"]
+
+    @dlt.resource(columns=CopiedRow, schema_contract={"columns": columns_contract})  # type: ignore[call-overload]
+    def copied_table() -> Any:
+        rel = dataset["example_table"][["a", "b", "_dlt_load_id", "_dlt_id"]].limit(5)
+        yield dlt.mark.with_hints(rel, hints=make_hints(columns=example_table_columns))
+
+    if columns_contract == "freeze":
+        with pytest.raises(PipelineStepFailed) as py_exc:
+            pipeline.run([copied_table()], loader_file_format="model")
+        assert py_exc.value.step == "extract"
+        assert isinstance(py_exc.value.__context__, DataValidationError)
+    else:
+        info = pipeline.run([copied_table()], loader_file_format="model")
+        assert_load_info(info)
+        assert "b" not in pipeline.default_schema.tables["copied_table"]["columns"]

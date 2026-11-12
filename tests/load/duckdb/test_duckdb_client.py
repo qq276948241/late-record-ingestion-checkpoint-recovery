@@ -1,0 +1,1272 @@
+import os
+import pytest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any, Iterator, List, Union, cast
+
+import dlt
+from dlt.common.configuration.resolve import resolve_configuration
+from dlt.common.configuration.specs import (
+    AwsCredentials,
+    AzureCredentials,
+    AzureCredentialsWithoutDefaults,
+    AzureServicePrincipalCredentials,
+    AzureServicePrincipalCredentialsWithoutDefaults,
+    GcpServiceAccountCredentials,
+)
+from dlt.common.configuration.exceptions import ValueNotSecretException
+from dlt.common.configuration.providers.toml import CONFIG_TOML, SECRETS_TOML
+from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContainer
+from dlt.common.destination import Destination
+from dlt.common.known_env import DLT_LOCAL_DIR
+from dlt.common.pendulum import pendulum
+from dlt.common.utils import set_working_dir, uniq_id
+
+from dlt.destinations.exceptions import DatabaseUndefinedRelation
+from dlt.destinations.impl.duckdb.configuration import (
+    ConnStatement,
+    DuckDbClientConfiguration,
+    DuckDbConnectionPool,
+    DuckDbCredentials,
+)
+from dlt.destinations import duckdb
+from dlt.destinations.impl.duckdb.exceptions import InvalidInMemoryDuckdbCredentials
+from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
+from dlt.pipeline.exceptions import PipelineStepFailed
+
+from tests.common.configuration.utils import toml_providers as toml_providers
+from tests.pipeline.utils import assert_table_column
+from tests.utils import get_test_storage_root
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.fixture(autouse=True)
+def run_in_storage(
+    autouse_test_storage, toml_providers: ConfigProvidersContainer
+) -> Iterator[None]:
+    with set_working_dir(get_test_storage_root()):
+        yield
+
+
+def test_duckdb_open_conn_default() -> None:
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    # default name: destination_type.duckdb == duckdb.duckdb
+    assert c.credentials.database == os.path.abspath("duckdb.duckdb")
+    # print(str(c.credentials))
+    # print(str(os.getcwd()))
+    # print(get_resolved_traces())
+    conn = c.credentials.conn_pool.borrow_conn()
+    assert c.credentials.conn_pool._conn_borrows == 1
+    assert c.credentials.conn_pool._conn_owner is True
+    # return conn
+    c.credentials.conn_pool.return_conn(conn)
+    # connection destroyed
+    assert c.credentials.conn_pool._conn_borrows == 0
+    assert c.credentials.conn_pool._conn_owner is True
+    assert c.credentials.conn_pool._conn is None
+    # db file is created
+    assert os.path.isfile("duckdb.duckdb")
+
+
+@pytest.mark.no_load
+def test_duckdb_connection_config() -> None:
+    import duckdb
+
+    # toml_providers injected custom config from ./tests/common/cases/configuration/.dlt (see auto fixture above)
+    credentials = resolve_configuration(
+        DuckDbCredentials(), sections=("destination", "duckdb_configured")
+    )
+    assert credentials.database == "localx.duckdb"
+    assert credentials.extensions == ["spatial"]
+    assert credentials.pragmas == ["enable_progress_bar"]  # "enable_logging"
+    assert credentials.global_config == {"azure_transport_option_type": True}
+    assert credentials.local_config == {"errors_as_json": True}
+
+    # install spatial
+    duckdb.sql("INSTALL spatial;")
+
+    def _read_config(conn: duckdb.DuckDBPyConnection) -> List[Any]:
+        rel = conn.sql("""
+            SELECT name, value
+            FROM duckdb_settings()
+            WHERE name IN ('azure_transport_option_type', 'enable_progress_bar', 'errors_as_json')
+            ORDER BY name ASC;
+            """)
+        return rel.fetchall()
+
+    # check if set
+    conn = credentials.conn_pool.borrow_conn()
+    try:
+        # all settings enabled
+        assert _read_config(conn) == [
+            ("azure_transport_option_type", "true"),
+            ("enable_progress_bar", "true"),
+            ("errors_as_json", "true"),
+        ]
+        # make cursor (new session)
+        cur = conn.cursor()
+        # local settings are gone
+        assert _read_config(cur) == [
+            ("azure_transport_option_type", "true"),
+            ("enable_progress_bar", "false"),
+            ("errors_as_json", "false"),
+        ]
+        cur.close()
+        # settings persisted via borrow
+        cur = credentials.conn_pool.borrow_conn()
+        assert _read_config(conn) == [
+            ("azure_transport_option_type", "true"),
+            ("enable_progress_bar", "true"),
+            ("errors_as_json", "true"),
+        ]
+        credentials.conn_pool.return_conn(cur)
+    finally:
+        credentials.conn_pool.return_conn(conn)
+    assert credentials.conn_pool._conn_borrows == 0
+
+    # check if borrow overwrites
+    conn = credentials.conn_pool.borrow_conn(
+        global_config={"azure_transport_option_type": False},
+        local_config={"errors_as_json": False},
+        pragmas=["disable_progress_bar"],
+    )
+    try:
+        # all settings disabled
+        assert _read_config(conn) == [
+            ("azure_transport_option_type", "false"),
+            ("enable_progress_bar", "false"),
+            ("errors_as_json", "false"),
+        ]
+    finally:
+        credentials.conn_pool.return_conn(conn)
+    assert credentials.conn_pool._conn_borrows == 0
+
+    # check credentials init for external connection
+    ext_conn = duckdb.connect()
+    credentials = DuckDbCredentials(
+        ext_conn,
+        extensions=["spatial"],
+        global_config={"azure_transport_option_type": True},
+        local_config={"errors_as_json": True},
+        pragmas=["enable_progress_bar"],
+    )
+    credentials.resolve()
+    assert credentials.conn_pool._conn_owner is False
+    conn = credentials.conn_pool.borrow_conn()
+    assert credentials.conn_pool._conn_owner is False
+    try:
+        # all settings enabled, on the clone and on the caller's connection
+        assert _read_config(conn) == [
+            ("azure_transport_option_type", "true"),
+            ("enable_progress_bar", "true"),
+            ("errors_as_json", "true"),
+        ]
+        assert _read_config(ext_conn) == _read_config(conn)
+    finally:
+        credentials.conn_pool.return_conn(conn)
+        ext_conn.close()
+
+    # check if move conn keeps config
+    credentials = resolve_configuration(
+        DuckDbCredentials(), sections=("destination", "duckdb_configured")
+    )
+    borrowed = credentials.conn_pool.borrow_conn()
+    # take connection out
+    conn = credentials.conn_pool.move_conn()
+    try:
+        # all settings enabled, including local config
+        assert _read_config(conn) == [
+            ("azure_transport_option_type", "true"),
+            ("enable_progress_bar", "true"),
+            ("errors_as_json", "true"),
+        ]
+    finally:
+        # should not close conn
+        assert credentials.conn_pool.return_conn(borrowed) == 0
+        credentials.conn_pool.__del__()
+        conn.sql("SHOW TABLES;")
+        # close the connection, otherwise it leaks to the next test
+        conn.close()
+
+
+def test_sql_client_config() -> None:
+    import duckdb as _duckdb
+
+    # install spatial
+    _duckdb.sql("INSTALL spatial;")
+
+    def _read_config(conn: _duckdb.DuckDBPyConnection) -> List[Any]:
+        rel = conn.sql("""
+            SELECT name, value
+            FROM duckdb_settings()
+            WHERE name IN ('azure_transport_option_type', 'enable_progress_bar', 'errors_as_json', 'search_path', 'checkpoint_threshold', 'TimeZone')
+            ORDER BY name ASC;
+            """)
+        return rel.fetchall()
+
+    dest_ = duckdb(destination_name="duckdb_configured")
+    pipeline = dlt.pipeline("test_sql_client_config", destination=dest_)
+    c: DuckDbSqlClient
+    with pipeline.destination_client() as job:
+        assert job.config.destination_name == "duckdb_configured"
+        with job.sql_client as c:  # type: ignore[attr-defined]
+            # no search path because dataset is not present
+            assert _read_config(c.native_connection) == [
+                ("TimeZone", "UTC"),
+                ("azure_transport_option_type", "true"),
+                ("checkpoint_threshold", "953.6 MiB"),
+                ("enable_progress_bar", "true"),
+                ("errors_as_json", "true"),
+                ("search_path", ""),
+            ]
+            # create dataset
+            c.create_dataset()
+            with pipeline.sql_client() as c2:
+                assert _read_config(c2.native_connection) == [
+                    ("TimeZone", "UTC"),
+                    ("azure_transport_option_type", "true"),
+                    ("checkpoint_threshold", "953.6 MiB"),
+                    ("enable_progress_bar", "true"),
+                    ("errors_as_json", "true"),
+                    ("search_path", "test_sql_client_config_dataset"),
+                ]
+
+            c.native_connection.sql(
+                "SELECT count(1) FROM duckdb_logs where message LIKE"
+                " '%enable_checkpoint_on_shutdown%';"
+            ).fetchall()
+
+            # TODO: had to disable this test after downgrade to 1.2.1 (logs available on 1.3)
+            # 5 calls to pragma (two for each connection, log is common)
+            # assert cnt[0][0] == 5
+            # # one call to load extension (from second connection, we enabled logging after the first LOAD)
+            # cnt = c.native_connection.sql(
+            #     "SELECT count(1) FROM duckdb_logs where message LIKE '%spatial%';"
+            # ).fetchall()
+            # assert cnt[0][0] == 1
+
+
+def _timezone(conn: Any) -> str:
+    return conn.sql("SELECT current_setting('TimeZone')").fetchone()[0]
+
+
+def test_session_timezone() -> None:
+    """`dlt` applies `session_timezone` to each connection. The default is UTC."""
+    import duckdb as _duckdb
+
+    def _pipeline_with(**kwargs: Any) -> dlt.Pipeline:
+        db_path = os.path.join(get_test_storage_root(), f"tz_{uniq_id()}.duckdb")
+        return dlt.pipeline(
+            "test_session_timezone_" + uniq_id(),
+            destination=duckdb(DuckDbCredentials(db_path, **kwargs)),
+        )
+
+    with _pipeline_with().sql_client() as c:
+        assert _timezone(c.native_connection) == "UTC"
+
+    with _pipeline_with(session_timezone="Europe/Berlin").sql_client() as c:
+        assert _timezone(c.native_connection) == "Europe/Berlin"
+
+    # with no timezone configured, duckdb keeps the machine default
+    duckdb_default = _timezone(_duckdb.connect())
+    with _pipeline_with(session_timezone=None).sql_client() as c:
+        assert _timezone(c.native_connection) == duckdb_default
+
+
+@pytest.mark.parametrize("session_timezone", ("UTC", "Europe/Berlin", None))
+def test_session_config_on_external_connection(session_timezone: str) -> None:
+    """dlt configures a caller's connection like the ones it opens: `search_path` names the dataset
+    and `TimeZone` is set unless it is disabled."""
+    import duckdb as _duckdb
+
+    ext_conn = _duckdb.connect(os.path.join(get_test_storage_root(), f"tz_ext_{uniq_id()}.duckdb"))
+    ext_conn.execute("SET GLOBAL TimeZone='America/New_York'")
+
+    pipeline = dlt.pipeline(
+        "test_session_timezone_external_" + uniq_id(),
+        destination=duckdb(DuckDbCredentials(ext_conn, session_timezone=session_timezone)),
+        dataset_name="tz_external",
+    )
+    pipeline.run([{"id": 1, "ts": pendulum.datetime(2024, 1, 1, tz="UTC")}], table_name="events")
+
+    try:
+        assert _timezone(ext_conn) == (session_timezone or "America/New_York")
+        assert ext_conn.sql("SELECT current_setting('search_path')").fetchone()[0] == "tz_external"
+        # the load ran in UTC so the instant is intact
+        assert ext_conn.sql("SELECT epoch(ts) FROM events").fetchone()[0] == 1704067200
+    finally:
+        ext_conn.close()
+
+
+@pytest.mark.no_load
+def test_destination_credentials_with_config() -> None:
+    import duckdb
+    from dlt.destinations.impl.duckdb.configuration import DuckDbCredentials
+
+    # install spatial
+    duckdb.sql("INSTALL spatial;")
+
+    os.environ["DESTINATION__DUCKDB__CREDENTIALS__PRAGMAS"] = '["enable_profiling"]'
+
+    plan_path = os.path.abspath("plan.txt")
+    dest_ = dlt.destinations.duckdb(
+        DuckDbCredentials(
+            "duck.db", extensions=["spatial"], local_config={"profiling_output": plan_path}
+        )
+    )
+    pipeline = dlt.pipeline("test_destination_credentials_with_config", destination=dest_)
+    c: DuckDbSqlClient
+    with pipeline.sql_client() as c:  # type: ignore[assignment]
+        # logging not enabled on 1.2.1
+        assert c.native_connection.sql("SELECT count(1) FROM duckdb_logs").fetchall()[0][0] == 0
+    # check if query plan is created so pragma is working
+    assert os.path.isfile(plan_path)
+
+
+def _foreign_db(path: str) -> str:
+    import duckdb
+
+    conn = duckdb.connect(path)
+    conn.execute("CREATE TABLE t AS SELECT 1 AS x")
+    conn.close()
+    return f"ATTACH IF NOT EXISTS '{path}' AS a (READ_ONLY)"
+
+
+@pytest.mark.no_load
+def test_conn_pool_statements() -> None:
+    """Statements registered on the pool run on every connection that the pool opens, in every
+    open mode.
+    """
+    root = get_test_storage_root()
+    attach_sql = _foreign_db(os.path.join(root, f"pool_stmt_{uniq_id()}.duckdb"))
+    c = resolve_configuration(
+        DuckDbClientConfiguration(
+            credentials=DuckDbCredentials(os.path.join(root, f"pool_main_{uniq_id()}.duckdb"))
+        )._bind_dataset_name(dataset_name="test_dataset")
+    )
+    pool = c.credentials.conn_pool
+
+    # the pool registers the statement before any connection exists, so nothing runs yet
+    assert pool.add_statements([ConnStatement(attach_sql)]) == [ConnStatement(attach_sql)]
+
+    first = pool.borrow_conn()
+    assert first.execute("SELECT x FROM a.t").fetchone() == (1,)
+    # a duplicate of a live connection shares the attached catalog
+    second = pool.borrow_conn()
+    assert second.execute("SELECT x FROM a.t").fetchone() == (1,)
+    pool.return_conn(second)
+    pool.return_conn(first)
+
+    # the underlying connection is gone, so the pool replays the statements onto a fresh instance
+    assert pool._conn is None
+    third = pool.borrow_conn()
+    assert third.execute("SELECT x FROM a.t").fetchone() == (1,)
+
+    # the pool already holds an identical statement and does not run it again
+    assert pool.add_statements([ConnStatement(attach_sql)]) == []
+    # the same SQL under an explicit key is a different statement
+    assert pool.add_statements([ConnStatement(attach_sql, "attach_a")], conn=third)
+
+    # a keyed statement replaces the earlier statement with that key. the pool does not keep both
+    registered = len(pool._statements)
+    pool.add_statements([ConnStatement("CREATE OR REPLACE VIEW v AS SELECT 1", "v")], conn=third)
+    assert len(pool._statements) == registered + 1
+    pool.add_statements([ConnStatement("CREATE OR REPLACE VIEW v AS SELECT 2", "v")], conn=third)
+    assert len(pool._statements) == registered + 1
+    # a statement that the pool adds while a connection is open runs on that connection immediately
+    assert third.execute("SELECT * FROM v").fetchone() == (2,)
+
+    # statements that share a key are one group. the pool replaces the whole group, even when
+    # the new group is smaller
+    group = [
+        ConnStatement("CREATE OR REPLACE VIEW g1 AS SELECT 1", "grp"),
+        ConnStatement("CREATE OR REPLACE VIEW g2 AS SELECT 2", "grp"),
+    ]
+    assert pool.add_statements(group, conn=third) == group
+    assert [s.key for s in pool._statements].count("grp") == 2
+    smaller = [ConnStatement("CREATE OR REPLACE VIEW g1 AS SELECT 3", "grp")]
+    assert pool.add_statements(smaller, conn=third) == smaller
+    assert [s.sql for s in pool._statements if s.key == "grp"] == [smaller[0].sql]
+    # when a group does not change, the pool adds nothing
+    assert pool.add_statements(smaller, conn=third) == []
+
+    pool.return_conn(third)
+    # a later connection receives the replacement, not the statement that it superseded
+    fourth = pool.borrow_conn()
+    assert fourth.execute("SELECT * FROM v").fetchone() == (2,)
+    assert fourth.execute("SELECT * FROM g1").fetchone() == (3,)
+    pool.return_conn(fourth)
+
+
+@pytest.mark.no_load
+def test_conn_pool_statements_replayed_after_interleaved_borrow() -> None:
+    """A sibling borrow that spans the teardown leaves the borrow count non-zero while the
+    underlying connection is new. The count therefore cannot show that the statements are still
+    in place.
+    """
+    root = get_test_storage_root()
+    attach_sql = _foreign_db(os.path.join(root, f"pool_inter_{uniq_id()}.duckdb"))
+    c = resolve_configuration(
+        DuckDbClientConfiguration(
+            credentials=DuckDbCredentials(os.path.join(root, f"pool_inter_main_{uniq_id()}.duckdb"))
+        )._bind_dataset_name(dataset_name="test_dataset")
+    )
+    pool = c.credentials.conn_pool
+    pool.add_statements([ConnStatement(attach_sql)])
+
+    mine = pool.borrow_conn()
+    sibling = pool.borrow_conn()
+    # my borrow ends while the sibling keeps the pool alive
+    pool.return_conn(mine)
+    # the sibling returns last, so the pool destroys the underlying connection here
+    pool.return_conn(sibling)
+    # a sibling borrows first and recreates the connection. the count stays non-zero for my
+    # next borrow
+    sibling = pool.borrow_conn()
+    mine = pool.borrow_conn()
+    try:
+        assert mine.execute("SELECT x FROM a.t").fetchone() == (1,)
+    finally:
+        pool.return_conn(mine)
+        pool.return_conn(sibling)
+
+
+@pytest.mark.no_load
+def test_conn_pool_statements_always_open_connection() -> None:
+    """Every borrow opens a new database in this mode, so the pool replays the statements on
+    every borrow.
+    """
+    root = get_test_storage_root()
+    attach_sql = _foreign_db(os.path.join(root, f"pool_always_{uniq_id()}.duckdb"))
+    credentials = resolve_configuration(
+        DuckDbCredentials(os.path.join(root, f"pool_always_main_{uniq_id()}.duckdb"))
+    )
+    pool = DuckDbConnectionPool(credentials, always_open_connection=True)
+    pool.add_statements([ConnStatement(attach_sql)])
+
+    first = pool.borrow_conn()
+    second = pool.borrow_conn()
+    assert first.execute("SELECT x FROM a.t").fetchone() == (1,)
+    assert second.execute("SELECT x FROM a.t").fetchone() == (1,)
+    pool.return_conn(second)
+    pool.return_conn(first)
+
+
+@pytest.mark.no_load
+def test_conn_pool_statements_from_config(toml_providers: ConfigProvidersContainer) -> None:
+    """Configured statements seed the pool. These statements are secrets, so they resolve from
+    `secrets.toml` only.
+    """
+    root = get_test_storage_root()
+    attach_sql = _foreign_db(os.path.join(root, f"pool_cfg_{uniq_id()}.duckdb"))
+    providers = {provider.name: provider for provider in toml_providers.providers}
+
+    # these statements often carry credentials, so a non-secret provider must refuse to hold them
+    providers[CONFIG_TOML].set_value(
+        "statements", [attach_sql], None, "destination", "duck_from_config", "credentials"
+    )
+    with pytest.raises(ValueNotSecretException):
+        resolve_configuration(
+            DuckDbCredentials(os.path.join(root, "unused.duckdb")),
+            sections=("destination", "duck_from_config"),
+        )
+
+    providers[SECRETS_TOML].set_value(
+        "statements", [attach_sql], None, "destination", "duck_from_secrets", "credentials"
+    )
+    credentials = resolve_configuration(
+        DuckDbCredentials(os.path.join(root, f"pool_cfg_main_{uniq_id()}.duckdb")),
+        sections=("destination", "duck_from_secrets"),
+    )
+    assert credentials.statements == [attach_sql]
+    conn = credentials.conn_pool.borrow_conn()
+    try:
+        assert conn.execute("SELECT x FROM a.t").fetchone() == (1,)
+        # the pool registers a runtime statement after the configured ones
+        credentials.conn_pool.add_statements(
+            [ConnStatement("CREATE OR REPLACE VIEW v AS SELECT 1")]
+        )
+        assert [statement.sql for statement in credentials.conn_pool._statements][0] == attach_sql
+    finally:
+        credentials.conn_pool.return_conn(conn)
+
+
+@pytest.mark.no_load
+def test_conn_pool_statement_failure() -> None:
+    """The pool does not register a statement that cannot run, so the statement does not break
+    every later connection.
+    """
+    import duckdb
+
+    root = get_test_storage_root()
+    c = resolve_configuration(
+        DuckDbClientConfiguration(
+            credentials=DuckDbCredentials(os.path.join(root, f"pool_fail_{uniq_id()}.duckdb"))
+        )._bind_dataset_name(dataset_name="test_dataset")
+    )
+    pool = c.credentials.conn_pool
+
+    conn = pool.borrow_conn()
+    with pytest.raises(duckdb.Error):
+        pool.add_statements([ConnStatement("SELECT * FROM no_such_table")], conn=conn)
+    assert pool._statements == []
+    pool.return_conn(conn)
+
+    # the pool is still usable
+    conn = pool.borrow_conn()
+    assert conn.execute("SELECT 1").fetchone() == (1,)
+    pool.return_conn(conn)
+
+    # a statement that the pool registers while no connection is open cannot run yet. the pool
+    # keeps it and fails the next borrow, exactly as a failing pragma does
+    assert pool._conn is None
+    pool.add_statements([ConnStatement("SELECT * FROM no_such_table")])
+    with pytest.raises(duckdb.Error):
+        pool.borrow_conn()
+    assert pool._conn is None
+    assert pool._conn_borrows == 0
+
+
+def test_credentials_wrong_config() -> None:
+    import duckdb
+
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    with pytest.raises(duckdb.CatalogException):
+        c.credentials.conn_pool.borrow_conn(global_config={"wrong_conf": 0})
+    # connection closed
+    assert c.credentials.conn_pool._conn is None
+    assert c.credentials.conn_pool._conn_borrows == 0
+
+    with pytest.raises(duckdb.CatalogException):
+        c.credentials.conn_pool.borrow_conn(local_config={"wrong_conf": 0})
+    # connection closed
+    assert c.credentials.conn_pool._conn is None
+    assert c.credentials.conn_pool._conn_borrows == 0
+
+    with pytest.raises(duckdb.CatalogException):
+        c.credentials.conn_pool.borrow_conn(pragmas=["unkn_pragma"])
+    # connection closed
+    assert c.credentials.conn_pool._conn is None
+    assert c.credentials.conn_pool._conn_borrows == 0
+
+    # open and borrow conn
+    conn = c.credentials.conn_pool.borrow_conn()
+    assert c.credentials.conn_pool._conn_borrows == 1
+    try:
+        with pytest.raises(duckdb.CatalogException):
+            c.credentials.conn_pool.borrow_conn(pragmas=["unkn_pragma"])
+        assert c.credentials.conn_pool._conn is not None
+        # refcount not increased
+        assert c.credentials.conn_pool._conn_borrows == 1
+    finally:
+        conn.close()
+
+    # check extensions fail
+    os.environ["CREDENTIALS__EXTENSIONS"] = '["unk_extension"]'
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    with pytest.raises(duckdb.IOException):
+        c.credentials.conn_pool.borrow_conn()
+    assert not hasattr(c.credentials, "_conn")
+    assert c.credentials.conn_pool._conn_borrows == 0
+
+
+@pytest.mark.no_load
+def test_duckdb_in_memory_mode_via_factory():
+    import duckdb
+
+    # Check if passing external duckdb connection works fine
+    db = duckdb.connect(":memory:")
+    dlt.pipeline(pipeline_name="booboo", destination=dlt.destinations.duckdb(db))
+
+    # Check if passing :memory: to factory fails
+    with pytest.raises(PipelineStepFailed) as exc:
+        p = dlt.pipeline(
+            pipeline_name="booboo", destination=dlt.destinations.duckdb(credentials=":memory:")
+        )
+        p.run([1, 2, 3])
+
+    assert isinstance(exc.value.exception, InvalidInMemoryDuckdbCredentials)
+
+    os.environ["DESTINATION__DUCKDB__CREDENTIALS"] = ":memory:"
+    with pytest.raises(PipelineStepFailed):
+        p = dlt.pipeline(
+            pipeline_name="booboo",
+            destination="duckdb",
+        )
+        p.run([1, 2, 3])
+
+    assert isinstance(exc.value.exception, InvalidInMemoryDuckdbCredentials)
+
+    with pytest.raises(PipelineStepFailed) as exc:
+        p = dlt.pipeline(
+            pipeline_name="booboo",
+            destination=Destination.from_reference("duckdb", credentials=":memory:"),
+        )
+        p.run([1, 2, 3], table_name="numbers")
+
+    assert isinstance(exc.value.exception, InvalidInMemoryDuckdbCredentials)
+
+
+def test_duckdb_database_path() -> None:
+    # resolve without any path provided
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    assert c.credentials._conn_str().lower() == os.path.abspath("duckdb.duckdb").lower()
+
+    # resolve without any path but with pipeline context
+    p = dlt.pipeline(pipeline_name="quack_pipeline")
+    # pipeline context must be passed explicitly
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    assert c.credentials._conn_str().lower() == os.path.abspath("duckdb.duckdb").lower()
+    # pass explicitly
+    c = resolve_configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+        )
+    )
+    # still cwd
+    db_path = os.path.abspath(os.path.join(".", "quack_pipeline.duckdb"))
+    assert c.credentials._conn_str().lower() == db_path.lower()
+
+    # must work via factory
+    factory_ = dlt.destinations.duckdb()
+    c = factory_.configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+        )
+    )
+    assert c.credentials._conn_str().lower() == db_path.lower()
+
+    # connect
+    try:
+        conn = c.credentials.conn_pool.borrow_conn()
+        c.credentials.conn_pool.return_conn(conn)
+        assert os.path.isfile(db_path)
+    finally:
+        if os.path.isfile(db_path):
+            os.unlink(db_path)
+
+    # must work via pipeline
+    duck_p = dlt.pipeline(pipeline_name="quack_pipeline_exp", destination="duckdb")
+    db_path = os.path.abspath(os.path.join(".", "quack_pipeline_exp.duckdb"))
+    assert duck_p.sql_client().credentials._conn_str().lower() == db_path.lower()
+
+    duck_p = dlt.pipeline(pipeline_name="quack_pipeline_exp", destination=dlt.destinations.duckdb())
+    creds_ = duck_p.sql_client().credentials
+    assert creds_._conn_str().lower() == db_path.lower()
+
+    # connect
+    try:
+        conn = creds_.conn_pool.borrow_conn()
+        creds_.conn_pool.return_conn(conn)
+        assert os.path.isfile(db_path)
+    finally:
+        if os.path.isfile(db_path):
+            os.unlink(db_path)
+
+    # test special :pipeline: path to create in pipeline folder
+    c = resolve_configuration(
+        # not an active pipeline
+        p._bind_local_files(
+            DuckDbClientConfiguration(credentials=":pipeline:")._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+    )
+    db_path = os.path.abspath(os.path.join(p.working_dir, p.pipeline_name + ".duckdb"))
+    assert c.credentials._conn_str().lower() == db_path.lower()
+    # connect
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+    p = p.drop()
+
+    # provide relative path
+    db_path = "test_quack.duckdb"
+    c = resolve_configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration(credentials="duckdb:///test_quack.duckdb")._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+    )
+    assert c.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+    p = p.drop()
+
+    # provide absolute path
+    db_path = os.path.abspath("abs_test_quack.duckdb")
+    c = resolve_configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration(credentials=f"duckdb:///{db_path}")._bind_dataset_name(
+                dataset_name="test_dataset",
+            )
+        )
+    )
+    assert os.path.isabs(c.credentials.database)
+    assert c.credentials._conn_str().lower() == db_path.lower()
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+    p = p.drop()
+
+    # set just path as credentials
+    db_path = "path_test_quack.duckdb"
+    c = resolve_configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration(credentials=db_path)._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+    )
+    assert c.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+    p = p.drop()
+
+    db_path = os.path.abspath("abs_path_test_quack.duckdb")
+    c = resolve_configuration(
+        p._bind_local_files(
+            DuckDbClientConfiguration(credentials=db_path)._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+    )
+    assert os.path.isabs(c.credentials.database)
+    assert c.credentials._conn_str().lower() == db_path.lower()
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+    p = p.drop()
+
+    # invalid path
+    import duckdb
+
+    with pytest.raises(duckdb.IOException):
+        c = resolve_configuration(
+            DuckDbClientConfiguration(credentials=".")._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+        conn = c.credentials.conn_pool.borrow_conn()
+
+
+def test_named_destination_path() -> None:
+    # if destination is named, its name is always used
+    c = resolve_configuration(
+        DuckDbClientConfiguration(destination_name="named")._bind_dataset_name(
+            dataset_name="test_dataset"
+        )
+    )
+    assert c.credentials._conn_str().lower() == os.path.abspath("named.duckdb").lower()
+    # even if part of of pipeline
+    named_duck = dlt.destinations.duckdb(destination_name="named")
+    pipeline = dlt.pipeline(pipeline_name="quack_pipeline", destination=named_duck)
+    c = resolve_configuration(
+        pipeline._bind_local_files(
+            DuckDbClientConfiguration(destination_name="named")._bind_dataset_name(
+                dataset_name="test_dataset"
+            )
+        )
+    )
+    db_path = os.path.abspath("named.duckdb")
+    assert c.credentials._conn_str().lower() == db_path.lower()
+    conn = c.credentials.conn_pool.borrow_conn()
+    c.credentials.conn_pool.return_conn(conn)
+    assert os.path.isfile(db_path)
+
+
+def test_db_path_follows_local_dir() -> None:
+    local_dir = os.path.join(get_test_storage_root(), uniq_id())
+    os.makedirs(local_dir)
+    # mock tmp dir
+    os.environ[DLT_LOCAL_DIR] = local_dir
+    # we expect duckdb db to appear there
+    c = resolve_configuration(
+        DuckDbClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    )
+    db_path = os.path.join(local_dir, "duckdb.duckdb")
+    assert c.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+
+
+@pytest.mark.no_load
+def test_keeps_initial_db_path() -> None:
+    db_path = "path_test_quack.duckdb"
+    # this must be present in credentials so attach also sees it
+    os.environ["CREDENTIALS"] = db_path
+
+    p = dlt.pipeline(pipeline_name="quack_pipeline", destination=dlt.destinations.duckdb())
+    assert p.state["_local"]["initial_cwd"].lower() == os.path.abspath(os.path.curdir).lower()
+    with p.sql_client() as conn:
+        # still cwd
+        assert conn.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+
+    # attach the pipeline
+    p = dlt.attach(pipeline_name="quack_pipeline")
+    assert p.state["_local"]["initial_cwd"].lower() == os.path.abspath(os.path.curdir).lower()
+    with p.sql_client() as conn:
+        # still cwd
+        assert conn.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+
+    # now create and activate a new pipeline
+    dlt.pipeline(pipeline_name="not_quack", destination="dummy")
+    with p.sql_client() as conn:
+        # still cwd
+        assert conn.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+
+
+def test_uses_duckdb_local_path_compat() -> None:
+    db_path = "./path_test_quack.duckdb"
+    p = dlt.pipeline(pipeline_name="quack_pipeline")
+    # old db location is still recognized
+    p.set_local_state_val("duckdb_database", os.path.abspath(db_path))
+    p = dlt.attach("quack_pipeline", destination="duckdb")
+    with p.sql_client() as conn:
+        # still cwd
+        assert conn.credentials._conn_str().lower() == os.path.abspath(db_path).lower()
+
+
+def test_drops_pipeline_changes_bound() -> None:
+    p = dlt.pipeline(pipeline_name="quack_pipeline", destination="duckdb")
+    p.run([1, 2, 3], table_name="p_table")
+    p = p.drop()
+    p.sync_destination()
+    assert len(p.dataset().p_table.fetchall()) == 3
+
+    # drops internal duckdb
+    p = dlt.pipeline(pipeline_name="quack_pipeline", destination=duckdb(":pipeline:"))
+    p.run([1, 2, 3], table_name="p_table")
+    p = p.drop()
+    p.sync_destination()
+    with pytest.raises(DatabaseUndefinedRelation):
+        with p.sql_client() as conn:
+            conn.execute_sql("SELECT * FROM p_table")
+
+
+def test_duckdb_database_delete() -> None:
+    db_path = "./path_test_quack.duckdb"
+    os.environ["CREDENTIALS"] = db_path
+
+    p = dlt.pipeline(pipeline_name="quack_pipeline", destination="duckdb")
+    p.run([1, 2, 3], table_name="table", dataset_name="dataset")
+    # attach the pipeline
+    p = dlt.attach(pipeline_name="quack_pipeline")
+    assert p.first_run is False
+    # drop the database
+    os.remove(db_path)
+    p = dlt.attach(pipeline_name="quack_pipeline")
+    assert p.first_run is False
+    assert not os.path.exists(db_path)
+    p.run([1, 2, 3], table_name="table", dataset_name="dataset")
+    assert os.path.exists(db_path)
+
+
+def test_duck_database_path_delete() -> None:
+    # delete path
+    db_folder = "./db_path"
+    os.makedirs(db_folder)
+    db_path = f"{db_folder}/path_test_quack.duckdb"
+    os.environ["CREDENTIALS"] = db_path
+
+    p = dlt.pipeline(pipeline_name="deep_quack_pipeline", destination="duckdb")
+    p.run([1, 2, 3], table_name="table", dataset_name="dataset")
+    # attach the pipeline
+    p = dlt.attach(pipeline_name="deep_quack_pipeline")
+    assert p.first_run is False
+    # drop the database
+    os.remove(db_path)
+    os.rmdir(db_folder)
+    p = dlt.attach(pipeline_name="deep_quack_pipeline")
+    assert p.first_run is False
+
+    # we won't be able to recreate the database because folder was deleted
+    with pytest.raises(PipelineStepFailed) as py_ex:
+        p.run([1, 2, 3], table_name="table", dataset_name="dataset")
+    assert "No such file or directory" in str(py_ex.value)
+    # no database
+    assert not os.path.exists(db_path)
+    # restore folder, otherwise cleanup fails
+    os.makedirs(db_folder)
+
+
+def test_case_sensitive_database_name() -> None:
+    # make case sensitive folder name
+    cs_quack = os.path.join(get_test_storage_root(), "QuAcK")
+    os.makedirs(cs_quack, exist_ok=True)
+    db_path = os.path.join(cs_quack, "path_TEST_quack.duckdb")
+    p = dlt.pipeline(pipeline_name="NOT_QUAck", destination=duckdb(credentials=db_path))
+    with p.sql_client() as conn:
+        conn.execute_sql("DESCRIBE;")
+
+
+def test_external_duckdb_database() -> None:
+    import duckdb
+
+    # pass explicit in memory database
+    conn = duckdb.connect(":memory:")
+    c = resolve_configuration(
+        DuckDbClientConfiguration(credentials=conn)._bind_dataset_name(dataset_name="test_dataset")
+    )
+    assert c.credentials.conn_pool._conn_borrows == 0
+    assert c.credentials.conn_pool._conn is conn
+    int_conn = c.credentials.conn_pool.borrow_conn()
+    assert c.credentials.conn_pool._conn_borrows == 1
+    assert c.credentials.conn_pool._conn_owner is False
+    c.credentials.conn_pool.return_conn(int_conn)
+    assert c.credentials.conn_pool._conn_borrows == 0
+    assert c.credentials.conn_pool._conn_owner is False
+    assert c.credentials.conn_pool._conn is not None
+    conn.close()
+    assert not os.path.exists(":memory:")
+
+
+def test_default_duckdb_dataset_name() -> None:
+    # drop previous pipeline from container
+    dlt.current.pipeline().deactivate()
+
+    # Check if dataset_name does not collide with pipeline_name
+    data = ["a", "b", "c"]
+    info = dlt.run(data, destination="duckdb", table_name="data")
+    assert_table_column(cast(dlt.Pipeline, info.pipeline), "data", data, info=info)
+
+
+def _aws_environment_default(region: str = "us-east-1") -> AwsCredentials:
+    """AwsCredentials resolved from the environment default chain (not an external session)."""
+    creds = AwsCredentials()
+    creds.region_name = region
+    creds._set_default_credentials(object())
+    return creds
+
+
+def _aws_external_session(region: str = "us-east-1") -> AwsCredentials:
+    """AwsCredentials created from a user-passed boto session (marked external)."""
+    import botocore.session
+    from botocore.credentials import Credentials
+
+    session = botocore.session.get_session()
+    session._credentials = Credentials("AKIAEXTERNAL", "ext_secret", "ext_token")  # type: ignore[attr-defined]
+    session.set_config_variable("region", region)
+    return AwsCredentials.from_session(session)
+
+
+def _aws_explicit(region: str = "us-east-1") -> AwsCredentials:
+    """AwsCredentials with explicit static keys and no default credentials."""
+    creds = AwsCredentials()
+    creds.aws_access_key_id = "AKIAEXPLICIT"
+    creds.aws_secret_access_key = "explicit_secret"
+    creds.region_name = region
+    return creds
+
+
+def _azure_default(
+    sp: bool = False, account: str = "acc"
+) -> Union[AzureCredentials, AzureServicePrincipalCredentials]:
+    """Azure credentials backed by DefaultAzureCredential (managed identity / workload / cli)."""
+    creds = AzureServicePrincipalCredentials() if sp else AzureCredentials()
+    creds.azure_storage_account_name = account
+    creds._set_default_credentials(object())
+    return creds
+
+
+def _gcp_default(*lifetimes: timedelta) -> GcpServiceAccountCredentials:
+    """GCP credentials whose default google credentials mint `tok-1`, `tok-2`... living
+    `lifetimes`. `minted` on the default credentials counts the tokens."""
+    from google.auth.credentials import Credentials
+
+    class _MintingCredentials(Credentials):
+        minted = 0
+
+        def refresh(self, request: Any) -> None:
+            self.minted += 1
+            self.token = f"tok-{self.minted}"
+            # google-auth keeps the expiry as naive utc
+            expiry = datetime.now(timezone.utc) + lifetimes[self.minted - 1]
+            self.expiry = expiry.replace(tzinfo=None)
+
+    creds = GcpServiceAccountCredentials()
+    creds.project_id = "project"
+    creds._set_default_credentials(_MintingCredentials())
+    return creds
+
+
+def _azure_external_session(*lifetimes: timedelta) -> AzureServicePrincipalCredentials:
+    """Azure credentials with a user-passed credential that mints `tok-1`, `tok-2`... living
+    `lifetimes`. `minted` on the default credentials counts the tokens."""
+
+    class _MintingCredential:
+        minted = 0
+
+        def get_token(self, *scopes: str, **kwargs: Any) -> Any:
+            self.minted += 1
+            expires_on = datetime.now(timezone.utc) + lifetimes[self.minted - 1]
+            # the fields of azure `AccessToken`, azure packages are not installed with duckdb
+            return SimpleNamespace(
+                token=f"tok-{self.minted}", expires_on=int(expires_on.timestamp())
+            )
+
+    creds = AzureServicePrincipalCredentials.from_credential(_MintingCredential())
+    creds.azure_storage_account_name = "acc"
+    return creds
+
+
+def _secret_sql(
+    scope: str, credentials: Any, persistent_stmt: str = "", persist_secrets: bool = False
+) -> str:
+    return "\n".join(
+        DuckDbSqlClient._build_secret_statements(
+            scope, credentials, "ds_secret", persistent_stmt, persist_secrets
+        )
+    )
+
+
+@pytest.mark.no_load
+@pytest.mark.parametrize(
+    "creds_factory, present, absent",
+    [
+        (_aws_environment_default, ["PROVIDER credential_chain", "REFRESH auto,"], ["KEY_ID"]),
+        (_aws_external_session, ["KEY_ID 'AKIAEXTERNAL'"], ["credential_chain"]),
+        (_aws_explicit, ["KEY_ID 'AKIAEXPLICIT'"], ["credential_chain"]),
+    ],
+    ids=["environment-default", "external-session", "explicit"],
+)
+def test_duckdb_secret_s3_handover(
+    creds_factory: Any, present: List[str], absent: List[str]
+) -> None:
+    """S3 hands over environment default creds to credential_chain; freezes external/explicit creds."""
+    sql = _secret_sql("s3://bucket/path", creds_factory())
+    for token in present:
+        assert token in sql
+    for token in absent:
+        assert token not in sql
+
+
+@pytest.mark.no_load
+@pytest.mark.parametrize(
+    "version, has_refresh", [("1.0.0", False), ("1.1.0", True), ("1.5.3", True)]
+)
+def test_duckdb_secret_s3_refresh_version_check(
+    monkeypatch: pytest.MonkeyPatch, version: str, has_refresh: bool
+) -> None:
+    """REFRESH auto is emitted only on DuckDB >= 1.1.0."""
+    import duckdb
+
+    monkeypatch.setattr(duckdb, "__version__", version)
+    sql = _secret_sql("s3://bucket", _aws_environment_default())
+    assert "PROVIDER credential_chain" in sql
+    assert ("REFRESH auto," in sql) is has_refresh
+
+
+@pytest.mark.no_load
+@pytest.mark.parametrize("scope", ["az://container", "abfss://container"], ids=["az", "abfss"])
+@pytest.mark.parametrize("sp", [False, True], ids=["default", "service-principal-default"])
+def test_duckdb_secret_azure_default_handover(scope: str, sp: bool) -> None:
+    """Azure default credentials hand over to credential_chain for az and abfss."""
+    sql = _secret_sql(scope, _azure_default(sp=sp))
+    assert "PROVIDER credential_chain" in sql
+    assert "ACCOUNT_NAME 'acc'" in sql
+    assert "CONNECTION_STRING" not in sql
+
+
+@pytest.mark.no_load
+def test_duckdb_secret_azure_connection_string_frozen() -> None:
+    """Azure account-key credentials are emitted frozen as a connection string."""
+    creds = AzureCredentialsWithoutDefaults()
+    creds.azure_storage_account_name = "acc"
+    creds.azure_storage_account_key = "key123"
+    sql = _secret_sql("az://container", creds)
+    assert "credential_chain" not in sql
+    assert "CONNECTION_STRING 'AccountName=acc;AccountKey=key123'" in sql
+
+
+@pytest.mark.no_load
+def test_duckdb_secret_azure_service_principal_frozen() -> None:
+    """Azure explicit service principal is emitted frozen."""
+    creds = AzureServicePrincipalCredentialsWithoutDefaults()
+    creds.azure_tenant_id = "t"
+    creds.azure_client_id = "ci"
+    creds.azure_client_secret = "cs"
+    creds.azure_storage_account_name = "acc"
+    sql = _secret_sql("az://container", creds)
+    assert "credential_chain" not in sql
+    assert "PROVIDER SERVICE_PRINCIPAL" in sql
+    assert "CLIENT_SECRET 'cs'" in sql
+
+
+@pytest.mark.no_load
+def test_duckdb_secret_azure_external_session() -> None:
+    """An external azure credential is frozen into a DuckDB access_token secret."""
+
+    class _Tok:
+        token = "bearer.jwt"
+        expires_on = 1893456000
+
+    class _Cred:
+        def get_token(self, *args: Any, **kwargs: Any) -> Any:
+            return _Tok()
+
+    creds = AzureServicePrincipalCredentials.from_credential(_Cred())
+    creds.azure_storage_account_name = "acc"
+    sql = _secret_sql("az://container", creds)
+    assert "credential_chain" not in sql
+    assert "PROVIDER access_token" in sql
+    assert "ACCESS_TOKEN 'bearer.jwt'" in sql
+    # the client creates the secret again before the token expires
+    _, expires_at = DuckDbSqlClient._build_secret("az://container", creds, "ds_secret", "", False)
+    assert expires_at == datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.no_load
+def test_duckdb_secret_gcs_bearer_token() -> None:
+    """GCS credentials are frozen into a bearer token secret that expires with the token."""
+    creds = _gcp_default(timedelta(hours=1), timedelta(hours=1))
+    minting = creds.default_credentials()
+    sql, expires_at = DuckDbSqlClient._build_secret("gs://bucket", creds, "ds_secret", "", False)
+    assert "TYPE GCS" in sql[0]
+    assert "BEARER_TOKEN 'tok-1'" in sql[0]
+    assert "SCOPE 'gs://bucket'" in sql[0]
+    assert expires_at == minting.expiry.replace(tzinfo=timezone.utc)
+    # the client creates the secret again before the token expires, so it reuses the token
+    DuckDbSqlClient._build_secret("gs://bucket", creds, "ds_secret", "", False)
+    assert minting.minted == 1
+    # attach statements are kept, so they get a new token
+    assert "BEARER_TOKEN 'tok-2'" in _secret_sql("gs://bucket", creds)
+    assert minting.minted == 2
+
+    # a persisted secret would outlive its token
+    with pytest.raises(ValueError):
+        _secret_sql("gs://bucket", creds, " PERSISTENT ", True)
+
+
+@pytest.mark.parametrize(
+    "scope, credentials_factory",
+    [("gs://bucket", _gcp_default), ("az://container", _azure_external_session)],
+    ids=["gcs", "azure-external-session"],
+)
+def test_duckdb_secret_recreated_before_token_expires(scope: str, credentials_factory: Any) -> None:
+    """The client creates a secret with a frozen token again before a statement when the token
+    is about to expire."""
+    suffix = uniq_id()
+    pipeline = dlt.pipeline(
+        "secret_refresh_" + suffix,
+        destination=duckdb(os.path.join(get_test_storage_root(), f"refresh_{suffix}.duckdb")),
+        dataset_name="ds",
+    )
+    pipeline.run([{"id": 1}], table_name="t")
+    # the first token is valid but lives shorter than the refresh margin
+    creds = credentials_factory(timedelta(minutes=20), timedelta(hours=1))
+    minting = creds.default_credentials()
+
+    with pipeline.sql_client() as client:
+        client = cast(DuckDbSqlClient, client)
+        client.create_secret(scope, creds)
+        assert minting.minted == 1
+        assert client.create_secret_name(scope) in client.list_secrets()
+        client.execute_sql("SELECT 1")
+        assert minting.minted == 2
+        # the new token lives long enough
+        client.execute_sql("SELECT 1")
+        assert minting.minted == 2
+
+
+def test_with_attach_interface() -> None:
+    suffix = uniq_id()
+    root = get_test_storage_root()
+    db_b = os.path.join(root, f"wa_b_{suffix}.duckdb")
+    pipeline_a = dlt.pipeline(
+        "wa_a_" + suffix,
+        destination=duckdb(os.path.join(root, f"wa_a_{suffix}.duckdb")),
+        dataset_name="ds_a",
+    )
+    pipeline_a.run([{"id": 1}], table_name="t")
+    pipeline_b = dlt.pipeline("wa_b_" + suffix, destination=duckdb(db_b), dataset_name="ds_b")
+    pipeline_b.run([{"id": 1}], table_name="t")
+
+    primary = cast(DuckDbSqlClient, pipeline_a.sql_client())
+    foreign = cast(DuckDbSqlClient, pipeline_b.sql_client())
+
+    statements = foreign.attach_statements(alias="attach_ds_b")
+    assert "READ_ONLY" in statements[0]["sql"]
+    assert db_b in statements[0]["sql"]
+
+    # the configuration decides what a connection can attach, not the client
+    primary_config = cast(DuckDbClientConfiguration, pipeline_a.destination_client().config)
+    assert primary_config.attach_type() == "duckdb"
+    assert primary_config.can_attach("duckdb")
+    assert not primary_config.can_attach("postgres")  # type: ignore[arg-type]
+
+    # a catalog override produces a three-part path
+    path = primary.make_qualified_table_name_path(
+        "t", quote=False, casefold=False, dataset_name="ds_b", catalog="attach_ds_b"
+    )
+    assert path == ["attach_ds_b", "ds_b", "t"]
+
+    pool = primary.credentials.conn_pool
+    with primary as client:
+        client.attach("attach_ds_b", statements)
+        assert pool.attached_aliases == {"attach_ds_b"}
+        assert [statement.key for statement in pool._statements] == [statements[0]["key"]]
+        rows = client.execute_sql('SELECT COUNT(*) FROM "attach_ds_b"."ds_b"."t"')
+        assert rows[0][0] == 1
+        # when the client attaches the same statements again, the pool registers and runs
+        # nothing new
+        client.attach("attach_ds_b", statements)
+        assert len(pool._statements) == 1
+        # the client rejects a reserved catalog name
+        with pytest.raises(ValueError):
+            client.attach("memory", foreign.attach_statements(alias="memory"))
+
+    # a load package hands every job client the same resolved credentials, so the clients share
+    # one pool. the pool replays for the other clients the attach statements that one client
+    # registered
+    sibling = DuckDbSqlClient(
+        primary.dataset_name,
+        primary.staging_dataset_name,
+        primary.credentials,
+        primary.capabilities,
+    )
+    assert sibling.credentials.conn_pool is pool
+    with sibling as client:
+        assert client.execute_sql('SELECT COUNT(*) FROM "attach_ds_b"."ds_b"."t"')[0][0] == 1
+
+
+def test_attach_escapes_database_path() -> None:
+    """A quote in the database path must not terminate the string literal in the `ATTACH`
+    statement.
+    """
+    suffix = uniq_id()
+    root = get_test_storage_root()
+    primary_pipeline = dlt.pipeline(
+        "esc_a_" + suffix,
+        destination=duckdb(os.path.join(root, f"esc_a_{suffix}.duckdb")),
+        dataset_name="ds_a",
+    )
+    primary_pipeline.run([{"id": 1}], table_name="t")
+    foreign_pipeline = dlt.pipeline(
+        "esc_b_" + suffix,
+        destination=duckdb(os.path.join(root, f"esc_o'brien_{suffix}.duckdb")),
+        dataset_name="ds_b",
+    )
+    foreign_pipeline.run([{"id": 1}], table_name="t")
+
+    foreign = cast(DuckDbSqlClient, foreign_pipeline.sql_client())
+    (statement,) = foreign.attach_statements(alias="attach_ds_b")
+    assert "''" in statement["sql"]
+
+    primary = cast(DuckDbSqlClient, primary_pipeline.sql_client())
+    with primary as client:
+        client.attach("attach_ds_b", [statement])
+        assert client.execute_sql('SELECT COUNT(*) FROM "attach_ds_b"."ds_b"."t"')[0][0] == 1

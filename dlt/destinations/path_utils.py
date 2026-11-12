@@ -1,0 +1,353 @@
+import re
+import os
+from datetime import datetime, timezone
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from dlt.common import logger
+from dlt.common.normalizers.naming import NamingConvention
+from dlt.common.storages.load_package import ParsedLoadJobFileName
+from dlt.common.time import (
+    DATETIME_PLACEHOLDERS,
+    datetime_to_placeholders,
+    datetime_to_timestamp,
+    datetime_to_timestamp_ms,
+    ensure_datetime_in_tz,
+)
+from dlt.destinations.exceptions import (
+    CantExtractTablePrefix,
+    InvalidFilesystemLayout,
+    InvalidPlaceholderCallback,
+)
+from dlt.destinations.impl.filesystem.typing import TCurrentDateTime
+
+
+STANDARD_PLACEHOLDERS = DATETIME_PLACEHOLDERS.union(
+    {
+        "schema_name",
+        "table_name",
+        "load_id",
+        "file_id",
+        "ext",
+        "curr_date",
+        "timestamp",
+        "timestamp_ms",
+        "load_package_timestamp",
+        "load_package_timestamp_ms",
+    }
+)
+
+
+SUPPORTED_TABLE_NAME_PREFIX_PLACEHOLDERS = ("schema_name",)
+
+TABLE_NAME_PLACEHOLDER = "{table_name}"
+SCHEMA_NAME_PLACEHOLDER = "{schema_name}"
+
+
+def normalize_path_sep(pathlib: Any, path: str) -> str:
+    """Normalizes path in `path` separator to one used by `pathlib`"""
+    if pathlib.sep == "/":
+        return path.replace("\\", "/")
+    if pathlib.sep == "\\":
+        return path.replace("/", "\\")
+    return path
+
+
+def get_placeholders(layout: str) -> List[str]:
+    return re.findall(r"\{(.*?)\}", layout)
+
+
+def get_unused_placeholders(
+    layout_placeholders: Sequence[str],
+    extra_placeholders: Sequence[str],
+) -> Sequence[str]:
+    unused_placeholders = [p for p in extra_placeholders if p not in layout_placeholders]
+    return unused_placeholders
+
+
+def prepare_datetime_params(
+    current_datetime: Optional[datetime] = None,
+    load_package_timestamp: Optional[datetime] = None,
+) -> Dict[str, str]:
+    """Renders the date and time placeholders of the filesystem layout. `current_datetime`
+    defaults to the load package timestamp, then to now. A naive value is UTC."""
+    params: Dict[str, str] = {}
+    current_timestamp: datetime = None
+    if load_package_timestamp:
+        # UTC, never the context timezone: a shift would split one table across two prefixes
+        current_timestamp = ensure_datetime_in_tz(load_package_timestamp, timezone.utc)
+        params["load_package_timestamp"] = str(datetime_to_timestamp(current_timestamp))
+        params["load_package_timestamp_ms"] = str(datetime_to_timestamp_ms(current_timestamp))
+
+    if not current_datetime:
+        if current_timestamp:
+            logger.info("`current_datetime` is not set. dlt uses the load package timestamp.")
+            current_datetime = current_timestamp
+        else:
+            logger.info("`current_datetime` is not set. dlt uses the current time.")
+            current_datetime = datetime.now().astimezone()
+    elif current_datetime.tzinfo is None:
+        # a naive value is UTC, like a naive `current_datetime` string in the config
+        current_datetime = current_datetime.replace(tzinfo=timezone.utc)
+
+    params.update(datetime_to_placeholders(current_datetime))
+
+    return params
+
+
+def prepare_params(
+    extra_placeholders: Optional[Dict[str, Any]] = None,
+    job_info: Optional[ParsedLoadJobFileName] = None,
+    schema_name: Optional[str] = None,
+    load_id: Optional[str] = None,
+    table_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    file_id = None
+    ext = None
+    if job_info:
+        table_name = job_info.table_name
+        file_id = job_info.file_id
+        ext = job_info.full_extension()
+        params.update(
+            {
+                "table_name": table_name,
+                "file_id": file_id,
+                "ext": ext,
+            }
+        )
+    elif table_name:
+        params["table_name"] = table_name
+
+    if schema_name:
+        params["schema_name"] = schema_name
+
+    if load_id:
+        params["load_id"] = load_id
+
+    # Resolve extra placeholders
+    if extra_placeholders:
+        for key, value in extra_placeholders.items():
+            if callable(value):
+                try:
+                    params[key] = value(
+                        schema_name,
+                        table_name,
+                        load_id,
+                        file_id,
+                        ext,
+                    )
+                except TypeError as exc:
+                    raise InvalidPlaceholderCallback(key) from exc
+            else:
+                params[key] = value
+
+    return params
+
+
+def check_layout(
+    layout: str,
+    extra_placeholders: Optional[Dict[str, Any]] = None,
+    standard_placeholders: Optional[Set[str]] = STANDARD_PLACEHOLDERS,
+) -> Tuple[List[str], List[str]]:
+    """Returns a tuple with all valid placeholders and the list of layout placeholders
+
+    Raises: InvalidFilesystemLayout
+
+    Returns: a pair of lists of valid placeholders and layout placeholders
+    """
+    placeholders = get_placeholders(layout)
+    # Build out the list of placeholder names
+    # which we will use to validate placeholders
+    # in a given config.layout template
+    all_placeholders = standard_placeholders.copy()
+    if extra_placeholders:
+        for placeholder, _ in extra_placeholders.items():
+            all_placeholders.add(placeholder)
+
+    # now collect all unknown placeholders from config.layout template
+    invalid_placeholders = [p for p in placeholders if p not in all_placeholders]
+    extra_placeholder_keys = list((extra_placeholders or {}).keys())
+    unused_placeholders = get_unused_placeholders(placeholders, extra_placeholder_keys)
+    if invalid_placeholders:
+        raise InvalidFilesystemLayout(
+            layout,
+            all_placeholders,  # type: ignore[arg-type]
+            extra_placeholder_keys,
+            invalid_placeholders,
+            unused_placeholders,
+        )
+
+    return list(all_placeholders), placeholders
+
+
+def _ensure_ext_in_layout(layout: str, placeholders: Sequence[str]) -> str:
+    """Returns the layout with `{ext}` appended when the layout does not contain it."""
+    if "ext" not in placeholders:
+        return f"{layout}.{{ext}}"
+    return layout
+
+
+def _survives_normalization(naming: NamingConvention, separator: str) -> bool:
+    """Tells if `separator` can occur inside a table name normalized with `naming`."""
+    # nested tables are joined with PATH_SEPARATOR after normalization strips it from identifiers
+    if separator in naming.PATH_SEPARATOR:
+        return True
+    # a separator on its own normalizes to a placeholder, the probe embeds it in an identifier
+    probe = f"a{separator}b"
+    return naming.normalize_table_identifier(probe) == probe
+
+
+def get_unsafe_prefix_separators(prefix: str, naming: NamingConvention) -> List[str]:
+    """Returns separators in a table prefix that `naming` allows inside table names."""
+    unsafe: List[str] = []
+    table_name_index = prefix.index(TABLE_NAME_PLACEHOLDER)
+
+    if SCHEMA_NAME_PLACEHOLDER in prefix[:table_name_index]:
+        schema_name_index = prefix.index(SCHEMA_NAME_PLACEHOLDER)
+        segment = prefix[schema_name_index + len(SCHEMA_NAME_PLACEHOLDER) : table_name_index]
+        if _survives_normalization(naming, segment):
+            unsafe.append(segment)
+
+    # only one character after {table_name} is in the prefix, a longer literal does not separate
+    separator = prefix[table_name_index + len(TABLE_NAME_PLACEHOLDER) :]
+    if separator and _survives_normalization(naming, separator):
+        unsafe.append(separator)
+
+    return list(dict.fromkeys(unsafe))
+
+
+def warn_on_unsafe_prefix_separators(layout: str, prefix: str, naming: NamingConvention) -> None:
+    """Emits a single warning naming the table prefix separators that are unsafe for `naming`."""
+    unsafe = get_unsafe_prefix_separators(prefix, naming)
+    if not unsafe:
+        return
+    _log_unsafe_prefix_separators(layout, ", ".join(repr(sep) for sep in unsafe), naming.name())
+
+
+# dlt creates a job client many times per run, so the cache emits this warning once
+@lru_cache(maxsize=None)
+def _log_unsafe_prefix_separators(layout: str, separators: str, naming_name: str) -> None:
+    logger.warning(
+        f"Layout `{layout}` separates `{{table_name}}` with {separators}, which the"
+        f" `{naming_name}` naming convention also allows inside table names. The prefix of one"
+        " table then selects the files of another, so `replace` and `drop` delete too much."
+        " Under `snake_case` the nested table of `event` is named `event__child`, so the `event_`"
+        " prefix also selects the child files, while `/` and `.` are safe because `snake_case`"
+        " removes them from table names. `duck_case` and `direct` keep `/` and `.` inside table"
+        " names, so under them no separator is safe and table names must not contain the one you"
+        " pick."
+        " To keep this layout, set `warn_unsafe_layout_separators=False` on the destination."
+    )
+
+
+def create_path(
+    layout: str,
+    file_name: str,
+    schema_name: str,
+    load_id: str,
+    load_package_timestamp: Optional[datetime] = None,
+    current_datetime: Optional[TCurrentDateTime] = None,
+    extra_placeholders: Optional[Dict[str, Any]] = None,
+) -> str:
+    """create a filepath from the layout and our default params"""
+    if callable(current_datetime):
+        current_datetime = current_datetime()
+        if not isinstance(current_datetime, datetime):
+            raise RuntimeError(
+                "The `current_datetime` callback did not return a `datetime`. Return a `datetime`."
+            )
+
+    job_info = ParsedLoadJobFileName.parse(file_name)
+    params = prepare_params(
+        extra_placeholders=extra_placeholders,
+        job_info=job_info,
+        schema_name=schema_name,
+        load_id=load_id,
+    )
+
+    datetime_params = prepare_datetime_params(current_datetime, load_package_timestamp)
+    params.update(datetime_params)
+
+    _, placeholders = check_layout(layout, params)
+    layout = _ensure_ext_in_layout(layout, placeholders)
+    path = layout.format(**params)
+
+    return path
+
+
+def get_table_prefix_layout(
+    layout: str,
+    supported_prefix_placeholders: Sequence[str] = SUPPORTED_TABLE_NAME_PREFIX_PLACEHOLDERS,
+    table_needs_own_folder: bool = False,
+    naming: Optional[NamingConvention] = None,
+) -> str:
+    """get layout fragment that defines positions of the table, cutting other placeholders
+    allowed `supported_prefix_placeholders` that may appear before table.
+
+    With `naming`, this also warns when a prefix separator can occur inside a table name.
+    """
+    placeholders = get_placeholders(layout)
+    # fail if table name is not defined
+    if "table_name" not in placeholders:
+        raise CantExtractTablePrefix(layout, "{table_name} placeholder not found. ")
+
+    table_name_index = placeholders.index("table_name")
+
+    # fail if any other prefix is defined before table_name
+    if [p for p in placeholders[:table_name_index] if p not in supported_prefix_placeholders]:
+        if len(supported_prefix_placeholders) == 0:
+            details = (
+                "No other placeholders are allowed before {table_name} but you have %s present. "
+                % placeholders[:table_name_index]
+            )
+        else:
+            details = "Only %s are allowed before {table_name} but you have %s present. " % (
+                supported_prefix_placeholders,
+                placeholders[:table_name_index],
+            )
+        raise CantExtractTablePrefix(layout, details)
+
+    # keep `layout` as written by the user so exceptions and warnings do not quote the {ext} we add
+    ext_layout = _ensure_ext_in_layout(layout, placeholders)
+
+    # we include the char after the table_name here, this should be a separator not a new placeholder
+    # this is to prevent selecting tables that have the same starting name -> {table_name}/
+    table_name_end = ext_layout.index(TABLE_NAME_PLACEHOLDER) + len(TABLE_NAME_PLACEHOLDER)
+    prefix = ext_layout[: table_name_end + 1]
+    if prefix[-1] == "{":
+        raise CantExtractTablePrefix(layout, "A separator is required after a {table_name}. ")
+    if prefix[-1] != "/" and table_needs_own_folder:
+        raise CantExtractTablePrefix(
+            layout, "Table requires it's own folder, please add a '/' after your {table_name}. "
+        )
+    # engines that read a folder as a table skip files that start with '.' or '_', so a layout
+    # that leaves dlt to name the file `.{ext}` creates a table that reads as empty
+    if table_needs_own_folder and ext_layout.rsplit("/", 1)[-1].startswith((".", "_")):
+        raise CantExtractTablePrefix(
+            layout, "A file name is required after the '/', for example {file_id}. "
+        )
+
+    if naming:
+        warn_on_unsafe_prefix_separators(layout, prefix, naming)
+
+    return prefix
+
+
+def get_file_format_and_compression(file_path: str) -> Tuple[str, bool]:
+    """Return file format and whether an explicit .gz compression extension is present.
+    Primarily used in cases that ParsedLoadJobFileName.parse() can't handle, that is,
+    staging storage files that have a configurabe layout."""
+    root, ext = os.path.splitext(file_path)
+
+    file_format: str = None
+    compression_ext: bool = False
+
+    if ext == ".gz":
+        compression_ext = True
+        _, ext = os.path.splitext(root)
+        file_format = ext[1:]  # remove the dot
+    else:
+        file_format = ext[1:]  # remove the dot
+
+    return file_format, compression_ext

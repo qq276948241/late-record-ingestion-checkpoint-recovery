@@ -1,0 +1,746 @@
+from typing import Dict, List, Optional, Type, Union
+import posixpath
+import os
+import json
+from unittest import mock
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import urlparse
+
+import pytest
+
+from dlt.common.configuration.specs.base_configuration import (
+    CredentialsConfiguration,
+    extract_inner_hint,
+)
+from dlt.common.destination.exceptions import DestinationUndefinedEntity, TableFormatNotSupported
+from dlt.common.destination.typing import PreparedTableSchema
+from dlt.common.known_env import DLT_LOCAL_DIR
+from dlt.common.schema.schema import Schema
+from dlt.common.storages.configuration import FilesystemConfiguration
+from dlt.common.time import ensure_pendulum_datetime
+from dlt.common.utils import custom_environ, digest128, uniq_id
+from dlt.common.storages import FileStorage, ParsedLoadJobFileName
+from dlt.common.storages.exceptions import UnsupportedStorageVersionException
+
+import dlt.destinations.path_utils
+from dlt.destinations import filesystem
+from dlt.destinations.impl.filesystem.configuration import (
+    HfFilesystemDestinationClientConfiguration,
+)
+from dlt.destinations.impl.filesystem.filesystem import (
+    FilesystemClient,
+    FilesystemDestinationClientConfiguration,
+    INIT_FILE_NAME,
+    CURRENT_VERSION,
+    SUPPORTED_VERSIONS,
+)
+
+from dlt.destinations.path_utils import create_path, prepare_datetime_params
+from tests.load.filesystem.utils import perform_load, setup_loader
+from tests.utils import get_test_storage_root, clean_test_storage, init_test_logging
+from tests.load.utils import (
+    TEST_FILE_LAYOUTS,
+    FILE_LAYOUT_TABLE_FOLDER_ONLY,
+    FILE_LAYOUT_TABLE_NAME_ONLY,
+)
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.fixture(autouse=True)
+def storage() -> FileStorage:
+    return clean_test_storage(init_normalize=True, init_loader=True)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def logger_autouse() -> None:
+    init_test_logging()
+
+
+NORMALIZED_FILES = [
+    "event_user.839c6e6b514e427687586ccc65bf133f.0.jsonl",
+    "event_loop_interrupted.839c6e6b514e427687586ccc65bf133f.0.jsonl",
+]
+
+
+def _client_factory(fs: filesystem, dataset_name: str = "test") -> FilesystemClient:
+    config_class = (
+        HfFilesystemDestinationClientConfiguration
+        if fs.is_hf
+        else FilesystemDestinationClientConfiguration
+    )
+    client = fs.client(
+        Schema("test"),
+        initial_config=config_class()._bind_dataset_name(dataset_name),
+    )
+    return client
+
+
+@pytest.mark.parametrize(
+    "bucket_url,expected_fingerprint",
+    [
+        pytest.param(None, "", id="empty"),
+        pytest.param("/path/path2", digest128("file://"), id="local_absolute_path"),
+        pytest.param("lake", digest128("file://"), id="local_relative_path"),
+        pytest.param("file:///home/ducklake.d", digest128("file://"), id="file_scheme"),
+        pytest.param("FILE:///home/ducklake.d", digest128("file://"), id="file_scheme_upper"),
+        pytest.param("file://server/share/lake", digest128("file://server"), id="file_scheme_host"),
+        pytest.param("s3://cool", digest128("s3://cool"), id="remote_bucket"),
+        pytest.param(
+            "s3://cool.domain/path/path2",
+            digest128("s3://cool.domain"),
+            id="remote_bucket_path_ignored",
+        ),
+        pytest.param("s3://cool/", digest128("s3://cool"), id="remote_bucket_trailing_slash"),
+        pytest.param("s3://data/data", digest128("s3://data"), id="path_repeats_bucket_name"),
+        pytest.param(
+            "s3://data-lake/data", digest128("s3://data-lake"), id="path_inside_bucket_name"
+        ),
+        pytest.param("S3://Cool/path", digest128("s3://Cool"), id="scheme_lowercased"),
+        pytest.param("memory:///tmp/path", digest128("memory://"), id="empty_netloc"),
+        pytest.param("https://host/path?token=abc", digest128("https://host"), id="query_ignored"),
+        pytest.param(
+            "sftp://user:pass@host:22/data", digest128("sftp://user@host:22"), id="password_dropped"
+        ),
+        pytest.param(
+            "abfss://container@account.dfs.core.windows.net/path",
+            digest128("abfss://container@account.dfs.core.windows.net"),
+            id="username_kept",
+        ),
+    ],
+)
+def test_filesystem_fingerprint(bucket_url: Optional[str], expected_fingerprint: str) -> None:
+    config = FilesystemDestinationClientConfiguration(bucket_url=bucket_url)
+
+    assert config.fingerprint() == expected_fingerprint
+
+
+@pytest.mark.parametrize(
+    "bucket_url,expected_fingerprint",
+    [
+        pytest.param(None, "", id="empty"),
+        pytest.param("hf://datasets/org-a", digest128("hf://datasets/org-a"), id="namespace"),
+        pytest.param("hf://datasets/org-b", digest128("hf://datasets/org-b"), id="other_namespace"),
+    ],
+)
+def test_hf_filesystem_fingerprint(bucket_url: Optional[str], expected_fingerprint: str) -> None:
+    config = HfFilesystemDestinationClientConfiguration(bucket_url=bucket_url)
+
+    assert config.fingerprint() == expected_fingerprint
+
+
+def test_filesystem_factory_buckets(with_gdrive_buckets_env: str) -> None:
+    proto = urlparse(with_gdrive_buckets_env).scheme
+    credentials_type = extract_inner_hint(
+        FilesystemConfiguration.PROTOCOL_CREDENTIALS.get(proto, CredentialsConfiguration)
+    )
+
+    # test factory figuring out the right credentials
+    filesystem_ = filesystem(with_gdrive_buckets_env)
+    client = _client_factory(filesystem_)
+    assert client.config.protocol == proto or "file"
+    assert isinstance(client.config.credentials, credentials_type)
+    assert issubclass(client.config.credentials_type(client.config), credentials_type)
+    assert filesystem_.capabilities()
+
+    # factory gets initial credentials
+    filesystem_ = filesystem(with_gdrive_buckets_env, credentials=credentials_type())
+    client = _client_factory(filesystem_)
+    assert isinstance(client.config.credentials, credentials_type)
+
+
+@pytest.mark.parametrize("location", ("lake", "file:lake"))
+def test_filesystem_follows_local_dir(location: str) -> None:
+    local_dir = os.path.join(get_test_storage_root(), uniq_id())
+    os.makedirs(local_dir)
+    # mock tmp dir
+    os.environ[DLT_LOCAL_DIR] = local_dir
+    filesystem_ = filesystem(location)
+    c = FilesystemDestinationClientConfiguration()._bind_dataset_name(dataset_name="test_dataset")
+    client = filesystem_.client(
+        Schema("test"),
+        initial_config=c,
+    )
+    # tmp dir is relative
+    lake_rel_dir = os.path.join(local_dir, "lake")
+    assert client.bucket_path.endswith(lake_rel_dir)
+    assert client.bucket_path == os.path.abspath(lake_rel_dir)
+
+
+@pytest.mark.parametrize(
+    "layout", ("{table_name}/{load_id}.{file_id}.{ext}", "{table_name}.{load_id}.{file_id}.{ext}")
+)
+def test_trailing_separators(layout: str, with_gdrive_buckets_env: str) -> None:
+    os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = layout
+    load = setup_loader("_data")
+    client: FilesystemClient = load.get_destination_client(Schema("empty"))  # type: ignore[assignment]
+    # assert separators
+    assert client.dataset_path.endswith("_data/")
+    assert client.get_table_dir("_dlt_versions").endswith("_dlt_versions/")
+    assert client.get_table_dir("_dlt_versions", remote=True).endswith("_dlt_versions/")
+    is_folder = layout.startswith("{table_name}/")
+    if is_folder:
+        assert client.get_table_dir("letters").endswith("_data/letters/")
+        assert client.get_table_dir("letters", remote=True).endswith("_data/letters/")
+    else:
+        # strip prefix
+        assert client.get_table_dir("letters").endswith("_data/")
+        assert client.get_table_dir("letters", remote=True).endswith("_data/")
+    if is_folder:
+        assert client.get_table_prefix("letters").endswith("_data/letters/")
+    else:
+        assert client.get_table_prefix("letters").endswith("_data/letters.")
+
+
+def test_table_prefix_resolves_standard_extra_placeholders() -> None:
+    def unused_load_id(*args: str) -> str:
+        raise AssertionError("placeholder outside table prefix must not be resolved")
+
+    client = _client_factory(
+        filesystem(
+            bucket_url=get_test_storage_root(),
+            layout="{schema_name}/{table_name}/{load_id}.{file_id}.{ext}",
+            extra_placeholders={
+                "schema_name": "custom",
+                "table_name": "custom_table",
+                "load_id": unused_load_id,
+            },
+        )
+    )
+
+    assert client.get_table_prefix("letters").endswith("/custom/custom_table/")
+
+    def custom_schema_name(
+        schema_name: str,
+        table_name: str,
+        load_id: str,
+        file_id: str,
+        ext: str,
+    ) -> str:
+        assert (schema_name, table_name, load_id, file_id, ext) == (
+            "test",
+            "letters",
+            None,
+            None,
+            None,
+        )
+        return "custom_callable"
+
+    def custom_table_name(
+        schema_name: str,
+        table_name: str,
+        load_id: str,
+        file_id: str,
+        ext: str,
+    ) -> str:
+        assert (schema_name, table_name, load_id, file_id, ext) == (
+            "test",
+            "letters",
+            None,
+            None,
+            None,
+        )
+        return "custom_table_callable"
+
+    client.config.extra_placeholders["schema_name"] = custom_schema_name
+    client.config.extra_placeholders["table_name"] = custom_table_name
+    assert client.get_table_prefix("letters").endswith("/custom_callable/custom_table_callable/")
+
+
+@pytest.mark.parametrize("write_disposition", ("replace", "append", "merge"))
+@pytest.mark.parametrize("layout", TEST_FILE_LAYOUTS)
+def test_successful_load(write_disposition: str, layout: str, default_buckets_env: str) -> None:
+    """Test load is successful with an empty destination dataset
+    Note: removed gdrive because it is slow
+    """
+    if default_buckets_env.startswith("hf://"):
+        pytest.skip("`perform_load` util does not handle `hf` protocol properly")
+
+    if layout:
+        os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = layout
+    else:
+        os.environ.pop("DESTINATION__FILESYSTEM__LAYOUT", None)
+
+    dataset_name = "test_" + uniq_id()
+    timestamp = ensure_pendulum_datetime("2024-04-05T09:16:59.942779Z")
+    mocked_timestamp = {"state": {"created_at": timestamp}}
+    with (
+        mock.patch(
+            "dlt.current.load_package_state",
+            return_value=mocked_timestamp,
+        ),
+        perform_load(
+            dataset_name,
+            NORMALIZED_FILES,
+            write_disposition=write_disposition,
+        ) as load_info,
+    ):
+        client, jobs, _, load_id = load_info
+        # dlt appends `.{ext}` to a layout that does not declare it
+        layout = client.config.layout
+        if "{ext}" not in layout:
+            layout += ".{ext}"
+        dataset_path = posixpath.join(client.bucket_path, client.config.dataset_name)
+
+        # Assert dataset dir exists
+        assert client.fs_client.isdir(dataset_path)
+
+        # Sanity check, there are jobs
+        assert jobs
+        for job in jobs:
+            assert job.state() == "completed"
+            job_info = ParsedLoadJobFileName.parse(job.file_name())
+            destination_path = posixpath.join(
+                dataset_path,
+                layout.format(
+                    schema_name=client.schema.name,
+                    table_name=job_info.table_name,
+                    load_id=load_id,
+                    file_id=job_info.file_id,
+                    ext=job_info.file_format,
+                    **prepare_datetime_params(load_package_timestamp=timestamp),
+                ),
+            )
+
+            # File is created with correct filename and path
+            assert client.fs_client.isfile(destination_path)
+
+
+@pytest.mark.parametrize("layout", TEST_FILE_LAYOUTS)
+def test_replace_write_disposition(layout: str, default_buckets_env: str) -> None:
+    if default_buckets_env.startswith("hf://"):
+        pytest.skip("`perform_load` util does not handle `hf` protocol properly")
+
+    if layout:
+        os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = layout
+    else:
+        os.environ.pop("DESTINATION__FILESYSTEM__LAYOUT", None)
+
+    dataset_name = "test_" + uniq_id()
+    # NOTE: context manager will delete the dataset at the end so keep it open until the end
+    # state is typed now
+    timestamp = ensure_pendulum_datetime("2024-04-05T09:16:59.942779Z")
+    mocked_timestamp = {"state": {"created_at": timestamp}}
+    with (
+        mock.patch(
+            "dlt.current.load_package_state",
+            return_value=mocked_timestamp,
+        ),
+        perform_load(
+            dataset_name,
+            NORMALIZED_FILES,
+            write_disposition="replace",
+        ) as load_info,
+    ):
+        client, _, root_path, load_id1 = load_info
+        layout = client.config.layout
+        # this path will be kept after replace
+        job_2_load_1_path = Path(
+            posixpath.join(
+                root_path,
+                create_path(
+                    layout,
+                    NORMALIZED_FILES[1],
+                    client.schema.name,
+                    load_id1,
+                    load_package_timestamp=timestamp,
+                    extra_placeholders=client.config.extra_placeholders,
+                ),
+            )
+        )
+
+        with perform_load(
+            dataset_name, [NORMALIZED_FILES[0]], write_disposition="replace"
+        ) as load_info:
+            client, _, root_path, load_id2 = load_info
+
+            # this one we expect to be replaced with
+            job_1_load_2_path = Path(
+                posixpath.join(
+                    root_path,
+                    create_path(
+                        layout,
+                        NORMALIZED_FILES[0],
+                        client.schema.name,
+                        load_id2,
+                        load_package_timestamp=timestamp,
+                        extra_placeholders=client.config.extra_placeholders,
+                    ),
+                )
+            )
+
+            # First file from load1 remains, second file is replaced by load2
+            # assert that only these two files are in the destination folder
+            is_sftp = urlparse(default_buckets_env).scheme == "sftp"
+            paths = []
+            for basedir, _dirs, files in client.fs_client.walk(
+                client.dataset_path, detail=False, **({"refresh": True} if not is_sftp else {})
+            ):
+                # remove internal paths
+                if "_dlt" in basedir:
+                    continue
+                for f in files:
+                    if f == INIT_FILE_NAME:
+                        continue
+                    paths.append(Path(posixpath.join(basedir, f)))
+
+            ls = set(paths)
+            assert ls == {job_2_load_1_path, job_1_load_2_path}
+
+
+def test_replace_does_not_truncate_sibling_tables() -> None:
+    """Regression for #4265: with layout `{table_name}`, truncating `event` must not
+    delete files of the sibling table `events`."""
+    os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = "{table_name}"
+    client = _client_factory(filesystem("random_location"))
+    client.initialize_storage()
+    event_file = client.pathlib.join(client.dataset_path, "event.jsonl")
+    events_file = client.pathlib.join(client.dataset_path, "events.jsonl")
+    client.fs_client.touch(event_file)
+    client.fs_client.touch(events_file)
+
+    client.truncate_tables(["event"])
+
+    assert not client.fs_client.isfile(event_file)
+    assert client.fs_client.isfile(events_file)
+
+
+def test_truncate_tables_deletes_many_files(default_buckets_env: str) -> None:
+    """Deletes more files than there are workers on every bucket. Sibling table files stay."""
+    if default_buckets_env.startswith("hf://"):
+        pytest.skip("hf creates a commit per file. test_hf_truncate_tables covers truncation")
+    client = _client_factory(filesystem(), dataset_name="test_" + uniq_id())
+    client.initialize_storage()
+    try:
+        event_dir, events_dir = client.get_table_dir("event"), client.get_table_dir("events")
+        client.fs_client.makedirs(event_dir, exist_ok=True)
+        client.fs_client.makedirs(events_dir, exist_ok=True)
+        event_files = [client.pathlib.join(event_dir, f"{i}.jsonl") for i in range(100)]
+        events_files = [client.pathlib.join(events_dir, f"{i}.jsonl") for i in range(3)]
+        client.fs_client.pipe({file: b"{}" for file in event_files + events_files})
+        assert len(client.list_table_files("event")) == 100
+
+        client.truncate_tables(["event"])
+
+        # the table folder vanishes on buckets without real directories
+        try:
+            remaining = client.list_table_files("event")
+        except DestinationUndefinedEntity:
+            remaining = []
+        assert remaining == []
+        assert len(client.list_table_files("events")) == 3
+    finally:
+        client.drop_dataset()
+    assert not client.fs_client.exists(client.dataset_path)
+
+
+@pytest.mark.parametrize("max_delete_workers", ("1", "4"), ids=("sequential", "pool"))
+def test_truncate_tables_raises_on_delete_error(max_delete_workers: str) -> None:
+    os.environ["DESTINATION__FILESYSTEM__MAX_DELETE_WORKERS"] = max_delete_workers
+    client = _client_factory(filesystem("random_location"))
+    assert client.config.max_delete_workers == int(max_delete_workers)
+    client.initialize_storage()
+    event_dir = client.get_table_dir("event")
+    client.fs_client.makedirs(event_dir, exist_ok=True)
+    client.fs_client.pipe({client.pathlib.join(event_dir, f"{i}.jsonl"): b"{}" for i in range(3)})
+
+    with mock.patch.object(client.fs_client, "rm_file", side_effect=PermissionError("denied")):
+        with pytest.raises(PermissionError):
+            client.truncate_tables(["event"])
+
+
+def test_unsafe_layout_separator_warning(mocker) -> None:
+    """`_` can occur in a table name so the `event` prefix also selects `event__child` files."""
+    os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = "{table_name}_{load_id}.{file_id}.{ext}"
+    logger_mock = mocker.patch("dlt.destinations.path_utils.logger")
+    # the warning is emitted once per layout and naming convention, process-wide
+    dlt.destinations.path_utils._log_unsafe_prefix_separators.cache_clear()
+
+    # dlt creates a job client many times per run but warns the user once
+    _client_factory(filesystem("random_location"))
+    _client_factory(filesystem("random_location"))
+    logger_mock.warning.assert_called_once()
+    assert "'_'" in logger_mock.warning.call_args[0][0]
+
+    logger_mock.reset_mock()
+    _client_factory(filesystem("random_location", warn_unsafe_layout_separators=False))
+    logger_mock.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", TEST_FILE_LAYOUTS)
+def test_append_write_disposition(layout: str, default_buckets_env: str) -> None:
+    """Run load twice with append write_disposition and assert that there are two copies of each file in destination"""
+    if default_buckets_env.startswith("hf://"):
+        pytest.skip("`perform_load` util does not handle `hf` protocol properly")
+    if layout in (FILE_LAYOUT_TABLE_NAME_ONLY, FILE_LAYOUT_TABLE_FOLDER_ONLY):
+        # without {load_id} and {file_id} every load writes the same path so it cannot keep two copies
+        pytest.skip(f"layout {layout} cannot append, each load overwrites the previous one")
+
+    if layout:
+        os.environ["DESTINATION__FILESYSTEM__LAYOUT"] = layout
+    else:
+        os.environ.pop("DESTINATION__FILESYSTEM__LAYOUT", None)
+    dataset_name = "test_" + uniq_id()
+    # NOTE: context manager will delete the dataset at the end so keep it open until the end
+    # also we would like to have reliable timestamp for this test so we patch it
+    timestamp = ensure_pendulum_datetime("2024-04-05T09:16:59.942779Z")
+    mocked_timestamp = {"state": {"created_at": timestamp}}
+    with (
+        mock.patch(
+            "dlt.current.load_package_state",
+            return_value=mocked_timestamp,
+        ),
+        perform_load(
+            dataset_name,
+            NORMALIZED_FILES,
+            write_disposition="append",
+        ) as load_info,
+    ):
+        client, jobs1, root_path, load_id1 = load_info
+        with perform_load(dataset_name, NORMALIZED_FILES, write_disposition="append") as load_info:
+            client, jobs2, root_path, load_id2 = load_info
+            layout = client.config.layout
+            expected_files = [
+                create_path(
+                    layout,
+                    job.file_name(),
+                    client.schema.name,
+                    load_id1,
+                    load_package_timestamp=timestamp,
+                    extra_placeholders=client.config.extra_placeholders,
+                )
+                for job in jobs1
+            ] + [
+                create_path(
+                    layout,
+                    job.file_name(),
+                    client.schema.name,
+                    load_id2,
+                    load_package_timestamp=timestamp,
+                    extra_placeholders=client.config.extra_placeholders,
+                )
+                for job in jobs2
+            ]
+            expected_files = sorted([Path(posixpath.join(root_path, fn)) for fn in expected_files])  # type: ignore[misc]
+
+            is_sftp = urlparse(default_buckets_env).scheme == "sftp"
+            paths = []
+            for basedir, _dirs, files in client.fs_client.walk(
+                client.dataset_path, detail=False, **({"refresh": True} if not is_sftp else {})
+            ):
+                # remove internal paths
+                if "_dlt" in basedir:
+                    continue
+                for f in files:
+                    if f == INIT_FILE_NAME:
+                        continue
+                    paths.append(Path(posixpath.join(basedir, f)))
+            assert list(sorted(paths)) == expected_files
+
+
+def test_get_storage_version_current() -> None:
+    filesystem_ = filesystem("random_location")
+    client = _client_factory(filesystem_)
+    # If storage is initialized with current code, then initial and current versions must always up to date
+    client.initialize_storage()
+    initial_version, current_version = client.get_storage_versions()
+    assert initial_version == CURRENT_VERSION
+    assert current_version == CURRENT_VERSION
+
+
+@pytest.mark.parametrize(
+    "version_info",
+    [
+        "",  # legacy empty content
+        {"initial_version": 1, "current_version": 1},
+        {"initial_version": 1, "current_version": 2},
+        {"initial_version": 2, "current_version": 2},
+    ],
+)
+def test_get_storage_version_valid(version_info: Union[str, Dict[str, int]]) -> None:
+    filesystem_ = filesystem("random_location")
+    client = _client_factory(filesystem_)
+    init_file = client.pathlib.join(client.dataset_path, INIT_FILE_NAME)
+    client.fs_client.mkdirs(client.dataset_path)
+    client.fs_client.touch(init_file)
+    client.fs_client.write_text(
+        init_file,
+        json.dumps(version_info) if isinstance(version_info, Dict) else version_info,
+        encoding="utf-8",
+    )
+
+    initial_version, current_version = client.get_storage_versions()
+
+    if version_info == "":
+        assert initial_version == 1
+        assert current_version == 1
+    else:
+        assert isinstance(version_info, Dict)
+        assert initial_version == version_info["initial_version"]
+        assert current_version == version_info["current_version"]
+
+
+@pytest.mark.parametrize(
+    "invalid_version_info,expected_exception,match",
+    [
+        # not json at all
+        ("random", ValueError, "Invalid content"),
+        # valid json, but not an object so the version keys cannot be looked up
+        ("5", ValueError, "Invalid content"),
+        ('"2"', ValueError, "Invalid content"),
+        ("[1, 2]", ValueError, "Invalid content"),
+        ("null", ValueError, "Invalid content"),
+        # object with an unexpected or a missing key
+        ({"unexpected": 2, "current_version": 2}, ValueError, "Invalid content"),
+        ({"initial_version": 1}, ValueError, "Invalid content"),
+        ({"current_version": 2}, ValueError, "Invalid content"),
+        # both keys present but the version is not supported
+        (
+            {
+                "initial_version": min(SUPPORTED_VERSIONS),
+                "current_version": max(SUPPORTED_VERSIONS) + 1,
+            },
+            UnsupportedStorageVersionException,
+            "Expected storage",
+        ),
+    ],
+)
+def test_get_storage_version_invalid(
+    invalid_version_info: Union[str, Dict[str, int]],
+    expected_exception: Type[Exception],
+    match: str,
+) -> None:
+    filesystem_ = filesystem("random_location")
+    client = _client_factory(filesystem_)
+    init_file = client.pathlib.join(client.dataset_path, INIT_FILE_NAME)
+    client.fs_client.mkdirs(client.dataset_path)
+    client.fs_client.touch(init_file)
+    client.fs_client.write_text(
+        init_file,
+        (
+            json.dumps(invalid_version_info)
+            if isinstance(invalid_version_info, Dict)
+            else invalid_version_info
+        ),
+        encoding="utf-8",
+    )
+
+    # match pins the curated message: a decode error leaking from the json backend must fail here
+    with pytest.raises(expected_exception, match=match):
+        client.get_storage_versions()
+
+
+@pytest.mark.parametrize(
+    "pipeline_name",
+    [
+        "my__pipeline",
+        "my_pipeline__long_name__with__underscores",
+        "__",
+        "____",
+        "__long_name__with__underscores__",
+    ],
+)
+def test_list_dlt_table_files_with_separator_in_pipeline_name(pipeline_name: str) -> None:
+    filesystem_ = filesystem("random_location")
+    client = _client_factory(filesystem_)
+    client.initialize_storage()
+
+    state_table_dir = client.get_table_dir(client.schema.state_table_name)
+    client.fs_client.mkdirs(state_table_dir)
+    test_file = client.pathlib.join(state_table_dir, f"{pipeline_name}__load123__hash123.jsonl")
+    client.fs_client.touch(test_file)
+
+    results = list(client._list_dlt_table_files(client.schema.state_table_name))
+    assert len(results) == 1
+    assert results[0][0] == test_file
+    assert results[0][1] == [pipeline_name, "load123", "hash123"]
+
+
+def test_verify_schema_table_format(with_gdrive_buckets_env: str) -> None:
+    filesystem_ = filesystem(with_gdrive_buckets_env)
+    client = _client_factory(filesystem_)
+    table_kwargs = {
+        "columns": {"c1": {"name": "c1", "data_type": "text"}},
+        "write_disposition": "append",
+    }
+    tables: List[PreparedTableSchema] = [
+        {"name": "delta_table", "table_format": "delta", **table_kwargs},  # type: ignore[typeddict-item]
+        {"name": "iceberg_table", "table_format": "iceberg", **table_kwargs},  # type: ignore[typeddict-item]
+        {"name": "other_table", **table_kwargs},  # type: ignore[typeddict-item]
+    ]
+
+    # test verify_schema_table_format
+    exceptions = client.verify_schema_table_format(tables)
+    if client.config.protocol == "hf":
+        assert len(exceptions) == 2
+        assert isinstance(exceptions[0], TableFormatNotSupported)
+    else:
+        assert len(exceptions) == 0
+
+    # test verify_schema
+    client.schema.update_table(tables[0])
+    if client.config.protocol == "hf":
+        with pytest.raises(TableFormatNotSupported):
+            client.verify_schema(["delta_table"])
+    else:
+        client.verify_schema(["delta_table"])
+
+
+def test_hf_endpoint_env(default_buckets_env: str) -> None:
+    if not default_buckets_env.startswith("hf://"):
+        pytest.skip("only runs on hf:// protocol")
+
+    from dlt.destinations.impl.filesystem.filesystem import HfFilesystemClient
+
+    filesystem_ = filesystem(default_buckets_env)
+    client = _client_factory(filesystem_)
+    assert isinstance(client, HfFilesystemClient)
+
+    CREDS_ENDPOINT = "https://credentials-endpoint.com"
+    ENV_VAR_ENDPOINT = "https://env-var-endpoint.com"
+
+    # sanity check
+    assert client.config.credentials.hf_endpoint is None
+    assert os.environ.get("HF_ENDPOINT") is None
+
+    # case 1: no endpoint in credentials, HF_ENDPOINT not set
+    with client._hf_endpoint_env():
+        assert os.environ.get("HF_ENDPOINT") is None
+
+    # case 2: no endpoint in credentials, HF_ENDPOINT set
+    with custom_environ({"HF_ENDPOINT": ENV_VAR_ENDPOINT}):
+        with client._hf_endpoint_env():
+            assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT  # env var endpoint retained
+        assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT
+
+    # now set endpoint in credentials
+    client.config.credentials.hf_endpoint = CREDS_ENDPOINT
+    assert os.environ.get("HF_ENDPOINT") is None
+
+    # case 3: endpoint in credentials, HF_ENDPOINT not set
+    with client._hf_endpoint_env():
+        assert os.environ.get("HF_ENDPOINT") == CREDS_ENDPOINT  # creds endpoint set in env
+    assert os.environ.get("HF_ENDPOINT") is None  # env var endpoint restored
+
+    # case 4: endpoint in credentials, HF_ENDPOINT set
+    with custom_environ({"HF_ENDPOINT": ENV_VAR_ENDPOINT}):
+        with client._hf_endpoint_env():
+            assert (
+                os.environ.get("HF_ENDPOINT") == CREDS_ENDPOINT
+            )  # creds endpoint takes precedence
+        assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT  # env var endpoint restored
+
+    # now test that Hugging Face methods without endpoint argument are wrapped with `_hf_endpoint_env`
+
+    assert client.config.credentials.hf_endpoint == CREDS_ENDPOINT  # sanity check
+
+    def assert_hf_endpoint_set(*args, **kwargs):
+        assert os.environ["HF_ENDPOINT"] == CREDS_ENDPOINT
+
+    with patch("huggingface_hub.DatasetCard.push_to_hub", side_effect=assert_hf_endpoint_set):
+        client.init_dataset_card()
+
+    with patch("huggingface_hub.metadata_update", side_effect=assert_hf_endpoint_set):
+        client.update_dataset_card_metadata(load_id="test")

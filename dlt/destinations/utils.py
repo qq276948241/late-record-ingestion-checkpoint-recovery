@@ -1,0 +1,463 @@
+import re
+
+from typing import Any, List, Dict, Type, Optional, Sequence, Tuple, cast
+
+from dlt.common import logger
+from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+from dlt.common.destination.exceptions import WriteDispositionNotSupported
+from dlt.common.destination.typing import PreparedTableSchema
+from dlt.common.destination.utils import resolve_merge_strategy, resolve_replace_strategy
+from dlt.common.schema import Schema
+from dlt.common.schema.exceptions import SchemaCorruptedException
+from dlt.common.schema.typing import (
+    MERGE_STRATEGIES,
+    MERGE_STRATEGY_OPTIONS,
+    MERGE_DISPOSITION_HINTS,
+    TColumnType,
+    TLoaderReplaceStrategy,
+    TTableSchema,
+)
+from dlt.common.schema.utils import (
+    get_columns_names_with_prop,
+    get_first_column_name_with_prop,
+    get_root_table,
+    has_column_with_prop,
+    is_nested_table,
+    pipeline_state_table,
+)
+from dlt.common.destination.utils import (
+    MERGE_CONDITION_PLACEHOLDERS,
+    MERGE_CONDITION_VALUE_PLACEHOLDERS,
+    get_merge_placeholder_values,
+    validate_merge_condition,
+)
+
+from dlt.destinations.exceptions import DatabaseTransientException
+from dlt.extract import DltResource, resource as make_resource, DltSource
+
+RE_DATA_TYPE = re.compile(r"([A-Z]+)\((\d+)(?:,\s?(\d+))?\)")
+
+
+def get_resource_for_adapter(data: Any) -> DltResource:
+    """
+    Helper function for adapters. Wraps `data` in a DltResource if it's not a DltResource already.
+    Alternatively if `data` is a DltSource, throws an error if there are multiple resource in the source
+    or returns the single resource if available.
+    """
+    if isinstance(data, DltResource):
+        return data
+    # prevent accidentally wrapping sources with adapters
+    if isinstance(data, DltSource):
+        if len(data.selected_resources.keys()) == 1:
+            return list(data.selected_resources.values())[0]
+        else:
+            raise ValueError(
+                "You are trying to use an adapter on a `DltSource` with multiple resources. You can"
+                " only use adapters on: pure data, a `DltResouce` or a `DltSource` with a single"
+                " `DltResource`."
+            )
+
+    resource_name = None
+    if not hasattr(data, "__name__"):
+        logger.info("Setting default resource name to `content` for adapted resource.")
+        resource_name = "content"
+
+    return cast(DltResource, make_resource(data, name=resource_name))
+
+
+def info_schema_null_to_bool(v: str) -> bool:
+    """Converts INFORMATION SCHEMA truth values to Python bool"""
+    if v in ("NO", "0"):
+        return False
+    elif v in ("YES", "1"):
+        return True
+    raise ValueError(v)
+
+
+def parse_db_data_type_str_with_precision(db_type: str) -> Tuple[str, Optional[int], Optional[int]]:
+    """Parses a db data type with optional precision or precision and scale information"""
+    # Search for matches using the regular expression
+    match = RE_DATA_TYPE.match(db_type)
+
+    # If the pattern matches, extract the type, precision, and scale
+    if match:
+        db_type = match.group(1)
+        precision = int(match.group(2))
+        scale = int(match.group(3)) if match.group(3) else None
+        return db_type, precision, scale
+
+    # If the pattern does not match, return the original type without precision and scale
+    return db_type, None, None
+
+
+def get_pipeline_state_query_columns() -> TTableSchema:
+    """We get definition of pipeline state table without columns we do not need for the query"""
+    state_table = pipeline_state_table()
+    # we do not need version_hash to be backward compatible as long as we can
+    state_table["columns"].pop("version_hash")
+    return state_table
+
+
+def verify_schema_replace_disposition(
+    schema: Schema,
+    load_tables: Sequence[PreparedTableSchema],
+    capabilities: DestinationCapabilitiesContext,
+    required_strategy: TLoaderReplaceStrategy,
+    warnings: bool = True,
+) -> List[Exception]:
+    # log = logger.warning if warnings else logger.info
+    # collect all exceptions to show all problems in the schema
+    exception_log: List[Exception] = []
+
+    # verifies schema settings specific to sql job client
+    for table in load_tables:
+        # from now on validate only top level tables
+        if is_nested_table(table):
+            continue
+        table_name = table["name"]
+        if table["write_disposition"] == "replace":
+            if not resolve_replace_strategy(table, required_strategy, capabilities):
+                format_info = ""
+                if capabilities.supported_table_formats:
+                    format_info = (
+                        " Note that setting table format may allow you to pick other replace"
+                        " strategies. Available formats:"
+                        f" {', '.join(capabilities.supported_table_formats)}"
+                    )
+                exception_log.append(
+                    # Pick one of: {', '.join(supported_replace_strategies)} .
+                    SchemaCorruptedException(
+                        schema.name,
+                        f"Requested replace strategy {required_strategy} not available for table"
+                        f" {table_name}. "
+                        + format_info,
+                    )
+                )
+    return exception_log
+
+
+def _get_merge_options(table: PreparedTableSchema) -> Dict[str, Any]:
+    """Returns the merge disposition keys that `table` stores as hints, by key name."""
+    options: Dict[str, Any] = {
+        key: table.get(hint) for key, hint in MERGE_DISPOSITION_HINTS.items()
+    }
+    options["row_version_column_name"] = get_first_column_name_with_prop(table, "x-row-version")
+    return options
+
+
+def verify_unsupported_merge_options(
+    schema: Schema,
+    load_tables: Sequence[PreparedTableSchema],
+    capabilities: DestinationCapabilitiesContext,
+    target: str,
+    options: Sequence[str],
+) -> List[Exception]:
+    """Returns an exception for each merge table in `load_tables` that sets one of the merge
+    `options` that `target` (a destination type or table format) cannot apply."""
+    exception_log: List[Exception] = []
+    for table in load_tables:
+        merge_strategy = resolve_merge_strategy(
+            schema.tables, table, capabilities, is_prepared=True
+        )
+        if merge_strategy is None:
+            continue
+        set_options = _get_merge_options(table)
+        for option in options:
+            # `verify_schema_merge_disposition` warns about options that the strategy ignores
+            if set_options[option] and merge_strategy in MERGE_STRATEGY_OPTIONS[option]:
+                message = (
+                    f"dlt does not support `{option}` with the `{merge_strategy}` merge strategy"
+                    f" on `{target}` table `{table['name']}`."
+                )
+                if option == "source_filter":
+                    message += " Filter the yielded items with `resource.add_filter()` instead."
+                exception_log.append(SchemaCorruptedException(schema.name, message))
+    return exception_log
+
+
+def _verify_nested_destination_scope(
+    schema: Schema,
+    table: PreparedTableSchema,
+    root_table: PreparedTableSchema,
+    capabilities: DestinationCapabilitiesContext,
+    destination_scope_placeholders: Sequence[str],
+) -> List[Exception]:
+    merge_strategy = resolve_merge_strategy(
+        schema.tables, root_table, capabilities, is_prepared=True
+    )
+    if merge_strategy is None:
+        # the prepared root table does not merge, ie. on a staging filesystem
+        return []
+    if merge_strategy != "delete-insert" or "x-merge-destination-scope" not in root_table:
+        return [
+            SchemaCorruptedException(
+                schema.name,
+                f"Nested table `{table['name']}` has `destination_scope`. dlt uses it only with"
+                " the `delete-insert` merge strategy and when the root table"
+                f" `{root_table['name']}` has `destination_scope`.",
+            )
+        ]
+    try:
+        validate_merge_condition(
+            "destination_scope",
+            cast(str, table["x-merge-destination-scope"]),  # type: ignore[typeddict-item]
+            [
+                *destination_scope_placeholders,
+                *MERGE_CONDITION_VALUE_PLACEHOLDERS,
+                *get_merge_placeholder_values(root_table["name"]),
+            ],
+        )
+    except ValueError as scope_ex:
+        return [SchemaCorruptedException(schema.name, f"Table `{table['name']}`: {scope_ex}")]
+    return []
+
+
+def verify_schema_merge_disposition(
+    schema: Schema,
+    load_tables: Sequence[PreparedTableSchema],
+    capabilities: DestinationCapabilitiesContext,
+    warnings: bool = True,
+    source_filter_placeholders: Sequence[str] = (),
+    destination_scope_placeholders: Sequence[str] = MERGE_CONDITION_PLACEHOLDERS,
+) -> List[Exception]:
+    """Verifies the merge hints of `load_tables`. Verifies `source_filter` and `destination_scope`
+    against the placeholders that the destination expands. Returns exceptions for errors and
+    logs warnings."""
+    log = logger.warning if warnings else logger.info
+    # collect all exceptions to show all problems in the schema
+    exception_log: List[Exception] = []
+    prepared_tables = {table["name"]: table for table in load_tables}
+
+    # verifies schema settings specific to sql job client
+    for table in load_tables:
+        if is_nested_table(table):
+            if "x-merge-destination-scope" in table:
+                root_name = get_root_table(schema.tables, table["name"])["name"]
+                # a nested table has data only with its root table, so the root is loaded too
+                if root_table := prepared_tables.get(root_name):
+                    exception_log.extend(
+                        _verify_nested_destination_scope(
+                            schema, table, root_table, capabilities, destination_scope_placeholders
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "dlt did not verify the `destination_scope` of nested table"
+                        f" `{table['name']}`. Its root table `{root_name}` has no data in this"
+                        " load."
+                    )
+            continue
+
+        table_name = table["name"]
+        if table["write_disposition"] == "merge":
+            if "x-merge-strategy" in table and table["x-merge-strategy"] not in MERGE_STRATEGIES:  # type: ignore[typeddict-item]
+                exception_log.append(
+                    SchemaCorruptedException(
+                        schema.name,
+                        f'"{table["x-merge-strategy"]}" is not a valid merge strategy. '  # type: ignore[typeddict-item]
+                        f"""Allowed values: {', '.join(['"' + s + '"' for s in MERGE_STRATEGIES])}.""",
+                    )
+                )
+
+            merge_strategy = resolve_merge_strategy(
+                schema.tables, table, capabilities, is_prepared=True
+            )
+            if merge_strategy is None:
+                table_format_info = ""
+                if capabilities.supported_table_formats:
+                    table_format_info = (
+                        " or try different table format which may offer `merge`:"
+                        f" {capabilities.supported_table_formats}"
+                    )
+                exception_log.append(
+                    WriteDispositionNotSupported(
+                        "merge",
+                        "Destination does not support any merge strategies and `merge` write"
+                        f" disposition  for table `{table_name}` cannot be met. "
+                        f"Change write disposition{table_format_info}.",
+                    )
+                )
+                continue
+            has_destination_scope = "x-merge-destination-scope" in table
+            value_placeholders = {
+                *MERGE_CONDITION_VALUE_PLACEHOLDERS,
+                *get_merge_placeholder_values(table_name),
+            }
+            for hint_name, x_hint, placeholders in (
+                ("source_filter", "x-merge-source-filter", source_filter_placeholders),
+                ("destination_scope", "x-merge-destination-scope", destination_scope_placeholders),
+            ):
+                if filter_ := table.get(x_hint):
+                    try:
+                        validate_merge_condition(
+                            hint_name,
+                            cast(str, filter_),
+                            [*placeholders, *sorted(value_placeholders)],
+                        )
+                    except ValueError as filter_ex:
+                        exception_log.append(
+                            SchemaCorruptedException(
+                                schema.name, f"Table `{table_name}`: {filter_ex}"
+                            )
+                        )
+            if merge_strategy == "delete-insert":
+                if (
+                    not has_column_with_prop(table, "primary_key")
+                    and not has_column_with_prop(table, "merge_key")
+                    # without keys, the destination scope selects the rows that this load replaces
+                    and not has_destination_scope
+                ):
+                    log(
+                        f"Table {table_name} has `write_disposition` set to `merge`"
+                        " and `merge_strategy` set to `delete-insert`, but no primary or"
+                        " merge keys defined."
+                    )
+            elif merge_strategy in ("upsert", "insert-only", "cdc"):
+                if not has_column_with_prop(table, "primary_key"):
+                    exception_log.append(
+                        SchemaCorruptedException(
+                            schema.name,
+                            f"No primary key defined for table `{table['name']}`."
+                            f" `primary_key` needs to be set when using the `{merge_strategy}`"
+                            " merge strategy.",
+                        )
+                    )
+                if merge_strategy != "cdc" and has_column_with_prop(table, "merge_key"):
+                    log(
+                        f"Found `merge_key` for table `{table['name']}` with"
+                        f" `{merge_strategy}` merge strategy. Merge key is not supported"
+                        " for this strategy and will be ignored."
+                    )
+            # the resource rejects these options for an explicit strategy. Only the destination
+            # knows the default strategy
+            set_options = _get_merge_options(table)
+            for option, strategies in MERGE_STRATEGY_OPTIONS.items():
+                if set_options[option] and merge_strategy not in strategies:
+                    supported = ", ".join(f"`{s}`" for s in strategies)
+                    log(
+                        f"Table `{table_name}` sets `{option}` with the `{merge_strategy}` merge"
+                        f" strategy. dlt ignores this option, because only the {supported} merge"
+                        " strategies support it. Use one of these strategies or remove the option."
+                    )
+            if (
+                has_destination_scope
+                and merge_strategy in MERGE_STRATEGY_OPTIONS["destination_scope"]
+                and has_column_with_prop(table, "merge_key")
+            ):
+                log(
+                    f"Table `{table_name}` has `merge_key` and `destination_scope`. The"
+                    " destination scope selects the destination records to delete or retire, so"
+                    " dlt ignores `merge_key`."
+                )
+        if has_column_with_prop(table, "hard_delete"):
+            if len(get_columns_names_with_prop(table, "hard_delete")) > 1:
+                exception_log.append(
+                    SchemaCorruptedException(
+                        schema.name,
+                        f'Found multiple "hard_delete" column hints for table "{table_name}" in'
+                        f' schema "{schema.name}" while only one is allowed:'
+                        f' {", ".join(get_columns_names_with_prop(table, "hard_delete"))}.',
+                    )
+                )
+            if table.get("write_disposition") in ("replace", "append"):
+                log(
+                    f"""The "hard_delete" column hint for column "{get_first_column_name_with_prop(table, 'hard_delete')}" """
+                    f'in table "{table_name}" with write disposition'
+                    f' "{table.get("write_disposition")}"'
+                    f' in schema "{schema.name}" will be ignored.'
+                    ' The "hard_delete" column hint is only applied when using'
+                    ' the "merge" write disposition.'
+                )
+        if has_column_with_prop(table, "dedup_sort"):
+            if len(get_columns_names_with_prop(table, "dedup_sort")) > 1:
+                exception_log.append(
+                    SchemaCorruptedException(
+                        schema.name,
+                        f'Found multiple "dedup_sort" column hints for table "{table_name}" in'
+                        f' schema "{schema.name}" while only one is allowed:'
+                        f' {", ".join(get_columns_names_with_prop(table, "dedup_sort"))}.',
+                    )
+                )
+            if table.get("write_disposition") in ("replace", "append"):
+                log(
+                    f"""The "dedup_sort" column hint for column "{get_first_column_name_with_prop(table, 'dedup_sort')}" """
+                    f'in table "{table_name}" with write disposition'
+                    f' "{table.get("write_disposition")}"'
+                    f' in schema "{schema.name}" will be ignored.'
+                    ' The "dedup_sort" column hint is only applied when using'
+                    ' the "merge" write disposition.'
+                )
+            if table.get("write_disposition") == "merge":
+                if not has_column_with_prop(table, "primary_key"):
+                    log(
+                        f"""The "dedup_sort" column hint for column "{get_first_column_name_with_prop(table, 'dedup_sort')}" """
+                        f'in table "{table_name}" with write disposition'
+                        f' "{table.get("write_disposition")}"'
+                        f' in schema "{schema.name}" will be ignored.'
+                        ' The "dedup_sort" column hint is only applied when a'
+                        " primary key has been specified."
+                    )
+                if table.get("x-stage-data-deduplicated", False):
+                    log(
+                        f"""The "dedup_sort" column hint for column "{get_first_column_name_with_prop(table, 'dedup_sort')}" """
+                        f'in table "{table_name}" with write disposition'
+                        f' "{table.get("write_disposition")}"'
+                        f' in schema "{schema.name}" will be ignored.'
+                        " Staging data is declared as already deduplicated."
+                    )
+    return exception_log
+
+
+def _convert_to_old_pyformat(
+    new_style_string: str, args: Tuple[Any, ...], operational_error_cls: Type[Exception]
+) -> Tuple[str, Dict[str, Any]]:
+    """Converts a query string from the new pyformat style to the old pyformat style.
+
+    The new pyformat style uses placeholders like %s, while the old pyformat style
+    uses placeholders like %(arg0)s, where the number corresponds to the index of
+    the argument in the args tuple.
+
+    Args:
+        new_style_string (str): The query string in the new pyformat style.
+        args (Tuple[Any, ...]): The arguments to be inserted into the query string.
+        operational_error_cls (Type[Exception]): The specific OperationalError class to be raised
+            in case of a mismatch between placeholders and arguments. This should be the
+            OperationalError class provided by the DBAPI2-compliant driver being used.
+
+    Returns:
+        Tuple[str, Dict[str, Any]]: A tuple containing the converted query string
+            in the old pyformat style, and a dictionary mapping argument keys to values.
+
+    Raises:
+        DatabaseTransientException: If there is a mismatch between the number of
+            placeholders in the query string, and the number of arguments provided.
+    """
+    if len(args) == 1 and isinstance(args[0], tuple):
+        args = args[0]
+
+    keys = [f"arg{str(i)}" for i, _ in enumerate(args)]
+    old_style_string, count = re.subn(r"%s", lambda _: f"%({keys.pop(0)})s", new_style_string)
+    mapping = dict(zip([f"arg{str(i)}" for i, _ in enumerate(args)], args))
+    if count != len(args):
+        raise DatabaseTransientException(operational_error_cls())
+    return old_style_string, mapping
+
+
+def is_compression_disabled() -> bool:
+    from dlt import config
+
+    key_ = "normalize.data_writer.disable_compression"
+    if key_ not in config:
+        key_ = "data_writer.disable_compression"
+    return config.get(key_, bool)
+
+
+def get_deterministic_temp_table_name(table_name: str, op: str) -> str:
+    """Returns table name suitable for deterministic temp table. Such table will survive
+    disconnects and is supposed to be dropped before being filled again so we need
+    deterministic name with very low collision prob with "data" tables
+    """
+    from dlt.common.normalizers.naming import NamingConvention
+
+    op_name = f"{table_name}_{op}"
+    return f"{op_name}_{NamingConvention._compute_tag(op_name, 0.001)}"

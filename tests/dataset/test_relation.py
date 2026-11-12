@@ -1,0 +1,1151 @@
+import pathlib
+import sys
+from typing import Any, List, Tuple
+from unittest.mock import ANY
+
+import pytest
+from sqlglot import expressions as sge
+
+import dlt
+from dlt.common.utils import uniq_id
+from dlt.common.schema.schema import Schema
+from dlt.common.schema.typing import C_DLT_LOAD_ID, LOADS_TABLE_NAME, VERSION_TABLE_NAME
+from dlt.common.schema.utils import new_table
+from dlt.dataset import lineage
+from dlt.dataset.dataset import _get_load_ids, _get_latest_load_id
+from dlt.dataset.exceptions import LineageFailedException
+from tests.dataset.utils import TLoadsFixture, crm
+
+# TODO move destination-independent tests from `test_read_interfaces.py` to this module
+
+
+def _set_name_normalizer_on_schema(schema: dlt.Schema, name_normalizer_ref: str) -> None:
+    schema._normalizers_config["names"] = name_normalizer_ref
+    schema.update_normalizers()
+
+
+ITEMS_DATA = [{"item_id": 1, "name": "Widget"}, {"item_id": 2, "name": "Gadget"}]
+WAREHOUSES_DATA = [{"warehouse_id": 1, "location": "Berlin"}]
+
+
+@dlt.source
+def inventory():
+    @dlt.resource
+    def items():
+        yield ITEMS_DATA
+
+    @dlt.resource
+    def warehouses():
+        yield WAREHOUSES_DATA
+
+    return [items, warehouses]
+
+
+@pytest.fixture(scope="module")
+def dataset(module_tmp_path: pathlib.Path) -> dlt.Dataset:
+    @dlt.resource(name="purchases")
+    def purchases_data():
+        yield from (
+            {"id": 1, "name": "alice", "city": "berlin"},
+            {"id": 2, "name": "bob", "city": "paris"},
+            {"id": 3, "name": "charlie", "city": "barcelona"},
+        )
+
+    # each xdist worker gets its own database file, a shared one fails on the duckdb file lock
+    pipeline = dlt.pipeline(
+        "_relation_to_ibis",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(module_tmp_path / "relation_to_ibis.duckdb")),
+        dev_mode=True,
+    )
+    pipeline.run([purchases_data])
+    return pipeline.dataset()
+
+
+@pytest.fixture
+def purchases(dataset: dlt.Dataset) -> dlt.Relation:
+    purchases = dataset.table("purchases")
+    assert isinstance(purchases, dlt.Relation)
+    return purchases
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason=f"Skipping tests for Python `{sys.version_info}`. Ibis only supports Python >= 3.10.",
+)
+def test_sql_relation_to_ibis(dataset: dlt.Dataset) -> None:
+    """Call `.to_ibis()` on a `dlt.Relation` defined by an SQL query"""
+    from ibis import ir
+
+    purchases = dataset.query("SELECT * FROM purchases")
+    assert isinstance(purchases, dlt.Relation)
+
+    table = purchases.to_ibis()
+    assert isinstance(table, ir.Table)
+    # executes without error
+    table.execute()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason=f"Skipping tests for Python `{sys.version_info}`. Ibis only supports Python >= 3.10.",
+)
+def test_base_relation_to_ibis(purchases: dlt.Relation) -> None:
+    """Call `.to_ibis()` on a `dlt.Relation` defined by an existing table name"""
+    from ibis import ir
+
+    table = purchases.to_ibis()
+    assert isinstance(table, ir.Table)
+    # executes without error
+    table.execute()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason=f"Skipping tests for Python `{sys.version_info}`. Ibis only supports Python >= 3.10.",
+)
+def test_transformed_relation_to_ibis_(purchases: dlt.Relation) -> None:
+    """Call `.to_ibis()` on a `dlt.Relation` that was transformed by methods"""
+    from ibis import ir
+
+    table = purchases.where("id", "gt", 2).select("name").to_ibis()
+    assert isinstance(table, ir.Table)
+    out = table.execute()
+    assert list(out["name"]) == ["charlie"]
+
+
+@pytest.mark.parametrize(
+    "query,where_args,expected_rows",
+    [
+        pytest.param(
+            "SELECT city, MAX(id) AS max_id FROM purchases GROUP BY city",
+            ("max_id > 1",),
+            [("barcelona", 3), ("paris", 2)],
+            id="aggregate-expr",
+        ),
+        pytest.param(
+            "SELECT id AS src_id, id * 10 AS id FROM purchases",
+            ("id", "eq", 10),
+            [(1, 10)],
+            id="alias-shadows-source-typed",
+        ),
+        pytest.param(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS rn FROM purchases",
+            ("rn", "eq", 1),
+            [(3, 1)],
+            id="untyped-window-column-typed",
+        ),
+    ],
+)
+def test_where_filters_relation_output(
+    dataset: dlt.Dataset,
+    query: str,
+    where_args: Tuple[Any, ...],
+    expected_rows: List[Tuple[Any, ...]],
+) -> None:
+    assert sorted(dataset(query).where(*where_args).fetchall()) == expected_rows
+
+
+def test_relation_from_loads_rejects_non_table_relations(dataset: dlt.Dataset) -> None:
+    with pytest.raises(ValueError, match=r"only works on relations created via \.table\(\)"):
+        dataset.query("SELECT * FROM purchases").from_loads(["load_1"])
+
+    with pytest.raises(ValueError, match=r"only works on relations created via \.table\(\)"):
+        dataset.table("purchases").where("id", "gt", 1).from_loads(["load_1"])
+
+
+def test_relation_with_load_id_rejects_non_table_relations(
+    dataset_with_loads: TLoadsFixture,
+) -> None:
+    dataset, _, _ = dataset_with_loads
+
+    with pytest.raises(ValueError, match=r"only works on relations created via \.table\(\)"):
+        dataset.query("SELECT * FROM users").with_load_id_col()
+
+    with pytest.raises(ValueError, match=r"only works on relations created via \.table\(\)"):
+        dataset.table("users__orders").where("order_id", "gt", 1).with_load_id_col()
+
+
+@pytest.mark.parametrize(
+    "query,expected_columns",
+    [
+        ("SELECT item_id, name FROM items", ["item_id", "name"]),
+        # an unqualified column is not attributed to the only unknown table
+        ("SELECT col_unknown FROM table_unknown", None),
+        ("SELECT * FROM table_unknown", None),
+    ],
+    ids=["known_table", "unknown_table_unqualified_column", "unknown_table_star"],
+)
+def test_relation_columns_match_execution(
+    multi_schema_dataset: dlt.Dataset, query: str, expected_columns: Any
+) -> None:
+    """The columns of a relation are the columns that its execution returns, or both fail."""
+    relation = multi_schema_dataset(query)
+    if expected_columns is None:
+        with pytest.raises(LineageFailedException):
+            relation.columns
+        with pytest.raises(LineageFailedException):
+            relation.arrow()
+    else:
+        assert relation.columns == expected_columns
+        assert relation.arrow().schema.names == expected_columns
+
+
+@pytest.mark.parametrize(
+    "query,expected_columns",
+    [
+        ("SELECT item_id, name FROM items", ["item_id", "name"]),
+        ("SELECT col_unknown FROM table_unknown", ["col_unknown"]),
+        # a `*` over an unknown table cannot be expanded
+        ("SELECT * FROM table_unknown", []),
+    ],
+    ids=["known_table", "unknown_table_unqualified_column", "unknown_table_star"],
+)
+@pytest.mark.parametrize("execute_raw_query", [True, False], ids=["raw", "partial"])
+def test_relation_partial_lineage(
+    multi_schema_dataset: dlt.Dataset,
+    query: str,
+    expected_columns: Any,
+    execute_raw_query: bool,
+) -> None:
+    # a raw query implies partial lineage
+    relation = multi_schema_dataset(
+        query,
+        _execute_raw_query=execute_raw_query,
+        _allow_partial_lineage=not execute_raw_query,
+    )
+    assert relation.columns == expected_columns
+
+    # relations derived from the relation keep both modes
+    derived = relation.limit(1)
+    assert derived._allow_partial_lineage is True
+    assert derived._execute_raw_query is execute_raw_query
+    assert derived.columns == expected_columns
+    if execute_raw_query:
+        assert derived.to_sql() == derived.sqlglot_expression.sql(
+            dialect=derived.destination_dialect
+        )
+
+
+def test_relation_lineage_computed_once(tmp_path: pathlib.Path, mocker: Any) -> None:
+    pipeline = dlt.pipeline(
+        "relation_lineage",
+        pipelines_dir=str(tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(tmp_path / "relation_lineage.db")),
+        dev_mode=True,
+    )
+    pipeline.run([{"id": 1}], table_name="items")
+    dataset = pipeline.dataset()
+    lineage_spy = mocker.spy(lineage, "compute_columns_schema")
+    sqlglot_schema_spy = mocker.spy(lineage, "create_sqlglot_schema")
+
+    relation = dataset("SELECT * FROM items")
+    assert "value" not in relation.columns
+    relation.fetchall()
+    assert lineage_spy.call_count == 1
+    # the query binding reuses the sqlglot schema of the lineage
+    assert sqlglot_schema_spy.call_count == 1
+
+    # a change of the dataset schema computes the lineage again
+    dataset.schema.update_table(
+        new_table("items", columns=[{"name": "value", "data_type": "text", "nullable": True}])
+    )
+    assert "value" in relation.columns
+    assert lineage_spy.call_count == 2
+    assert sqlglot_schema_spy.call_count == 2
+
+    # a raw query executes without lineage, its columns compute it on request
+    raw_relation = dataset("SELECT * FROM items", _execute_raw_query=True)
+    raw_relation.fetchall()
+    assert lineage_spy.call_count == 2
+    assert raw_relation.columns == ["id", "_dlt_load_id", "_dlt_id", "value"]
+    assert lineage_spy.call_count == 3
+
+
+def test_cross_dataset_relation_lineage_follows_foreign_schema(
+    tmp_path: pathlib.Path, mocker: Any
+) -> None:
+    db_path = str(tmp_path / "cross_dataset_lineage.db")
+    pipeline_users = dlt.pipeline(
+        "lineage_users",
+        pipelines_dir=str(tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(db_path),
+        dataset_name="users_data",
+    )
+    pipeline_users.run([{"id": 1, "name": "alice"}], table_name="users")
+    pipeline_purchases = dlt.pipeline(
+        "lineage_purchases",
+        pipelines_dir=str(tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(db_path),
+        dataset_name="purchases_data",
+    )
+    pipeline_purchases.run([{"user_id": 1, "amount": 10}], table_name="purchases")
+    ds_users, ds_purchases = pipeline_users.dataset(), pipeline_purchases.dataset()
+    lineage_spy = mocker.spy(lineage, "compute_columns_schema")
+
+    joined = ds_users.table("users").join(
+        ds_purchases.table("purchases"), on="users.id = purchases.user_id"
+    )
+    assert "x-annotation-pii" not in joined.columns_schema["purchases__amount"]
+    assert joined.fetchall() == [(1, "alice", ANY, ANY, 1, 10, ANY, ANY)]
+    assert lineage_spy.call_count == 1
+
+    # a hint added to the schema of the foreign dataset computes the lineage again
+    ds_purchases.schema.update_table(
+        new_table(
+            "purchases",
+            columns=[{"name": "amount", "data_type": "bigint", "x-annotation-pii": True}],  # type: ignore[typeddict-unknown-key]
+        )
+    )
+    assert joined.columns_schema["purchases__amount"].get("x-annotation-pii") is True
+    assert joined.fetchall() == [(1, "alice", ANY, ANY, 1, 10, ANY, ANY)]
+    assert lineage_spy.call_count == 2
+    # the schema of the primary dataset did not change
+    assert "x-annotation-pii" not in ds_users.schema.get_table_columns("users")["id"]
+
+
+def test_dataset_load_ids(dataset_with_loads: TLoadsFixture):
+    dataset, load_ids, _ = dataset_with_loads
+
+    retrieved_load_ids = _get_load_ids(dataset)
+
+    assert tuple(retrieved_load_ids) == load_ids
+    assert isinstance(retrieved_load_ids, list)
+    assert all(isinstance(load_id, str) for load_id in retrieved_load_ids)
+    assert len(retrieved_load_ids) == 2
+
+    assert _get_load_ids(dataset) == dataset.load_ids()
+
+
+def test_dataset_latest_load_id(dataset_with_loads: TLoadsFixture):
+    dataset, load_ids, _ = dataset_with_loads
+
+    load_id = _get_latest_load_id(dataset)
+
+    assert isinstance(load_id, str)
+    assert load_id == load_ids[-1]
+    assert _get_latest_load_id(dataset) == dataset.latest_load_id()
+
+
+@pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
+def test_dataset_access_equivalent_relation_access(
+    dataset_with_loads: TLoadsFixture,
+    selected_load_id_idx: list[int],
+) -> None:
+    dataset, load_ids, _ = dataset_with_loads
+    selected_load_ids = [load_ids[idx] for idx in selected_load_id_idx]
+
+    dataset_output = dataset.table("users", load_ids=selected_load_ids)
+    relation_output = dataset.table("users").from_loads(selected_load_ids)
+
+    assert dataset_output._sqlglot_expression == relation_output._sqlglot_expression
+
+
+@pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
+@pytest.mark.parametrize(
+    "dataset_with_loads",
+    [
+        pytest.param("with_root_key", id="root_key-True"),
+        pytest.param("without_root_key", id="root_key-False"),
+    ],
+    indirect=True,
+)
+def test_relation_with_load_id(
+    dataset_with_loads: TLoadsFixture,
+    table_name: str,
+) -> None:
+    """Test filtering a root table with a single load_id string."""
+    dataset, load_ids, load_stats = dataset_with_loads
+    table = dataset.table(table_name)
+    expected_columns = (
+        table.columns if C_DLT_LOAD_ID in table.columns else table.columns + [C_DLT_LOAD_ID]
+    )
+
+    output = dataset.table(table_name).with_load_id_col()
+
+    assert isinstance(output, dlt.Relation)
+    assert output.columns == expected_columns
+
+    df = output.df()
+
+    assert len(df) == len(table.df())
+    assert list(df.columns) == expected_columns
+
+
+def test_relation_with_load_id_on_parallel_child_branch(tmp_path) -> None:
+    data = [
+        {
+            "id": 1,
+            "orders": [{"order_id": 101, "total_amount": 100.0}],
+            "profiles": [{"type": "personal"}],
+        },
+        {
+            "id": 2,
+            "orders": [{"order_id": 102, "total_amount": 200.0}],
+            "profiles": [{"type": "work"}],
+        },
+    ]
+
+    @dlt.resource(name="users")
+    def users():
+        yield data
+
+    pipeline = dlt.pipeline(
+        pipeline_name="parallel_child_branch_" + uniq_id(),
+        pipelines_dir=str(tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(tmp_path / "parallel_child_branch.duckdb")),
+        dev_mode=True,
+    )
+    pipeline.run(users(), dataset_name="test")
+
+    table = pipeline.dataset().table("users__profiles")
+    output = table.with_load_id_col()
+    expected_columns = table.columns + [C_DLT_LOAD_ID]
+
+    assert output.columns == expected_columns
+
+    df = output.df()
+
+    assert len(df) == len(data)
+    assert list(df.columns) == expected_columns
+    assert set(df[C_DLT_LOAD_ID]) == {pipeline.last_trace.last_normalize_info.loads_ids[0]}
+
+
+@pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
+@pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
+@pytest.mark.parametrize("add_load_id_column", [True, False])
+@pytest.mark.parametrize(
+    "dataset_with_loads",
+    [
+        pytest.param("with_root_key", id="root_key-True"),
+        pytest.param("without_root_key", id="root_key-False"),
+    ],
+    indirect=True,
+)
+def test_relation_from_loads(
+    dataset_with_loads: TLoadsFixture,
+    selected_load_id_idx: list[int],
+    add_load_id_column: bool,
+    table_name: str,
+) -> None:
+    """Test filtering a root table with a single load_id string."""
+    dataset, load_ids, load_stats = dataset_with_loads
+    selected_load_ids = [load_ids[idx] for idx in selected_load_id_idx]
+    table = dataset.table(table_name)
+    original_columns = table.columns
+    if C_DLT_LOAD_ID in original_columns:
+        expected_columns = original_columns
+    else:
+        expected_columns = (
+            original_columns + [C_DLT_LOAD_ID] if add_load_id_column else original_columns
+        )
+
+    output = table.from_loads(selected_load_ids, add_load_id_column=add_load_id_column)
+
+    assert isinstance(output, dlt.Relation)
+    assert output.columns == expected_columns
+
+    df = output.df()
+
+    assert len(df) == sum(load_stats[idx][table_name] for idx in selected_load_id_idx)
+    assert list(df.columns) == expected_columns
+    if C_DLT_LOAD_ID in expected_columns:
+        assert set(df[C_DLT_LOAD_ID]) == set(selected_load_ids)
+
+
+@pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
+@pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
+@pytest.mark.parametrize("add_load_id_column", [True, False])
+@pytest.mark.parametrize(
+    "dataset_with_loads",
+    [
+        "with_root_key",
+        "without_root_key",
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "name_normalizer_ref",
+    (
+        "tests.common.cases.normalizers.title_case",
+        "tests.common.cases.normalizers.sql_upper",
+        "tests.common.cases.normalizers.snake_no_x",
+    ),
+)
+def test_relation_from_loads_query(
+    dataset_with_loads: TLoadsFixture,
+    selected_load_id_idx: list[int],
+    add_load_id_column: bool,
+    table_name: str,
+    name_normalizer_ref: str,
+) -> None:
+    """Use different naming normalization to check if the internal queries
+    properly used normalized ids instead of constants.
+
+    The relation / query isn't executable because the stored data won't
+    match the name normalization that we force. Checks are conducted
+    against the query itself
+    """
+    original_dataset, load_ids, _ = dataset_with_loads
+    selected_load_ids = [load_ids[idx] for idx in selected_load_id_idx]
+    # change normalization; this query won't be executable
+    schema = original_dataset.schema.clone()  # copy to avoid mutating the fixture
+    schema._normalizers_config["allow_identifier_change_on_table_with_data"] = True
+    schema._normalizers_config["names"] = name_normalizer_ref
+    schema.update_normalizers()
+    dataset = dlt.dataset(
+        dataset_name=original_dataset.dataset_name,
+        destination=original_dataset._destination_reference,
+        schema=schema,
+    )
+    normalized_table_name = schema.naming.normalize_tables_path(table_name)
+    normalized_load_id = schema.naming.normalize_identifier(C_DLT_LOAD_ID)
+
+    rel = dataset.table(normalized_table_name).from_loads(
+        selected_load_ids, add_load_id_column=add_load_id_column
+    )
+    expr = rel._sqlglot_expression
+    sql_query = expr.sql()
+
+    assert normalized_table_name in sql_query
+    assert all(load_id in sql_query for load_id in selected_load_ids)
+
+    # root tables return star select() when not modifying the selection
+    if table_name == "products" and add_load_id_column:
+        assert expr.expressions[0] == sge.Star()
+    elif C_DLT_LOAD_ID in original_dataset.table(table_name).columns:
+        assert any(col.name == normalized_load_id for col in expr.expressions)
+    elif add_load_id_column:
+        assert any(col.name == normalized_load_id for col in expr.expressions)
+    else:
+        assert not any(col.name == normalized_load_id for col in expr.expressions)
+
+
+@pytest.fixture(scope="module")
+def multi_schema_pipeline(module_tmp_path: pathlib.Path) -> dlt.Pipeline:
+    pipeline = dlt.pipeline(
+        pipeline_name="multi_schema",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(module_tmp_path / "multi_schema.db")),
+        dev_mode=True,
+    )
+    pipeline.run(crm(0))
+    pipeline.run(inventory())
+    return pipeline
+
+
+@pytest.fixture(scope="module")
+def multi_schema_dataset(multi_schema_pipeline: dlt.Pipeline) -> dlt.Dataset:
+    return multi_schema_pipeline.dataset()
+
+
+def test_multi_schema_schemas_property(multi_schema_dataset: dlt.Dataset) -> None:
+    schemas = multi_schema_dataset.schemas
+    assert len(schemas) == 2
+    schema_names = {s.name for s in multi_schema_dataset.schemas}
+    assert schema_names == {"crm", "inventory"}
+
+
+def test_relation_all_schemas(multi_schema_dataset: dlt.Dataset) -> None:
+    # relation over a multi-schema dataset: single (primary) entry keyed by the dataset name
+    schema_map = multi_schema_dataset.table("users")._all_schemas()
+    assert list(schema_map.keys()) == [multi_schema_dataset.dataset_name]
+    schemas = schema_map[multi_schema_dataset.dataset_name]
+    # schemas are ordered with the default schema first and match the `schemas` property
+    assert schemas[0].name == multi_schema_dataset.schema.name
+    assert [s.name for s in schemas] == [s.name for s in multi_schema_dataset.schemas]
+
+
+def test_relation_foreign_dataset_schemas(cross_dataset_duckdb: Any) -> None:
+    ds_crm, ds_inv = cross_dataset_duckdb
+    joined = ds_crm.table("users").join(
+        ds_inv.table("purchases"), on="users.id = purchases.user_id"
+    )
+    schema_map = joined._all_schemas()
+    # the relation's own dataset is primary (first), the foreign dataset follows
+    assert list(schema_map.keys()) == [ds_crm.dataset_name, ds_inv.dataset_name]
+    assert schema_map[ds_crm.dataset_name][0].name == ds_crm.schema.name
+
+
+def test_multi_schema_tables_includes_all_schemas(multi_schema_dataset: dlt.Dataset) -> None:
+    tables = multi_schema_dataset.tables
+    expected = set(
+        [
+            "users",
+            "products",
+            "users__orders",
+            "users__orders__items",
+            "items",
+            "warehouses",
+            "_dlt_version",
+            "_dlt_loads",
+            "_dlt_pipeline_state",
+        ]
+    )
+    assert set(tables) == expected
+
+
+def test_multi_schema_table_access_secondary(multi_schema_dataset: dlt.Dataset) -> None:
+    items = multi_schema_dataset["items"].fetchall()
+    assert len(items) == len(ITEMS_DATA)
+    assert items[0][0] == 1
+    assert items[0][1] == "Widget"
+    assert items[1][0] == 2
+    assert items[1][1] == "Gadget"
+
+
+def test_multi_schema_row_counts(multi_schema_dataset: dlt.Dataset) -> None:
+    counts = dict(multi_schema_dataset.row_counts().fetchall())
+    expected_counts = {
+        "users": 2,
+        "products": 2,
+        "users__orders": 3,
+        "users__orders__items": 4,
+        "items": 2,
+        "warehouses": 1,
+    }
+    assert counts == expected_counts
+
+
+@pytest.fixture(scope="module")
+def casefolding_dataset(module_tmp_path: pathlib.Path) -> dlt.Dataset:
+    """Dataset on a duckdb that folds identifiers to upper case, like snowflake."""
+    pipeline = dlt.pipeline(
+        pipeline_name="casefolding",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(
+            str(module_tmp_path / "casefolding.db"),
+            casefold_identifier=str.upper,
+            has_case_sensitive_identifiers=True,
+        ),
+        dev_mode=True,
+    )
+    pipeline.run(inventory())
+    return pipeline.dataset()
+
+
+def test_casefolding_row_counts_output_names(casefolding_dataset: dlt.Dataset) -> None:
+    """`row_counts` names its output columns in the dlt schema namespace, also when the
+    destination folds identifiers."""
+    counts = casefolding_dataset.row_counts()
+    assert counts.columns == ["table_name", "row_count"]
+    rows = counts.arrow().to_pylist()
+    assert {row["table_name"]: row["row_count"] for row in rows} == {
+        "items": len(ITEMS_DATA),
+        "warehouses": len(WAREHOUSES_DATA),
+    }
+
+
+def test_casefolding_literal_projection_output_name(casefolding_dataset: dlt.Dataset) -> None:
+    relation = casefolding_dataset("SELECT 'Widget' AS kind, item_id FROM items ORDER BY item_id")
+    assert relation.arrow().schema.names == ["kind", "item_id"]
+
+
+def test_multi_schema_cross_schema_sql_query(multi_schema_dataset: dlt.Dataset) -> None:
+    result = multi_schema_dataset.query(
+        "SELECT u.id, i.item_id FROM users u, items i WHERE u.id = i.item_id"
+    ).fetchall()
+    assert sorted(result) == [(1, 1), (2, 2)]
+
+
+def test_multi_schema_load_ids(multi_schema_dataset: dlt.Dataset) -> None:
+    # default: returns load ids for the default schema only
+    default_ids = multi_schema_dataset.load_ids()
+    assert len(default_ids) >= 1
+    assert default_ids == sorted(default_ids)
+    assert all(isinstance(lid, str) for lid in default_ids)
+
+    # explicit schema_name returns that schema's load ids
+    inv_ids = multi_schema_dataset.load_ids(schema_name="inventory")
+    assert len(inv_ids) >= 1
+    assert all(isinstance(lid, str) for lid in inv_ids)
+
+    # each schema's load ids are disjoint
+    assert set(default_ids).isdisjoint(set(inv_ids))
+
+
+def test_multi_schema_latest_load_id(multi_schema_dataset: dlt.Dataset) -> None:
+    # default schema
+    latest = multi_schema_dataset.latest_load_id()
+    all_ids = multi_schema_dataset.load_ids()
+    assert latest == all_ids[-1]
+
+    # explicit schema
+    inv_latest = multi_schema_dataset.latest_load_id(schema_name="inventory")
+    inv_ids = multi_schema_dataset.load_ids(schema_name="inventory")
+    assert inv_latest == inv_ids[-1]
+
+
+def test_multi_schema_str_shows_all_schema_names(multi_schema_dataset: dlt.Dataset) -> None:
+    s = str(multi_schema_dataset)
+    assert "crm" in s
+    assert "inventory" in s
+
+
+def test_multi_schema_sqlglot_schema_has_all_tables(multi_schema_dataset: dlt.Dataset) -> None:
+    sg_schema = multi_schema_dataset.sqlglot_schema
+    assert sg_schema.column_names(sge.Table(this=sge.to_identifier("users")))
+    assert sg_schema.column_names(sge.Table(this=sge.to_identifier("items")))
+
+
+def test_use_single_dataset_false_stays_single_schema(
+    module_tmp_path: pathlib.Path,
+) -> None:
+    pipeline = dlt.pipeline(
+        pipeline_name="multi_dataset_mode",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(module_tmp_path / "multi_dataset.db")),
+        dev_mode=True,
+    )
+    pipeline.config.use_single_dataset = False
+    pipeline.run(crm(0))
+    pipeline.run(inventory())
+    ds = pipeline.dataset()
+    assert len(ds.schemas) == 1
+    assert ds.schema.name == "crm"
+
+
+@pytest.mark.parametrize(
+    "schema_arg_fn, expected_names",
+    [
+        pytest.param(lambda a, b: [a, b], ["crm", "inventory"], id="list-input"),
+        pytest.param(lambda a, b: (b, a), ["inventory", "crm"], id="tuple-input-reversed"),
+        pytest.param(lambda a, b: [b, a], ["inventory", "crm"], id="caller-ordering"),
+        pytest.param(lambda a, b: [a], ["crm"], id="single-in-list"),
+    ],
+)
+def test_dataset_with_schema_sequence(
+    multi_schema_pipeline: dlt.Pipeline,
+    schema_arg_fn: Any,
+    expected_names: list[str],
+) -> None:
+    schema_a = multi_schema_pipeline.schemas["crm"]
+    schema_b = multi_schema_pipeline.schemas["inventory"]
+    schema_arg = schema_arg_fn(schema_a, schema_b)
+
+    ds = dlt.dataset(
+        destination=multi_schema_pipeline._destination,
+        dataset_name=multi_schema_pipeline.dataset_name,
+        schema=schema_arg,
+    )
+    assert [s.name for s in ds.schemas] == expected_names
+    assert ds.schema.name == expected_names[0]
+
+
+def test_dataset_with_empty_schema_sequence(
+    multi_schema_pipeline: dlt.Pipeline,
+) -> None:
+    ds = dlt.dataset(
+        destination=multi_schema_pipeline._destination,
+        dataset_name=multi_schema_pipeline.dataset_name,
+        schema=[],
+    )
+    with pytest.raises(ValueError, match="must not be empty"):
+        ds.schema
+
+
+@pytest.mark.parametrize(
+    "schema_fn, expected_names",
+    [
+        pytest.param(lambda a, b: [a, b], ["crm", "inventory"], id="sequence"),
+        pytest.param(lambda a, b: a, ["crm"], id="schema-object"),
+        pytest.param(lambda a, b: "crm", ["crm"], id="str-name"),
+        pytest.param(lambda a, b: None, ["crm", "inventory"], id="none-default"),
+    ],
+)
+def test_pipeline_dataset_with_explicit_schema(
+    multi_schema_pipeline: dlt.Pipeline,
+    schema_fn: Any,
+    expected_names: list[str],
+) -> None:
+    schema_a = multi_schema_pipeline.schemas["crm"]
+    schema_b = multi_schema_pipeline.schemas["inventory"]
+    schema_arg = schema_fn(schema_a, schema_b)
+
+    ds = multi_schema_pipeline.dataset(schema=schema_arg)
+    assert [s.name for s in ds.schemas] == expected_names
+    assert ds.schema.name == expected_names[0]
+    assert ds._pipeline_name == multi_schema_pipeline.pipeline_name
+
+
+def test_pipeline_dataset_with_empty_schema_sequence(
+    multi_schema_pipeline: dlt.Pipeline,
+) -> None:
+    ds = multi_schema_pipeline.dataset(schema=[])
+    with pytest.raises(ValueError, match="must not be empty"):
+        ds.schema
+
+
+@dlt.source
+def src_a():
+    @dlt.resource(name="shared_users")
+    def shared_users_a():
+        yield [{"id": 1, "name": "Alice"}]
+
+    return [shared_users_a]
+
+
+@dlt.source
+def src_b():
+    @dlt.resource(name="shared_users")
+    def shared_users_b():
+        yield [{"id": 2, "email": "bob@example.com"}]
+
+    return [shared_users_b]
+
+
+@pytest.fixture(scope="module")
+def overlapping_tables_dataset(module_tmp_path: pathlib.Path) -> dlt.Dataset:
+    pipeline = dlt.pipeline(
+        pipeline_name="overlapping_tables",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(module_tmp_path / "overlapping_tables.db")),
+        dev_mode=True,
+    )
+    pipeline.run(src_a())
+    pipeline.run(src_b())
+    return pipeline.dataset()
+
+
+def test_shared_table_merge(overlapping_tables_dataset: dlt.Dataset) -> None:
+    ds = overlapping_tables_dataset
+
+    sg_columns = ds.sqlglot_schema.column_names(sge.Table(this=sge.to_identifier("shared_users")))
+    assert sorted(sg_columns) == sorted(["id", "name", "_dlt_load_id", "_dlt_id", "email"])
+
+    rel_columns = ds["shared_users"].columns
+    assert sorted(rel_columns) == sorted(["id", "name", "_dlt_load_id", "_dlt_id", "email"])
+
+    rows = ds.query("SELECT id, name, email FROM shared_users ORDER BY id").fetchall()
+    assert rows == [(1, "Alice", None), (2, None, "bob@example.com")]
+
+
+def test_multi_schema_row_counts_by_load_id(
+    multi_schema_dataset: dlt.Dataset,
+) -> None:
+    ds = multi_schema_dataset
+    crm_load_id = ds.load_ids()[0]
+    inventory_load_id = ds.load_ids(schema_name="inventory")[0]
+
+    crm_counts = dict(ds.row_counts(load_id=crm_load_id).fetchall())
+    assert crm_counts == {
+        "users": 2,
+        "products": 2,
+        "items": 0,
+        "warehouses": 0,
+    }
+    inventory_counts = dict(ds.row_counts(load_id=inventory_load_id).fetchall())
+    assert inventory_counts == {
+        "users": 0,
+        "products": 0,
+        "items": 2,
+        "warehouses": 1,
+    }
+
+
+def test_unify_schemas_across_naming_conventions(
+    module_tmp_path: pathlib.Path,
+) -> None:
+    pipeline = dlt.pipeline(
+        pipeline_name="multi_naming",
+        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(
+            str(module_tmp_path / "multi_naming.db"),
+            enable_dataset_name_normalization=False,
+        ),
+        dataset_name="multi_naming_ds",
+    )
+    # default snake_case schema
+    pipeline.run([{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}], table_name="users")
+
+    upper_schema = dlt.Schema("events")
+    upper_schema._configure_normalizers(
+        {"names": "tests.common.cases.normalizers.sql_upper", "json": None}
+    )
+    pipeline.run(
+        [{"id": 7, "value": "hello"}],
+        table_name="events📊",
+        schema=upper_schema,
+    )
+    assert "users" in pipeline.schemas["multi_naming"].data_table_names()
+    assert "EVENTS📊" in pipeline.schemas["events"].data_table_names()
+
+    dataset = pipeline.dataset()
+    users = sorted(row[:2] for row in dataset.users.fetchall())
+    assert users == [(1, "alice"), (2, "bob")]
+    events = [row[:2] for row in dataset["EVENTS📊"].fetchall()]
+    assert events == [(7, "hello")]
+
+
+@pytest.fixture
+def mock_dataset() -> dlt.Dataset:
+    s = Schema("my_schema")
+    t = new_table(
+        "my_table",
+        columns=[
+            {"name": "col1", "data_type": "text"},
+            {"name": "col2", "data_type": "text"},
+        ],
+    )
+    s.update_table(t)
+    return dlt.dataset(
+        dlt.destinations.duckdb(destination_name="duck_db"),
+        "pipeline_dataset",
+        schema=s,
+    )
+
+
+def test_dataset_autocompletion(mock_dataset: dlt.Dataset) -> None:
+    expected_suggestions = ["my_table", LOADS_TABLE_NAME, VERSION_TABLE_NAME]
+    suggestions = mock_dataset._ipython_key_completions_()
+    assert set(expected_suggestions) == set(suggestions)
+
+
+def test_relation_autocompletion(mock_dataset: dlt.Dataset) -> None:
+    expected_suggestions = ["col1", "col2"]
+    suggestions = mock_dataset["my_table"]._ipython_key_completions_()
+    assert set(expected_suggestions) == set(suggestions)
+
+
+def test_query_builder(mock_dataset: dlt.Dataset) -> None:
+    relation = mock_dataset.my_table
+
+    # default query for a table
+    assert (
+        relation.to_sql().strip()
+        == 'SELECT "my_table"."col1" AS "col1", "my_table"."col2" AS "col2" FROM'
+        ' "pipeline_dataset"."my_table" AS "my_table"'
+    )
+
+    # head query
+    assert (
+        relation.head().to_sql().strip()
+        == 'SELECT "my_table"."col1" AS "col1", "my_table"."col2" AS "col2" FROM'
+        ' "pipeline_dataset"."my_table" AS "my_table" LIMIT 5'
+    )
+
+    # limit query
+    assert (
+        relation.limit(24).to_sql().strip()
+        == 'SELECT "my_table"."col1" AS "col1", "my_table"."col2" AS "col2" FROM'
+        ' "pipeline_dataset"."my_table" AS "my_table" LIMIT 24'
+    )
+
+    # select columns
+    assert (
+        relation.select("col1").to_sql().strip()
+        == 'SELECT "my_table"."col1" AS "col1" FROM "pipeline_dataset"."my_table" AS "my_table"'
+    )
+    # also indexer notation
+    assert (
+        relation[["col2"]].to_sql().strip()
+        == 'SELECT "my_table"."col2" AS "col2" FROM "pipeline_dataset"."my_table" AS "my_table"'
+    )
+
+    # limit and select chained
+    assert (
+        relation.select("col1").limit(24).to_sql().strip()
+        == 'SELECT "my_table"."col1" AS "col1" FROM "pipeline_dataset"."my_table" AS "my_table"'
+        " LIMIT 24"
+    )
+
+
+def test_select_projection_shapes(mock_dataset: dlt.Dataset) -> None:
+    relation = mock_dataset.my_table
+
+    # pure column projections are replaced in place; ORDER BY column may be unprojected
+    selected = relation.order_by("col1", "desc").limit(3).select("col2")
+    expr = selected.sqlglot_expression
+    assert expr.find(sge.Subquery) is None
+    assert [sel.output_name for sel in expr.selects] == ["col2"]
+    assert expr.args.get("order") is not None
+    assert expr.args.get("limit") is not None
+
+    # aggregate applies at the same level
+    agg = relation.select("col1").max()
+    assert isinstance(agg.sqlglot_expression.selects[0], sge.Max)
+    assert agg.sqlglot_expression.find(sge.Subquery) is None
+
+    # a defining projection wraps as a derived table; ORDER BY and LIMIT hoist onto the wrap
+    defining = mock_dataset("SELECT col1 AS c FROM my_table ORDER BY c LIMIT 3").select("c")
+    expr = defining.sqlglot_expression
+    derived = expr.find(sge.Subquery)
+    assert derived is not None
+    assert derived.this.args.get("order") is None
+    assert derived.this.args.get("limit") is None
+    assert expr.args.get("order") is not None
+    assert expr.args.get("limit") is not None
+
+    # select over the wrap replaces its projection in place, no second wrap
+    chained = defining.select("c")
+    assert chained.sqlglot_expression.find(sge.Subquery).this.find(sge.Subquery) is None
+
+    # a sort key dropped by the projection keeps ORDER BY and LIMIT inside the wrap
+    kept = mock_dataset("SELECT col1 AS c FROM my_table ORDER BY col2 LIMIT 3").select("c")
+    derived = kept.sqlglot_expression.find(sge.Subquery)
+    assert derived.this.args.get("order") is not None
+    assert derived.this.args.get("limit") is not None
+    assert kept.sqlglot_expression.args.get("order") is None
+    assert kept.sqlglot_expression.args.get("limit") is None
+
+
+def test_order_by_output_alias_binding(mock_dataset: dlt.Dataset) -> None:
+    """ORDER BY an output alias binds to its source, except under DISTINCT/GROUP BY."""
+    # plain select: bind resolves the alias to its source column (tsql/snowflake need this)
+    plain = mock_dataset("SELECT col1 FROM my_table ORDER BY col1").to_sql()
+    assert 'ORDER BY "my_table"."col1"' in plain
+
+    # DISTINCT: sort key must stay the output column (databricks rejects a source column here)
+    distinct = mock_dataset("SELECT DISTINCT col1 FROM my_table ORDER BY col1").to_sql()
+    assert 'ORDER BY "col1"' in distinct
+    assert "my_table" not in distinct.split("ORDER BY")[1]
+
+    grouped = mock_dataset("SELECT col1 FROM my_table GROUP BY col1 ORDER BY col1").to_sql()
+    assert "my_table" not in grouped.split("ORDER BY")[1]
+
+
+def test_copy_and_chaining() -> None:
+    dataset = dlt.dataset(
+        dlt.destinations.duckdb(destination_name="duck_db"),
+        "pipeline_dataset",
+    )
+
+    dataset.schema.tables["items"] = new_table(
+        "items",
+        columns=[{"data_type": "text", "name": "one"}, {"data_type": "json", "name": "two"}],
+    )
+
+    # create relation and set some stuff on it
+    relation = dataset.items
+    relation = relation.limit(34)
+    relation = relation[["one", "two"]]
+
+    relation2 = relation.__copy__()
+    assert relation != relation2
+    assert relation.sqlglot_expression == relation2.sqlglot_expression
+
+    # test copy while chaining limit
+    relation3 = relation2.limit(22)
+    assert relation2 != relation3
+    assert relation2.sqlglot_expression != relation3.sqlglot_expression
+
+    # test last setting prevails chaining
+    limit_expr = relation.limit(23).limit(67).limit(11).sqlglot_expression.args["limit"]
+    literal_expr = limit_expr.args["expression"]
+    assert int(literal_expr.this) == 11
+
+
+def test_computed_schema_columns() -> None:
+    dataset = dlt.dataset(
+        dlt.destinations.duckdb(destination_name="duck_db"),
+        "pipeline_dataset",
+    )
+
+    # missing attribute should raise Attribute error
+    with pytest.raises(AttributeError):
+        dataset.items
+
+    # missing key should raise KeyError
+    with pytest.raises(KeyError):
+        dataset["items"]
+
+    with pytest.raises(ValueError):
+        dataset.table("items")
+
+    dataset.schema.tables["items"] = new_table(
+        "items",
+        columns=[{"data_type": "text", "name": "one"}, {"data_type": "json", "name": "two"}],
+    )
+
+    # now add columns
+    relation = dataset.items
+
+    # computed columns are same as above
+    assert relation.columns_schema == {
+        "one": {"data_type": "text", "name": "one"},
+        "two": {"data_type": "json", "name": "two"},
+    }
+
+    # when selecting only one column, computing schema columns will only show that one
+    assert relation.select("one").columns_schema == {"one": {"data_type": "text", "name": "one"}}
+    assert relation["one"].columns_schema == {"one": {"data_type": "text", "name": "one"}}
+    assert relation[["one"]].columns_schema == {"one": {"data_type": "text", "name": "one"}}
+
+    # selecting unknown column fails
+    with pytest.raises(KeyError):
+        relation[["unknown_columns"]]
+    with pytest.raises(KeyError):
+        relation["unknown_columns"]
+
+
+def test_changing_relation_with_query() -> None:
+    s = Schema("my_schema")
+    t = new_table(
+        "something",
+        columns=[
+            {"name": "this", "data_type": "text"},
+            {"name": "that", "data_type": "text"},
+        ],
+    )
+
+    s.update_table(t)
+    dataset = dlt.dataset(
+        dlt.destinations.duckdb(destination_name="duck_db"),
+        "pipeline_dataset",
+        schema=s,
+    )
+
+    relation = dataset("SELECT * FROM something")
+    query = relation.to_sql()
+    assert (
+        'SELECT "something"."this" AS "this", "something"."that" AS "that" FROM'
+        ' "pipeline_dataset"."something" AS "something"'
+        == query
+    )
+
+    query = dataset("SELECT this, that FROM something").limit(5).to_sql()
+    assert (
+        'SELECT "something"."this" AS "this", "something"."that" AS "that" FROM'
+        ' "pipeline_dataset"."something" AS "something" LIMIT 5'
+        == query
+    )
+
+    query = relation.select("this").to_sql()
+    assert (
+        'SELECT "something"."this" AS "this" FROM "pipeline_dataset"."something" AS "something"'
+        == query
+    )
+
+    with pytest.raises(LineageFailedException):
+        relation.select("hello", "hillo").to_sql()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason=f"Skipping tests for Python `{sys.version_info}`. Ibis only supports Python >= 3.10.",
+)
+def test_ibis_backend_gets_own_client(
+    dataset: dlt.Dataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ibis backend owns the client, so each call must get a new client."""
+    shared_client = dataset.destination_client
+
+    created: list[Any] = []
+    original_create = dlt.Dataset._create_destination_client
+
+    def _counting_create(self: Any) -> Any:
+        client = original_create(self)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(dlt.Dataset, "_create_destination_client", _counting_create)
+
+    dataset.ibis()
+    backend = dataset.ibis()
+
+    # each backend built its own client, and none of them is the shared client of the dataset
+    assert len(created) == 2
+    assert all(client is not shared_client for client in created)
+    assert "purchases" in backend.list_tables(database=dataset.dataset_name)
+    # the dataset keeps its own client usable
+    assert len(dataset.table("purchases").df()) == 3

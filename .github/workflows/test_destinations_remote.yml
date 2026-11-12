@@ -1,0 +1,333 @@
+
+name: remote
+
+on:
+  workflow_call:
+    inputs:
+        run_full_test_suite:
+          required: true
+          type: boolean
+          default: false
+
+  workflow_dispatch:
+
+env:
+  DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
+  RUNTIME__LOG_LEVEL: ERROR
+
+  # For s3 compatibility tests, used by "postgres and redshift", could be moved to google secrets
+  TESTS__R2_AWS_ACCESS_KEY_ID: a4950a5003b26f5a71ac97ef3848ff4c
+  TESTS__R2_AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+  TESTS__R2_ENDPOINT_URL: https://9830548e4e4b582989be0811f2a0a97f.r2.cloudflarestorage.com
+  TESTS__R2_REGION_NAME: us-east-1
+
+jobs:
+
+  run_destinations_remote:
+    name: ${{ matrix.display_name }}
+    strategy:
+        fail-fast: false
+        matrix:
+          include:
+
+            # Athena
+            - display_name: athena
+              destinations: "[\"athena\"]"
+              filesystem_drivers: "[\"memory\"]"
+              excluded_destination_test_configuration_ids: "[\"athena-iceberg\", \"athena-s3-tables\"]"
+              extras: "--extra athena"
+
+            - display_name: athena iceberg
+              destinations: "[\"athena\"]"
+              filesystem_drivers: "[\"memory\"]"
+              excluded_destination_test_configuration_ids: "[\"athena\", \"athena-s3-tables\"]"
+              extras: "--extra athena"
+
+            - display_name: athena s3 tables
+              destinations: "[\"athena\"]"
+              filesystem_drivers: "[\"memory\"]"
+              excluded_destination_test_configuration_ids: "[\"athena\", \"athena-iceberg\"]"
+              extras: "--extra athena"
+
+            # BigQuery
+            - display_name: bigquery
+              destinations: "[\"bigquery\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra bigquery --extra parquet"
+
+            # Clickhouse
+            # NOTE: pins the old pre-1.1 clickhouse-connect for back-compat coverage, local tests run the newest driver
+            - display_name: clickhouse
+              destinations: "[\"clickhouse\"]"
+              filesystem_drivers: "[\"memory\", \"file\"]"
+              extras: "--extra clickhouse --extra parquet"
+              post_install_commands: "uv run pip install clickhouse-connect==0.8.17"
+
+
+            # Databricks
+            - display_name: databricks
+              destinations: "[\"databricks\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra databricks --extra s3 --extra gs --extra az --extra parquet"
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun=ConnectionResetError --only-rerun=RequestError --only-rerun=DatabaseTransientException"
+
+            # Filesystem
+            - display_name: filesystem_s3_local
+              destinations: "[\"filesystem\"]"
+              # note that all buckets are enabled for testing
+              filesystem_drivers: "[\"memory\", \"file\", \"r2\", \"s3\"]" # excludes sftp which is run in local tests
+              extras: "--extra s3 --extra parquet --extra duckdb --extra filesystem --extra deltalake --extra pyiceberg"
+              post_install_commands: "uv run pip install sqlalchemy==2.0.18" # minimum version required by `pyiceberg`
+
+            - display_name: filesystem_az
+              destinations: "[\"filesystem\"]"
+              # note that all buckets are enabled for testing
+              filesystem_drivers: "[\"memory\", \"az\", \"abfss\"]" # excludes sftp which is run in local tests
+              extras: "--extra az --extra parquet --extra duckdb --extra filesystem --extra deltalake --extra pyiceberg"
+              post_install_commands: | # minimum SQLAlchemy version required by `pyiceberg`
+                uv run pip install sqlalchemy==2.0.18  # minimum version required by `pyiceberg`
+
+            - display_name: filesystem_gs_gdrive
+              destinations: "[\"filesystem\"]"
+              # note that all buckets are enabled for testing
+              filesystem_drivers: "[\"memory\", \"gs\", \"gdrive\"]" # excludes sftp which is run in local tests
+              extras: "--extra gs --extra parquet --extra duckdb --extra filesystem --extra deltalake --extra pyiceberg"
+              post_install_commands: "uv run pip install sqlalchemy==2.0.18" # minimum version required by `pyiceberg`
+
+            - display_name: filesystem_hf
+              destinations: "[\"filesystem\"]"
+              filesystem_drivers: "[\"memory\", \"hf\"]"
+              # although, `hf` does not support delta/iceberg, we include `deltalake`/`pyiceberg` extras to prevent missing imports in tests
+              extras: "--extra hf --extra parquet --extra duckdb --extra filesystem --extra deltalake --extra pyiceberg"
+              post_install_commands: "uv run pip install sqlalchemy==2.0.18" # minimum version required by `pyiceberg`
+
+            # LanceDB
+            - display_name: lancedb
+              destinations: "[\"lancedb\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra lancedb --extra parquet"
+              post_install_commands: "uv run pip install openai"
+              always_run_all_tests: true
+
+            # Lance — file and s3 protocols only, no need to test az and gs as all cloud storages go
+            # through same code paths thanks to `object_store` Rust crate
+            - display_name: lance_local
+              destinations: "[\"lance\"]"
+              filesystem_drivers: "[\"file\"]"
+              extras: "--extra lance"
+              post_install_commands: "uv run pip install openai"
+              always_run_all_tests: true
+
+            - display_name: lance_s3
+              destinations: "[\"lance\"]"
+              filesystem_drivers: "[\"s3\"]"
+              extras: "--extra lance --extra s3"
+              post_install_commands: "uv run pip install openai"
+
+            # Motherduck
+            - display_name: motherduck
+              destinations: "[\"motherduck\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra motherduck --extra s3 --extra gs --extra az --extra parquet"
+              xdist_workers: 1
+              # motherduck tests fail almost exclusively as xdist worker crashes (the worker
+              # segfaults). pytest-rerunfailures always retries worker crashes when
+              # --reruns > 0, independent of --only-rerun. We need --only-rerun sentinel below so
+              # only crashes are retried and genuine failures still fail fast
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun=__worker_crash_only__"
+
+            # Ducklake
+            - display_name: ducklake
+              destinations: "[\"ducklake\"]"
+              filesystem_drivers: "[\"s3\", \"gs\", \"abfss\"]"
+              extras: "--extra ducklake --extra s3 --extra gs --extra az --extra parquet"
+              always_run_all_tests: true
+
+            # MSSQL
+            - display_name: mssql
+              destinations: "[\"mssql\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra mssql --extra s3 --extra gs --extra az --extra parquet --group adbc"
+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+              post_install_commands: "uv run dbc install mssql"
+              always_run_all_tests: true
+              # Azure SQL / ODBC sometimes has transient connection errors (e.g. 40613 "is not currently available")
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun='is not currently available' --only-rerun='Communication link failure' --only-rerun='Login timeout expired' --only-rerun=DatabaseTransientException"
+
+            # Synapse
+            - display_name: synapse
+              destinations: "[\"synapse\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra synapse --extra parquet"
+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+              # see mssql: Azure SQL / ODBC transient connection errors
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun='is not currently available' --only-rerun='Communication link failure' --only-rerun='Login timeout expired' --only-rerun=DatabaseTransientException"
+
+            # Fabric
+            - display_name: fabric
+              destinations: "[\"fabric\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra fabric"
+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+              post_secrets_commands: "uv run python tests/load/fabric/refresh_spn_fabric_token.py"
+              # see mssql: Azure SQL / ODBC transient connection errors
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun='is not currently available' --only-rerun='Communication link failure' --only-rerun='Login timeout expired' --only-rerun=DatabaseTransientException"
+
+            # Postgres and Redshift (used to be test_destinations.yml)
+            - display_name: redshift
+              destinations: "[\"redshift\"]"
+              filesystem_drivers: "[\"memory\", \"file\"]"
+              extras: "--group adbc --extra postgres --extra redshift --extra postgis --extra s3 --extra gs --extra az --extra parquet --extra duckdb"
+              rerun_args: "--reruns=2 --reruns-delay=10 --only-rerun='connection to server' --only-rerun=DatabaseTransientException"
+
+            - display_name: postgres
+              destinations: "[\"postgres\"]"
+              filesystem_drivers: "[\"memory\", \"file\"]"
+              extras: "--group adbc --extra postgres --extra postgis --extra parquet --extra duckdb"
+              post_install_commands: "uv pip install adbc-driver-postgresql"  # use adbc driver installation
+              always_run_all_tests: true
+              xdist_workers: 3
+
+            # Qdrant (disabled, because we do not have a test account atm, qdrant is tested with local version)
+            # - name: qdrant
+            #   destinations: "[\"qdrant\"]"
+            #   filesystem_drivers: "[\"memory\"]"
+            #   extras: "--extra qdrant --extra parquet"
+
+            # Snowflake
+            - display_name: snowflake
+              destinations: "[\"snowflake\"]"
+              filesystem_drivers: "[\"memory\"]"
+              extras: "--extra snowflake --extra s3 --extra gs --extra az --extra parquet"
+
+    env:
+        # Prevent implicit resyncs by `uv run`; this is ignored by explicit `uv sync` commands.
+        UV_NO_SYNC: "1"
+        ACTIVE_DESTINATIONS: ${{ matrix.destinations }}
+        ALL_FILESYSTEM_DRIVERS: ${{ matrix.filesystem_drivers }}
+        EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS: ${{ matrix.excluded_destination_test_configuration_ids || '[]' }}
+        PYTEST_XDIST_N: 6
+    defaults:
+      run:
+        shell: bash
+    runs-on: ${{ matrix.runs_on || 'ubuntu-latest' }}
+
+    services:
+      # we need local postgres to run ducklake tests quickly
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_DB: dlt_data
+          POSTGRES_USER: loader
+          POSTGRES_PASSWORD: loader
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          persist-credentials: false
+          # fork code runs by design, gated by per-run `fork-ci` environment approval
+          allow-unsafe-pr-checkout: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          activate-environment: true
+          # fork runs (pull_request_target) must not write the default-branch cache scope
+          enable-cache: ${{ github.event_name != 'pull_request_target' }}
+
+      - name: Run pre install commands
+        run: ${{ matrix.pre_install_commands }}
+        if: ${{ matrix.pre_install_commands }}
+
+      - name: Install dependencies
+        run: uv sync --group pipeline --group ibis --group providers ${{ matrix.extras }}
+
+      - name: Run post install commands
+        run: ${{ matrix.post_install_commands }}
+        if: ${{ matrix.post_install_commands }}
+
+      - name: create secrets.toml
+        run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
+
+      - name: Run post secrets commands
+        run: ${{ matrix.post_secrets_commands }}
+        if: ${{ matrix.post_secrets_commands }}
+
+      # NOTE: essential tests are always run
+      - name: Run essential tests Linux
+        run: make test-dest-remote-essential
+        env:
+          PYTEST_XDIST_N: ${{ matrix.xdist_workers || env.PYTEST_XDIST_N }}
+          PYTEST_ARGS: ${{ matrix.rerun_args || '' }}
+
+      - name: Run non-essential tests Linux
+        if: ${{ always() && (inputs.run_full_test_suite || matrix.always_run_all_tests) }}
+        run: make test-dest-remote-nonessential
+        env:
+          PYTEST_XDIST_N: ${{ matrix.xdist_workers || env.PYTEST_XDIST_N }}
+          PYTEST_ARGS: ${{ matrix.rerun_args || '' }}
+
+  run_vault_providers:
+    name: vault providers and agents
+    env:
+      # Prevent implicit resyncs by `uv run`; this is ignored by explicit `uv sync` commands.
+      UV_NO_SYNC: "1"
+    defaults:
+      run:
+        shell: bash
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          persist-credentials: false
+          # fork code runs by design, gated by per-run `fork-ci` environment approval
+          allow-unsafe-pr-checkout: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          activate-environment: true
+          # fork runs (pull_request_target) must not write the default-branch cache scope
+          enable-cache: ${{ github.event_name != 'pull_request_target' }}
+
+      - name: Install dependencies
+        # google-api-python-client for google secrets, botocore (s3 extra) for aws secrets manager,
+        # the workspace and both agent loops for the agent runs
+        run: uv sync --group providers --extra s3 --group workspace-deps --extra cli --group agent --group agent-claude
+
+      - name: create secrets.toml
+        run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
+
+      - name: Run vault provider tests
+        run: uv run pytest tests/helpers/providers
+
+      - name: Run agents on real loops and models
+        # skipped unless the secrets carry `jobs.agent.api_key`
+        run: make test-workspace-agents

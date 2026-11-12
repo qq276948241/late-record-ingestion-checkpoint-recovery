@@ -1,0 +1,135 @@
+.DEFAULT_GOAL := help
+
+# Add " ## description" after any target name to include it in `make help` output.
+# Example:  my-target: ## Does something useful
+help: ## Shows this help message
+	@grep -E '^[a-zA-Z0-9_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-28s %s\n", $$1, $$2}'
+
+dev: ## Set up development environment
+	uv sync --all-extras --all-groups --all-packages --quiet
+	uv run prek install --hook-type pre-commit --hook-type pre-push
+
+start: ## Generate docs and start the docusaurus dev server
+	$(MAKE) preprocess-docs
+	cd website && npx docusaurus start
+
+# Pagefind indexes rendered HTML, so this needs a production build. The dev server
+# (`make start`) serves this index as is via `website/plugins/pagefind-dev.js`:
+# run it at least once to populate search, and again to refresh it.
+search-index: ## Build the docs and the search index used by the dev server
+	cd website && npx docusaurus build --out-dir build/docs
+	cd website && npm run search-index
+
+build: ## Full production build of the docs website into `website/build/docs`
+	cd website && uv run npm run update-versions
+	cd website && npm run compile-redirects
+	$(MAKE) check-orphan-docs
+	$(MAKE) preprocess-docs
+	cd website && npx docusaurus build --out-dir build/docs
+	cd website && npm run search-index
+	cd website && npm run verify-redirects
+	cd website && node scripts/verify-llms-txt.js
+
+# NOTE the command `preprocess-docs` must exist and produce the
+# documentation and API reference for `update_versions.js` to work
+# TODO make this mechanism less brittle
+#
+preprocess-docs: ## Dynamically generate pages under `website/docs_processed`
+	# Order matters: preprocess-markers wipes and recreates docs_processed, so
+	# generators that write into it must run afterwards.
+	uv run --script tools/preprocess_docs.py
+	uv run --script tools/generate_api_reference.py
+	$(MAKE) cli-generate-hub
+	$(MAKE) api-generate-hub
+	$(MAKE) sdk-generate-hub
+
+lint: lint-core lint-notebooks lint-website check-orphan-docs ## Runs all linters
+
+lint-website: ## Lints the docusaurus website JS/TS sources with Biome
+	cd website && npm run lint
+
+check-orphan-docs: ## Checks that all docs pages are reachable from website sidebars or marked unlisted
+	cd website && npm run check-orphan-docs
+
+cli-generate: ## Regenerates CLI reference docs
+	uv --quiet run --script tools/generate_cli_docs.py website/docs/reference/command-line-interface.md
+
+cli-check: ## Checks CLI reference docs are up to date (CI)
+	uv --quiet run --script tools/generate_cli_docs.py website/docs/reference/command-line-interface.md --compare
+
+# the hub references describe the newest dlthub and dlthub-client releases, resolved in an
+# environment of their own so the build never writes `uv.lock`
+# TODO: `dlthub-client>=0.28.8` (first release bundling the api specs and sdk docs) once released
+HUB_RUN = uv --quiet run --isolated --no-project --with "$(abspath ..)[cli,hub]" \
+	--with "dlthub-client>=0.28.8a3" --with griffe --with pyyaml
+
+# runs in tools/dlthub_cli because workspace commands need a workspace context
+HUB_CLI_DOCS ?= website/docs_processed/hub/command-line-interface.md
+cli-generate-hub: ## Generates the dlthub CLI reference into `website/docs_processed`
+	cd tools/dlthub_cli && $(HUB_RUN) python ../generate_cli_docs.py $(abspath $(HUB_CLI_DOCS)) \
+		--executable-name dlthub --title "CLI reference" --sort-commands \
+		--show-versions dlthub dlthub-client
+
+# TODO consolidate the flake8, black, mypy tooling to be the same as root `pyproject.toml`
+lint-core: ## Lints the docs tooling, non-embedded snippets, examples and notebooks
+	uv run ruff check
+	uv run mypy --config-file ../pyproject.toml tools website --exclude tools/generate_api_reference.py --exclude website/docs_processed --exclude website/versioned_docs/ --exclude 'examples/[^/]+/test_.*\.py'
+	uv run flake8 --max-line-length=200 tools website/docs
+	uv run black tools website --check --diff --color
+
+lint-notebooks: ## Lints the notebooks in the education folder
+	uv run nbqa flake8 education --extend-ignore=D,F704 --max-line-length=200
+	uv run nbqa mypy education \
+	--ignore-missing-imports \
+	--no-strict-optional \
+	--disable-error-code=no-redef \
+	--disable-error-code=top-level-await
+
+format: ## Formats the docs tooling, website, examples, and notebooks
+	uv run black tools website
+	uv run black education/*/*.ipynb --ipynb
+
+test-tools: ## Tests docs tools
+	uv run pytest tools/
+
+build-molabs: ## Format the notebooks files first and build Molabs
+	uv run black education/*/*.ipynb --ipynb --quiet
+	uv run tools/preprocess_to_molab.py
+	uv run black education/*/*.py --quiet
+	uv run marimo check education/*/*.py --fix --quiet
+
+validate-molabs: build-molabs ## Validate marimo notebooks are up-to-date
+	git diff --exit-code -- education/
+
+snippets-lint:
+	uv run pytest test_snippets.py::test_lint_snippets
+
+snippets-format:
+	uv run pytest test_snippets.py::test_lint_snippets --update-examples
+
+snippets-typecheck:
+	uv run pytest test_snippets.py::test_typecheck_snippets
+
+snippets-test:
+	uv run pytest test_snippets.py::test_run_snippets
+
+# set to a folder of specs, e.g. a runtime checkout's clients/cli/dlthub_sdk/_specs
+RUNTIME_OPENAPI_DIR ?=
+API_DOCS_DIR ?= website/docs_processed/hub/reference/api
+api-generate-hub: ## Generates the runtime REST API reference into `website/docs_processed`
+	$(HUB_RUN) python tools/generate_openapi_docs.py --output-dir $(API_DOCS_DIR) \
+		$(if $(RUNTIME_OPENAPI_DIR),--spec-dir $(RUNTIME_OPENAPI_DIR))
+
+SDK_DOCS_DIR ?= website/docs_processed/hub/reference/python-sdk
+sdk-generate-hub: ## Generates the Python SDK reference into `website/docs_processed`
+	$(HUB_RUN) python tools/generate_sdk_docs.py $(SDK_DOCS_DIR)
+
+# links into the generated hub references resolve against fresh, git-ignored copies
+md-check:  ## Check markdown file formatting errors in website/docs
+	$(MAKE) cli-generate-hub HUB_CLI_DOCS=website/docs/hub/command-line-interface.md
+	$(MAKE) api-generate-hub API_DOCS_DIR=website/docs/hub/reference/api
+	$(MAKE) sdk-generate-hub SDK_DOCS_DIR=website/docs/hub/reference/python-sdk
+	uv run mdsmith check website/docs
+
+md-fix:  ## Fix markdown file formatting errors in website/docs
+	uv run mdsmith fix website/docs

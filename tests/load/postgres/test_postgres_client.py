@@ -1,0 +1,162 @@
+import os
+from typing import Iterator
+import pytest
+
+from dlt.common import pendulum, Wei
+from dlt.common.configuration.resolve import resolve_configuration, ConfigFieldMissingException
+from dlt.common.storages import FileStorage
+from dlt.common.utils import uniq_id
+
+from dlt.destinations.impl.postgres.configuration import PostgresCredentials
+from dlt.destinations.impl.postgres.postgres import PostgresClient
+from dlt.destinations.impl.postgres.sql_client import Psycopg2SqlClient, psycopg2
+
+from tests.utils import get_test_storage_root, delete_test_storage, skipifpypy
+from tests.load.utils import expect_load_file, prepare_table, yield_client_with_storage
+from tests.common.configuration.utils import environment
+
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
+
+
+@pytest.fixture
+def file_storage() -> FileStorage:
+    return FileStorage(get_test_storage_root(), file_type="b", makedirs=True)
+
+
+@pytest.fixture(autouse=True)
+def auto_delete_storage() -> None:
+    delete_test_storage()
+
+
+@pytest.fixture(scope="function")
+def client() -> Iterator[PostgresClient]:
+    yield from yield_client_with_storage("postgres")  # type: ignore[misc]
+
+
+def test_postgres_credentials_defaults() -> None:
+    pg_cred = PostgresCredentials()
+    assert pg_cred.port == 5432
+    assert pg_cred.connect_timeout == 15
+    assert pg_cred.client_encoding is None
+    assert PostgresCredentials.__config_gen_annotations__ == ["port", "connect_timeout"]
+    # port should be optional
+    resolve_configuration(pg_cred, explicit_value="postgres://loader:loader@localhost/DLT_DATA")
+    assert pg_cred.port == 5432
+    # preserve case
+    assert pg_cred.database == "DLT_DATA"
+
+
+def test_postgres_credentials_native_value(environment) -> None:
+    with pytest.raises(ConfigFieldMissingException):
+        resolve_configuration(
+            PostgresCredentials(), explicit_value="postgres://loader@localhost/dlt_data"
+        )
+    # set password via env
+    os.environ["CREDENTIALS__PASSWORD"] = "pass"
+    c = resolve_configuration(
+        PostgresCredentials(), explicit_value="postgres://loader@localhost/dlt_data"
+    )
+    assert c.is_resolved()
+    assert c.password == "pass"
+    # but if password is specified - it is final
+    c = resolve_configuration(
+        PostgresCredentials(), explicit_value="postgres://loader:loader@localhost/dlt_data"
+    )
+    assert c.is_resolved()
+    assert c.password == "loader"
+
+    c = PostgresCredentials("postgres://loader:loader@localhost/dlt_data")
+    assert c.password == "loader"
+    assert c.database == "dlt_data"
+
+
+def test_postgres_query_params() -> None:
+    # test postgres timeout
+    dsn = "postgres://loader:pass@localhost:5432/dlt_data?client_encoding=utf-8&connect_timeout=600&options=-ctimezone%3DEurope%2FParis"
+    csc = PostgresCredentials()
+    csc.parse_native_representation(dsn)
+    assert csc.connect_timeout == 600
+    assert csc.client_encoding == "utf-8"
+    assert csc.get_query().get("options") == "-ctimezone=Europe/Paris"
+    assert csc.to_native_representation() == dsn
+
+
+def test_postgres_session_timezone_query_params() -> None:
+    csc = PostgresCredentials("postgres://loader:pass@localhost:5432/dlt_data")
+    assert "options" not in csc.get_query()
+
+    csc.session_timezone = "Europe/Paris"
+    assert csc.get_query()["options"] == "-ctimezone=Europe/Paris"
+
+    # dlt appends it to the options you already set
+    csc = PostgresCredentials(
+        "postgres://loader:pass@localhost:5432/dlt_data?options=-cstatement_timeout%3D5000"
+    )
+    csc.session_timezone = "UTC"
+    assert csc.get_query()["options"] == "-cstatement_timeout=5000 -ctimezone=UTC"
+
+    # a timezone already in the options takes precedence
+    csc = PostgresCredentials(
+        "postgres://loader:pass@localhost:5432/dlt_data?options=-ctimezone%3DAsia%2FTokyo"
+    )
+    csc.session_timezone = "UTC"
+    assert csc.get_query()["options"] == "-ctimezone=Asia/Tokyo"
+
+
+def test_postgres_session_timezone(client: PostgresClient) -> None:
+    """The timezone is a startup option. It survives the reset that `dlt` runs after an error."""
+    credentials = client.config.credentials.copy()
+    credentials.session_timezone = "Europe/Paris"
+    sql_client = Psycopg2SqlClient(
+        client.sql_client.dataset_name,
+        client.sql_client.staging_dataset_name,
+        credentials,
+        client.capabilities,
+    )
+    with sql_client:
+        assert sql_client.execute_sql("SHOW timezone")[0][0] == "Europe/Paris"
+        sql_client._reset_connection()
+        assert sql_client.execute_sql("SHOW timezone")[0][0] == "Europe/Paris"
+
+
+def test_wei_value(client: PostgresClient, file_storage: FileStorage) -> None:
+    user_table_name = prepare_table(client)
+
+    # postgres supports EVM precisions
+    insert_sql = (
+        "INSERT INTO {}(_dlt_id, _dlt_root_id, sender_id, timestamp,"
+        " parse_data__metadata__rasa_x_id)\nVALUES\n"
+    )
+    insert_values = (
+        f"('{uniq_id()}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
+        f" '{str(pendulum.now())}', {Wei.from_int256(2*256-1)});"
+    )
+    expect_load_file(client, file_storage, insert_sql + insert_values, user_table_name)
+
+    insert_sql = (
+        "INSERT INTO {}(_dlt_id, _dlt_root_id, sender_id, timestamp,"
+        " parse_data__metadata__rasa_x_id)\nVALUES\n"
+    )
+    insert_values = (
+        f"('{uniq_id()}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
+        f" '{str(pendulum.now())}', {Wei.from_int256(2*256-1, 18)});"
+    )
+    expect_load_file(client, file_storage, insert_sql + insert_values, user_table_name)
+
+    insert_sql = (
+        "INSERT INTO {}(_dlt_id, _dlt_root_id, sender_id, timestamp,"
+        " parse_data__metadata__rasa_x_id)\nVALUES\n"
+    )
+    insert_values = (
+        f"('{uniq_id()}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
+        f" '{str(pendulum.now())}', {Wei.from_int256(2*256-1, 78)});"
+    )
+    expect_load_file(client, file_storage, insert_sql + insert_values, user_table_name)
+
+
+def test_postgres_adbc_copy_job_keeps_streaming_ingest() -> None:
+    from dlt.destinations.impl.postgres.postgres import PostgresParquetCopyJob
+
+    # postgres ADBC driver streams incrementally; default single-call ingest is correct
+    assert PostgresParquetCopyJob._ingest_per_rowgroup is False
